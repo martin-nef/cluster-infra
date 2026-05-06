@@ -5,8 +5,10 @@
   roles:
     - role: base
       tags: [base]
+
 - name: Install k3s cluster
   ansible.builtin.import_playbook: k3s_io.k3s_ansible.site
+  tags: [k3s]
 
 - name: Bootstrap Flux
   hosts: server
@@ -30,12 +32,38 @@
     - name: Bootstrap Flux
       ansible.builtin.command: >
         flux bootstrap github
-        --owner={{ vault_flux_github_owner }}
-        --repository={{ vault_flux_github_cluster_repo }}
+        --owner=martin-nef
+        --repository=cluster-infra
         --branch=main
-        --path=clusters/nefcloud
+        --path=nefcloud
         --personal
       environment:
         GITHUB_TOKEN: "{{ vault_flux_github_token }}"
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       when: flux_check.rc != 0
+
+    - name: Register app git sources
+      ansible.builtin.shell: >
+        flux create source git {{ item.name }}
+        --url={{ item.url }}
+        --branch={{ item.branch }}
+        --interval=1m
+        --username=git
+        --password="$GITHUB_TOKEN"
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+        GITHUB_TOKEN: "{{ vault_flux_github_token }}"
+      loop: "{{ flux_apps }}"
+      changed_when: false
+
+    - name: Register app kustomizations
+      ansible.builtin.command: >
+        flux create kustomization {{ item.name }}
+        --source=GitRepository/{{ item.name }}
+        --path=./deploy
+        --prune=true
+        --interval=10m
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      loop: "{{ flux_apps }}"
+      changed_when: false

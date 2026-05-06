@@ -1,0 +1,8 @@
+---
+k3s_version: v1.32.0+k3s1
+k3s_ansible_version: 1.2.0
+
+flux_apps:
+  - name: smart-reviewer
+    url: https://github.com/martin-nef/smart-reviewer
+    branch: main
