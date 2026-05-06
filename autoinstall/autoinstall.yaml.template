@@ -1,0 +1,34 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+
+  keyboard:
+    layout: us
+
+  storage:
+    layout:
+      name: lvm
+      sizing-policy: all
+
+  identity:
+    hostname: <HOSTNAME>
+    username: deploy
+    # Password is locked — SSH key auth only
+    password: "!"
+
+  ssh:
+    install-server: true
+    authorized-keys:
+      - "<SSH_PUBLIC_KEY>"
+    allow-pw: false
+
+  late-commands:
+    - echo 'deploy ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/deploy
+    - chmod 440 /target/etc/sudoers.d/deploy
+    - curtin in-target --target=/target -- visudo -cf /etc/sudoers.d/deploy
+    - mkdir -p /target/home/deploy/.ssh
+    - echo "<SSH_PUBLIC_KEY>" >> /target/home/deploy/.ssh/authorized_keys
+    - chmod 700 /target/home/deploy/.ssh
+    - chmod 600 /target/home/deploy/.ssh/authorized_keys
+    - curtin in-target --target=/target -- chown -R deploy:deploy /home/deploy/.ssh

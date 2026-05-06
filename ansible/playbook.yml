@@ -1,0 +1,41 @@
+---
+- name: Provision cluster nodes
+  hosts: all
+  become: true
+  roles:
+    - role: base
+      tags: [base]
+- name: Install k3s cluster
+  ansible.builtin.import_playbook: k3s_io.k3s_ansible.site
+
+- name: Bootstrap Flux
+  hosts: server
+  become: true
+  tags: [flux]
+  tasks:
+    - name: Install Flux CLI
+      ansible.builtin.shell: |
+        curl -s https://fluxcd.io/install.sh | sudo bash
+      args:
+        creates: /usr/local/bin/flux
+
+    - name: Check if Flux is already bootstrapped
+      ansible.builtin.command: flux check
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: flux_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Bootstrap Flux
+      ansible.builtin.command: >
+        flux bootstrap github
+        --owner={{ vault_flux_github_owner }}
+        --repository={{ vault_flux_github_cluster_repo }}
+        --branch=main
+        --path=clusters/nefcloud
+        --personal
+      environment:
+        GITHUB_TOKEN: "{{ vault_flux_github_token }}"
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      when: flux_check.rc != 0

@@ -1,0 +1,17 @@
+---
+k3s_cluster:
+  children:
+    server:
+      hosts:
+        shitbox:
+          extra_server_args: "--tls-san {{ ansible_host }}"
+    agent:
+      hosts:
+        dumb-computer:
+  vars:
+    ansible_user: root
+    k3s_version: v1.32.0+k3s1
+    token: "{{ vault_k3s_token }}"   # store in Ansible Vault
+    api_endpoint: "{{ hostvars[groups['server'][0]]['ansible_host'] }}"
+    extra_server_args: ""
+    extra_agent_args: ""

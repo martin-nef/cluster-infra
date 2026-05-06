@@ -1,0 +1,6 @@
+*.retry
+.vault_password
+*.pyc
+__pycache__/
+.env
+autoinstall/autoinstall.yaml
