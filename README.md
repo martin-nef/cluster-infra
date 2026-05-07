@@ -4,7 +4,8 @@
 
 - Ansible 2.15+ with Python 3.10+
 - SSH access to the server as the `deploy` user
-- Make sure the shitbox is available at the hostname `shitbox`. This can be using the hosts file.
+- Make sure the shitbox is available at the hostname `shitbox`. This can be done using the hosts file.
+- The ansible vault password in `ansible/.vault_password`.
 
 ## Quick start
 
@@ -40,24 +41,11 @@ ansible-playbook playbook.yml
 
 ## Common tasks
 
-### Redeploy a single app
-
-```bash
-cd ansible
-ansible-playbook playbook.yml --tags apps -e app_filter=beam_demo
-```
-
-### Add a new app
-
-1. Create `apps/<appname>/docker-compose.yml`
-2. Optionally create `apps/<appname>/.env.j2` for secrets
-3. Add the app to the `apps` list in `ansible/group_vars/all/vars.yml`
-4. Add any new vault vars to `ansible/group_vars/all/vault.yml`
-5. Run the playbook
-
 ### Edit vault secrets
 
+To edit a vault file
 ```bash
 cd ansible
-ansible-vault edit group_vars/all/vault.yml
+export EDITOR='code --wait' # to use vscode instead of vim
+ansible-vault edit path/to/vault.yml
 ```
