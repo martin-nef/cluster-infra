@@ -1,0 +1,65 @@
+name: Flux
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ansible/group_vars/all/vars.yml
+      - ansible/roles/flux/**
+      - ansible/playbook.yml
+      - .github/workflows/flux.yml
+  workflow_dispatch:
+
+concurrency:
+  group: Flux
+  cancel-in-progress: false
+
+env:
+  SSH_CONFIG: |
+    Host shitbox
+      HostName shitbox.tail43f455.ts.net
+      User deploy
+      IdentityFile ~/.ssh/shitbox.pem
+      StrictHostKeyChecking no
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: Write vault password
+        run: |
+          echo -n "${{ secrets.VAULT_PASSWORD }}" > ansible/.vault_password
+          wc -c ansible/.vault_password
+
+      - name: Verify ansible config
+        run: make verify
+
+      - name: Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:k3s
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/shitbox.pem
+          chmod 600 ~/.ssh/shitbox.pem
+          echo "$SSH_CONFIG" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Run flux playbook
+        working-directory: ansible
+        run: ansible-playbook playbook.yml --tags flux
