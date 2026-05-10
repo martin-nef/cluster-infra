@@ -6,6 +6,32 @@
     - role: base
       tags: [base]
 
+- name: Clean up dated k3s services
+  hosts: all
+  become: true
+  tags: [k3s]
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Remove k3s-agent service from server nodes
+      when:
+        - "'server' in group_names"
+        - ansible_facts.services['k3s-agent.service'] is defined
+      ansible.builtin.service:
+        name: k3s-agent
+        state: stopped
+        enabled: false
+
+    - name: Remove k3s server service from agent nodes
+      when:
+        - "'agent' in group_names"
+        - ansible_facts.services['k3s.service'] is defined
+      ansible.builtin.service:
+        name: k3s
+        state: stopped
+        enabled: false
+
 - name: Install k3s cluster
   ansible.builtin.import_playbook: k3s.orchestration.site
   tags: [k3s]
