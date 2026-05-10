@@ -86,7 +86,9 @@
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
         GITHUB_TOKEN: "{{ vault_flux_github_token }}"
       loop: "{{ flux_apps }}"
-      when: not app_manifest.results[ansible_loop.index0].stat.exists
+      loop_control:
+        index_var: idx
+      when: not app_manifest.results[idx].stat.exists
       no_log: true
       changed_when: false
 
@@ -109,7 +111,9 @@
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       loop: "{{ flux_apps }}"
-      when: not app_manifest.results[ansible_loop.index0].stat.exists
+      loop_control:
+        index_var: idx
+      when: not app_manifest.results[idx].stat.exists
 
     - name: Fetch manifests to repo
       ansible.builtin.fetch:
@@ -117,7 +121,9 @@
         dest: "{{ playbook_dir }}/../nefcloud/apps/{{ item.name }}.yaml"
         flat: true
       loop: "{{ flux_apps }}"
-      when: not app_manifest.results[ansible_loop.index0].stat.exists
+      loop_control:
+        index_var: idx
+      when: not app_manifest.results[idx].stat.exists
 
     - name: Commit and push manifests
       ansible.builtin.shell: |
