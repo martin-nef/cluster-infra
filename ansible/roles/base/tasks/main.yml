@@ -10,13 +10,28 @@
     state: present
     update_cache: true
 
-# --- Install Tailscale ---
+# --- Tailscale ---
+
+- name: Check if Tailscale is installed
+  ansible.builtin.command: which tailscale
+  register: tailscale_installed
+  changed_when: false
+  failed_when: false
 
 - name: Install Tailscale
   ansible.builtin.shell: |
-    curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --auth-key={{ vault_tailscale_auth_key }}
-  args:
-    creates: /var/lib/tailscale/tailscaled.state
+    curl -fsSL https://tailscale.com/install.sh | sh
+  when: tailscale_installed.rc != 0
+
+- name: Check if Tailscale is up
+  ansible.builtin.command: tailscale status
+  register: tailscale_up
+  changed_when: false
+  failed_when: false
+
+- name: Bring Tailscale up
+  ansible.builtin.command: tailscale up --auth-key={{ vault_tailscale_auth_key }}
+  when: tailscale_up.rc != 0
 
 # --- Unattended upgrades ---
 

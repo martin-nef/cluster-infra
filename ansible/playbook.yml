@@ -7,7 +7,7 @@
       tags: [base]
 
 - name: Install k3s cluster
-  ansible.builtin.import_playbook: k3s_io.k3s_ansible.site
+  ansible.builtin.import_playbook: k3s.orchestration.site
   tags: [k3s]
 
 - name: Bootstrap Flux

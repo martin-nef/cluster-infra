@@ -3,15 +3,44 @@ k3s_cluster:
   children:
     server:
       hosts:
+        oci-witness:
+          ansible_user: ubuntu
+          # SSH-reachable address (OCI public IP)
+          ansible_host: 145.241.249.34
+          # Tailscale 100.x IP for k3s node-to-node communication
+          tailscale_ip: 100.68.249.22
+          tailscale_host: oci-witness
         shitbox:
-          extra_server_args: "--tls-san {{ ansible_host }}"
-    agent:
-      hosts:
-        dumb-computer:
+          ansible_user: deploy
+          # SSH-reachable address (assume host name is mapped in local DNS or /etc/hosts)
+          ansible_host: shitbox
+          # Tailscale 100.x IP for k3s node-to-node communication
+          tailscale_ip: 100.102.128.57
+          tailscale_host: shitbox
+        oci-big:
+          ansible_user: ubuntu
+          # SSH-reachable address (OCI public IP — fill in)
+          ansible_host: 152.67.129.175
+          # Tailscale 100.x IP — fill in from `tailscale ip -4` on the host
+          tailscale_ip: 100.94.164.28
+          tailscale_host: oci-big
+    # TODO: set up this node at some point for extra capacity
+    # agent:
+    #   hosts:
+    #     dumb-computer:
   vars:
-    ansible_user: root
     k3s_version: v1.32.0+k3s1
     token: "{{ vault_k3s_token }}"   # store in Ansible Vault
-    api_endpoint: "{{ hostvars[groups['server'][0]]['ansible_host'] }}"
-    extra_server_args: ""
-    extra_agent_args: ""
+
+    # All inter-node k3s traffic uses Tailscale IPs.
+    # The first server in the inventory is the bootstrap node.
+    api_endpoint: "{{ hostvars[groups['server'][0]]['tailscale_ip'] }}"
+
+    # Every server advertises and binds to its Tailscale IP.
+    extra_server_args: >-
+      --node-ip {{ tailscale_ip }}
+      --advertise-address {{ tailscale_ip }}
+      --tls-san {{ tailscale_host }}
+
+    # Agents also bind to their Tailscale IP.
+    extra_agent_args: "--node-ip {{ tailscale_ip }}"
