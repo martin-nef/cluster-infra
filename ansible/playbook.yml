@@ -11,8 +11,8 @@
   tags: [k3s]
 
 - name: Bootstrap Flux
-  hosts: server
-  become: true
+  hosts: "{{ groups['server'][0] }}"   # Flux controllers are deployed to the cluster and float across nodes.
+  become: true                         # Bootstrap only needs to run once, from the first server.
   tags: [flux]
   tasks:
     - name: Install Flux CLI
@@ -22,11 +22,11 @@
         creates: /usr/local/bin/flux
 
     - name: Check if Flux is already bootstrapped
-      ansible.builtin.command: flux check
+      ansible.builtin.command: kubectl -n flux-system get deployment source-controller
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       register: flux_check
-      ignore_errors: true
+      failed_when: false
       changed_when: false
 
     - name: Bootstrap Flux
@@ -42,28 +42,67 @@
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       when: flux_check.rc != 0
 
-    - name: Register app git sources
+    - name: Check if app manifest already exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../nefcloud/apps/{{ item.name }}.yaml"
+      loop: "{{ flux_apps }}"
+      register: app_manifest
+      delegate_to: localhost
+      run_once: true
+
+    - name: Create git credentials secret
       ansible.builtin.shell: >
-        flux create source git {{ item.name }}
-        --url={{ item.url }}
-        --branch={{ item.branch }}
-        --interval=1m
-        --username=git
-        --password="$GITHUB_TOKEN"
+        kubectl -n flux-system create secret generic {{ item.name }}-auth
+        --from-literal=username=git
+        --from-literal=password="$GITHUB_TOKEN"
+        --dry-run=client -o yaml | kubectl apply -f -
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
         GITHUB_TOKEN: "{{ vault_flux_github_token }}"
       loop: "{{ flux_apps }}"
+      when: not app_manifest.results[ansible_loop.index0].stat.exists
+      no_log: true
       changed_when: false
 
-    - name: Register app kustomizations
-      ansible.builtin.command: >
-        flux create kustomization {{ item.name }}
-        --source=GitRepository/{{ item.name }}
-        --path=./deploy
-        --prune=true
-        --interval=10m
+    - name: Export app manifests with flux
+      ansible.builtin.shell: |
+        set -o pipefail
+        flux create source git {{ item.name }} \
+          --url={{ item.url }} \
+          --branch={{ item.branch }} \
+          --interval=1m \
+          --secret-ref={{ item.name }}-auth \
+          --export > /tmp/{{ item.name }}.yaml
+        echo --- >> /tmp/{{ item.name }}.yaml
+        flux create kustomization {{ item.name }} \
+          --source=GitRepository/{{ item.name }} \
+          --path={{ item.path | default('./deploy') }} \
+          --prune=true \
+          --interval=10m \
+          --export >> /tmp/{{ item.name }}.yaml
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       loop: "{{ flux_apps }}"
-      changed_when: false
+      when: not app_manifest.results[ansible_loop.index0].stat.exists
+
+    - name: Fetch manifests to repo
+      ansible.builtin.fetch:
+        src: "/tmp/{{ item.name }}.yaml"
+        dest: "{{ playbook_dir }}/../nefcloud/apps/{{ item.name }}.yaml"
+        flat: true
+      loop: "{{ flux_apps }}"
+      when: not app_manifest.results[ansible_loop.index0].stat.exists
+
+    - name: Commit and push manifests
+      ansible.builtin.shell: |
+        set -e
+        cd "{{ playbook_dir }}/.."
+        git switch -C deploy 2>/dev/null || git switch deploy
+        git add nefcloud/apps/
+        if ! git diff --cached --quiet; then
+          git commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
+          git push -u origin deploy
+        fi
+      delegate_to: localhost
+      run_once: true
+      when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0

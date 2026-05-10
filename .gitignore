@@ -4,3 +4,4 @@
 __pycache__/
 .env
 autoinstall/autoinstall.yaml
+ansible/collections/
