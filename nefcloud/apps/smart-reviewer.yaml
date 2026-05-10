@@ -12,7 +12,6 @@ spec:
     name: smart-reviewer-auth
   url: https://github.com/martin-nef/smart-reviewer
 ---
----
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:

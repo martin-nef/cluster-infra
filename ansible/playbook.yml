@@ -102,7 +102,6 @@
           --interval=1m \
           --secret-ref={{ item.name }}-auth \
           --export > /tmp/{{ item.name }}.yaml
-        echo --- >> /tmp/{{ item.name }}.yaml
         flux create kustomization {{ item.name }} \
           --source=GitRepository/{{ item.name }} \
           --path={{ item.path | default('./deploy') }} \
@@ -133,8 +132,6 @@
       ansible.builtin.shell: |
         set -e
         cd "{{ playbook_dir }}/.."
-        git fetch origin deploy
-        git switch -C deploy 2>/dev/null || git switch deploy
         git add nefcloud/apps/
         if ! git diff --cached --quiet; then
           git commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
