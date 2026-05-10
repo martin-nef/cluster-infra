@@ -32,6 +32,12 @@ k3s_cluster:
     # The first server in the inventory is the bootstrap node.
     api_endpoint: "{{ hostvars[groups['server'][0]]['tailscale_ip'] }}"
 
+    # Route Flannel node-to-node traffic over Tailscale.
+    server_config_yaml: |
+      flannel-iface: tailscale0
+    agent_config_yaml: |
+      flannel-iface: tailscale0
+
     # Every server advertises and binds to its Tailscale IP.
     extra_server_args: >-
       --node-ip {{ tailscale_ip }}
