@@ -69,6 +69,7 @@
       when: flux_check.rc != 0
 
     - name: Check if app manifest already exists
+      become: false
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/../nefcloud/apps/{{ item.name }}.yaml"
       loop: "{{ flux_apps }}"
@@ -128,9 +129,11 @@
       when: not app_manifest.results[idx].stat.exists
 
     - name: Commit and push manifests
+      become: false
       ansible.builtin.shell: |
         set -e
         cd "{{ playbook_dir }}/.."
+        git fetch origin deploy
         git switch -C deploy 2>/dev/null || git switch deploy
         git add nefcloud/apps/
         if ! git diff --cached --quiet; then
