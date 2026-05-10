@@ -5,31 +5,20 @@ k3s_cluster:
       hosts:
         oci-small-1:
           ansible_user: ubuntu
-          # SSH-reachable address (OCI public IP)
-          ansible_host: 145.241.249.34
-          # Tailscale 100.x IP for k3s node-to-node communication
           tailscale_ip: 100.68.249.22
           tailscale_host: oci-small-1
         oci-small-2:
           ansible_user: ubuntu
-          # SSH-reachable address (OCI public IP)
-          ansible_host: 145.241.226.238
-          # Tailscale 100.x IP for k3s node-to-node communication
           tailscale_ip: 100.99.86.111
           tailscale_host: oci-small-2
         shitbox:
           ansible_user: deploy
-          # SSH-reachable address (assume host name is mapped in local DNS or /etc/hosts)
-          ansible_host: shitbox
-          # Tailscale 100.x IP for k3s node-to-node communication
           tailscale_ip: 100.102.128.57
           tailscale_host: shitbox
     agent:
       hosts:
         oci-big:
           ansible_user: ubuntu
-          # SSH-reachable address (OCI public IP — fill in)
-          ansible_host: 152.67.129.175
           # Tailscale 100.x IP — fill in from `tailscale ip -4` on the host
           tailscale_ip: 100.94.164.28
           tailscale_host: oci-big

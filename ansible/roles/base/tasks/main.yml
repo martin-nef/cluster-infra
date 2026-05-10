@@ -1,15 +1,4 @@
 ---
-# --- Docker ---
-
-- name: Install prerequisites
-  ansible.builtin.apt:
-    name:
-      - ca-certificates
-      - curl
-      - gnupg
-    state: present
-    update_cache: true
-
 # --- Tailscale ---
 
 - name: Check if Tailscale is installed
