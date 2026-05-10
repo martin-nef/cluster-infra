@@ -94,7 +94,7 @@
 
     - name: Export app manifests with flux
       ansible.builtin.shell: |
-        set -o pipefail
+        set -eo pipefail
         flux create source git {{ item.name }} \
           --url={{ item.url }} \
           --branch={{ item.branch }} \
@@ -108,6 +108,8 @@
           --prune=true \
           --interval=10m \
           --export >> /tmp/{{ item.name }}.yaml
+      args:
+        executable: /bin/bash
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       loop: "{{ flux_apps }}"
