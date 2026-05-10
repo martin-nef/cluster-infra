@@ -138,5 +138,7 @@
           git push -u origin deploy
         fi
       delegate_to: localhost
+      environment:
+        GITHUB_TOKEN: "{{ vault_flux_github_token }}"
       run_once: true
       when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
