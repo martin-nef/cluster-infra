@@ -135,10 +135,11 @@
         git add nefcloud/apps/
         if ! git diff --cached --quiet; then
           git commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
-          git push -u origin deploy
+          git push https://martin-nef:${GITHUB_TOKEN}@github.com/martin-nef/cluster-infra.git deploy
         fi
       delegate_to: localhost
       environment:
         GITHUB_TOKEN: "{{ vault_flux_github_token }}"
       run_once: true
+      no_log: true
       when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
