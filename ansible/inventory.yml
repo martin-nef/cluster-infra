@@ -7,6 +7,8 @@ k3s_cluster:
           ansible_user: deploy
           tailscale_ip: 100.102.128.57
           tailscale_host: shitbox
+    agent:
+      hosts:
         oci-small-1:
           ansible_user: ubuntu
           tailscale_ip: 100.68.249.22
@@ -15,8 +17,6 @@ k3s_cluster:
           ansible_user: ubuntu
           tailscale_ip: 100.99.86.111
           tailscale_host: oci-small-2
-    agent:
-      hosts:
         oci-big:
           ansible_user: ubuntu
           # Tailscale 100.x IP — fill in from `tailscale ip -4` on the host
