@@ -35,64 +35,104 @@
   delegate_to: localhost
   run_once: true
 
-- name: Create deploy keys for app repos
+- name: Set known hosts
   ansible.builtin.shell: |
     set -eo pipefail
-    KEYFILE=$(mktemp)
-    KNOWN_HOSTS=$(mktemp)
-    cleanup() { rm -f "$KEYFILE" "${KEYFILE}.pub" "$KNOWN_HOSTS"; }
-    trap cleanup EXIT
-
-    ssh-keygen -t ed25519 -f "$KEYFILE" -N "" -C "flux-{{ item.name }}" -q
-
+    mkdir -p /tmp
     printf '%s\n' \
       'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
       'github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=' \
       'github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=' \
-      > "$KNOWN_HOSTS"
-
-    PUBKEY=$(cat "${KEYFILE}.pub")
-    curl -sS -X POST \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/repos/martin-nef/${item.name}/keys" \
-      -d "{\"title\":\"flux-{{ item.name }}\",\"key\":\"$PUBKEY\",\"read_only\":true}"
-
-    kubectl -n flux-system create secret generic {{ item.name }}-auth \
-      --from-file=identity="$KEYFILE" \
-      --from-file=known_hosts="$KNOWN_HOSTS" \
-      --dry-run=client -o yaml | kubectl apply -f -
+      > "/tmp/known_hosts"
+  args:
+    executable: /bin/bash
+  run_once: true
+  
+- name: Generate SSH key and register deploy key on GitHub
+  ansible.builtin.shell: |
+    set -eo pipefail
+    mkdir -p /tmp/flux-deploy-keys
+    KEYFILE="/tmp/flux-deploy-keys/$ITEM_NAME-id_ed25519"
+    rm -f "$KEYFILE" "${KEYFILE}.pub"
+    ssh-keygen -t ed25519 -f "$KEYFILE" -N "" -C "flux-$ITEM_NAME" -q
+    echo "Generated deploy key $ITEM_NAME-id_ed25519"
   args:
     executable: /bin/bash
   environment:
-    GITHUB_TOKEN: "{{ vault_flux_github_token }}"
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+    ITEM_NAME: "{{ item.name }}"
   loop: "{{ flux_apps }}"
   loop_control:
     index_var: idx
   when: not app_manifest.results[idx].stat.exists
-  no_log: true
+  run_once: true
+
+- name: Register deploy key on GitHub
+  ansible.builtin.shell: |
+    set -eo pipefail
+    KEYFILE="/tmp/flux-deploy-keys/$ITEM_NAME-id_ed25519"
+    PUBKEY=$(cat "${KEYFILE}.pub")
+    curl -sS --fail --connect-timeout 10 --max-time 30 -X POST \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/martin-nef/$ITEM_NAME/keys" \
+      -d "{\"title\":\"flux-$ITEM_NAME\",\"key\":\"$PUBKEY\",\"read_only\":true}"
+    echo "Registered deploy key flux-$ITEM_NAME"
+  args:
+    executable: /bin/bash
+  environment:
+    GITHUB_TOKEN: "{{ vault_flux_github_token }}"
+    ITEM_NAME: "{{ item.name }}"
+  loop: "{{ flux_apps }}"
+  loop_control:
+    index_var: idx
+  when: not app_manifest.results[idx].stat.exists
+  run_once: true
+
+- name: Create Kubernetes secret from deploy key
+  ansible.builtin.shell: |
+    set -eo pipefail
+    KEYFILE="/tmp/flux-deploy-keys/$ITEM_NAME-id_ed25519"
+
+    kubectl -n flux-system create secret generic $ITEM_NAME-auth \
+      --from-file=identity="$KEYFILE" \
+      --from-file=known_hosts="/tmp/known_hosts" \
+      --dry-run=client -o yaml | kubectl apply -f -
+
+    rm -f "$KEYFILE" "${KEYFILE}.pub"
+    echo "Created Kubernetes secret $ITEM_NAME-auth"
+  args:
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+    ITEM_NAME: "{{ item.name }}"
+  loop: "{{ flux_apps }}"
+  loop_control:
+    index_var: idx
+  when: not app_manifest.results[idx].stat.exists
   run_once: true
 
 - name: Export app manifests with flux
   ansible.builtin.shell: |
     set -eo pipefail
-    flux create source git {{ item.name }} \
-      --url=git@github.com:martin-nef/{{ item.name }}.git \
-      --branch={{ item.branch | default("main") }} \
+    flux create source git $ITEM_NAME \
+      --url=git@github.com:martin-nef/$ITEM_NAME.git \
+      --branch=$BRANCH \
       --interval=1m \
-      --secret-ref={{ item.name }}-auth \
-      --export > /tmp/{{ item.name }}.yaml
-    flux create kustomization {{ item.name }} \
-      --source=GitRepository/{{ item.name }} \
-      --path={{ item.path | default('./deploy') }} \
+      --secret-ref=$ITEM_NAME-auth \
+      --export > /tmp/$ITEM_NAME.yaml
+    flux create kustomization $ITEM_NAME \
+      --source=GitRepository/$ITEM_NAME \
+      --path=$ITEM_PATH \
       --prune=true \
       --interval=10m \
-      --export >> /tmp/{{ item.name }}.yaml
+      --export >> /tmp/$ITEM_NAME.yaml
   args:
     executable: /bin/bash
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+    ITEM_NAME: "{{ item.name }}"
+    BRANCH: "{{ item.branch | default('main') }}"
+    ITEM_PATH: "{{ item.path | default('./deploy') }}"
   loop: "{{ flux_apps }}"
   loop_control:
     index_var: idx
