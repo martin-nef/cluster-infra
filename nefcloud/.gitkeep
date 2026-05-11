@@ -1,2 +1,0 @@
-# Flux watches this directory for Kubernetes manifests.
-# Add your Deployment, Service, ConfigMap, etc. YAML files here.
