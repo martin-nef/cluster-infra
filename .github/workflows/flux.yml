@@ -1,13 +1,6 @@
 name: Flux
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ansible/group_vars/all/vars.yml
-      - ansible/roles/flux/**
-      - ansible/playbook.yml
-      - .github/workflows/flux.yml
   workflow_dispatch:
 
 concurrency:
