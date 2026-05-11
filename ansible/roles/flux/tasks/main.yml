@@ -51,12 +51,11 @@
       'github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=' \
       > "$KNOWN_HOSTS"
 
-    REPO_PATH="{{ item.url }}"
     PUBKEY=$(cat "${KEYFILE}.pub")
     curl -sS -X POST \
       -H "Authorization: token $GITHUB_TOKEN" \
       -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/repos/${REPO_PATH}/keys" \
+      "https://api.github.com/repos/martin-nef/${item.name}/keys" \
       -d "{\"title\":\"flux-{{ item.name }}\",\"key\":\"$PUBKEY\",\"read_only\":true}"
 
     kubectl -n flux-system create secret generic {{ item.name }}-auth \
@@ -79,8 +78,8 @@
   ansible.builtin.shell: |
     set -eo pipefail
     flux create source git {{ item.name }} \
-      --url=git@github.com:{{ item.url }}.git \
-      --branch={{ item.branch }} \
+      --url=git@github.com:martin-nef/{{ item.name }}.git \
+      --branch={{ item.branch | default("main") }} \
       --interval=1m \
       --secret-ref={{ item.name }}-auth \
       --export > /tmp/{{ item.name }}.yaml
@@ -111,7 +110,7 @@
 
 - name: Set up git credentials for push
   ansible.builtin.copy:
-    content: "https://martin-nef:{{ vault_flux_github_token }}@github.com"
+    content: "https://Flux:{{ vault_flux_github_token }}@github.com"
     dest: "/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}"
     mode: '0600'
   no_log: true
@@ -124,14 +123,15 @@
   ansible.builtin.shell: |
     set -e
     cd "{{ playbook_dir }}/.."
-    git add nefcloud/apps/
-    git fetch origin main
-    git rebase origin/main
-    git add nefcloud/apps/
+    git add nefcloud/
+    git stash push --staged
+    git switch -f main
+    git pull origin main
+    git stash pop --index
     if ! git diff --cached --quiet; then
       git commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
       git -c credential.helper="store --file=/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}" \
-        push https://github.com/martin-nef/cluster-infra.git deploy
+        push
     fi
   delegate_to: localhost
   run_once: true

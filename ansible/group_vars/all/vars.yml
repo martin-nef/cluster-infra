@@ -1,11 +1,5 @@
 ---
 flux_apps:
   - name: smart-reviewer
-    url: https://github.com/martin-nef/smart-reviewer
-    branch: main
   - name: proj-kata
-    url: https://github.com/martin-nef/proj_kata
-    branch: main
   - name: minecraft
-    url: https://github.com/martin-nef/minecraft
-    branch: main
