@@ -16,11 +16,11 @@
 - name: Bootstrap Flux
   ansible.builtin.command: >
     flux bootstrap github
-    --owner=martin-nef
-    --repository=cluster-infra
-    --branch=main
-    --path=nefcloud
-    --personal
+      --owner=martin-nef
+      --repository=cluster-infra
+      --branch=main
+      --path=nefcloud
+      --personal
   environment:
     GITHUB_TOKEN: "{{ vault_flux_github_token }}"
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
@@ -38,9 +38,9 @@
 - name: Create git credentials secret
   ansible.builtin.shell: >
     kubectl -n flux-system create secret generic {{ item.name }}-auth
-    --from-literal=username=git
-    --from-literal=password="$GITHUB_TOKEN"
-    --dry-run=client -o yaml | kubectl apply -f -
+      --from-literal=username=git
+      --from-literal=password="$GITHUB_TOKEN"
+      --dry-run=client -o yaml | kubectl apply -f -
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
     GITHUB_TOKEN: "{{ vault_flux_github_token }}"
@@ -85,6 +85,16 @@
     index_var: idx
   when: not app_manifest.results[idx].stat.exists
 
+- name: Set up git credentials for push
+  ansible.builtin.copy:
+    content: "https://martin-nef:{{ vault_flux_github_token }}@github.com"
+    dest: "/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}"
+    mode: '0600'
+  no_log: true
+  delegate_to: localhost
+  run_once: true
+  when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
+
 - name: Commit and push manifests
   become: false
   ansible.builtin.shell: |
@@ -93,11 +103,17 @@
     git add nefcloud/apps/
     if ! git diff --cached --quiet; then
       git commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
-      git push https://martin-nef:${GITHUB_TOKEN}@github.com/martin-nef/cluster-infra.git deploy
+      git -c credential.helper="store --file=/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}" \
+        push https://github.com/martin-nef/cluster-infra.git deploy
     fi
   delegate_to: localhost
-  environment:
-    GITHUB_TOKEN: "{{ vault_flux_github_token }}"
   run_once: true
-  no_log: true
   when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
+
+- name: Clean up git credentials
+  ansible.builtin.file:
+    path: "/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
