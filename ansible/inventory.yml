@@ -25,7 +25,7 @@ k3s_cluster:
     # TODO: set up this node at some point to add GPU capacity
     #     dumb-computer:
   vars:
-    k3s_version: v1.32.0+k3s1
+    k3s_version: v1.36.0+k3s1
     token: "{{ vault_k3s_token }}"   # store in Ansible Vault
 
     # All inter-node k3s traffic uses Tailscale IPs.
