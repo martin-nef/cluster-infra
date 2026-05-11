@@ -115,7 +115,7 @@
   ansible.builtin.shell: |
     set -eo pipefail
     flux create source git $ITEM_NAME \
-      --url=git@github.com:martin-nef/$ITEM_NAME.git \
+      --url=ssh://git@github.com/martin-nef/$ITEM_NAME.git \
       --branch=$BRANCH \
       --interval=1m \
       --secret-ref=$ITEM_NAME-auth \
