@@ -12,7 +12,6 @@ spec:
     name: minecraft-auth
   url: https://github.com/martin-nef/minecraft
 ---
----
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
@@ -25,3 +24,7 @@ spec:
   sourceRef:
     kind: GitRepository
     name: minecraft
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age-minecraft
