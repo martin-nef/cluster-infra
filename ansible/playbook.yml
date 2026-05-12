@@ -39,6 +39,37 @@
   tags: [k3s]
   when: "'all' in ansible_run_tags or 'k3s' in ansible_run_tags"
 
+- name: Configure k3s registry credentials
+  hosts: all
+  become: true
+  gather_facts: false
+  tags: [k3s-registry]
+  tasks:
+    - name: Ensure k3s config directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+
+    - name: Configure ghcr.io pull credentials
+      no_log: true
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: '0600'
+        content: |
+          configs:
+            ghcr.io:
+              auth:
+                username: "{{ vault_ghcr_username }}"
+                password: "{{ vault_ghcr_token }}"
+      notify: Restart k3s
+
+  handlers:
+    - name: Restart k3s
+      ansible.builtin.service:
+        name: "{{ 'k3s' if 'server' in group_names else 'k3s-agent' }}"
+        state: restarted
+
 - name: Bootstrap Flux
   hosts: server[0]                     # Flux controllers are deployed to the cluster and float across nodes.
   become: true                         # Bootstrap only needs to run once, from the first server.
