@@ -7,23 +7,37 @@ k3s_cluster:
           ansible_user: deploy
           tailscale_ip: 100.102.128.57
           tailscale_host: shitbox
-    agent:
-      hosts:
         oci-small-1:
           ansible_user: ubuntu
           tailscale_ip: 100.68.249.22
           tailscale_host: oci-small-1
+          extra_server_args: |
+            --node-ip {{ tailscale_ip }}
+            --advertise-address {{ tailscale_ip }}
+            --tls-san {{ tailscale_host }}
+            --disable-apiserver
+            --disable-controller-manager
+            --disable-scheduler
         oci-small-2:
           ansible_user: ubuntu
           tailscale_ip: 100.99.86.111
           tailscale_host: oci-small-2
-        oci-big:
+          extra_server_args: |
+            --node-ip {{ tailscale_ip }}
+            --advertise-address {{ tailscale_ip }}
+            --tls-san {{ tailscale_host }}
+            --disable-etcd
+        oci-big-1:
           ansible_user: ubuntu
           # Tailscale 100.x IP — fill in from `tailscale ip -4` on the host
-          tailscale_ip: 100.94.164.28
-          tailscale_host: oci-big
+          tailscale_ip: 100.109.118.21
+          tailscale_host: oci-big-1
+
     # TODO: set up this node at some point to add GPU capacity
+    # agent:
+    #   hosts:
     #     dumb-computer:
+
   vars:
     k3s_version: v1.36.0+k3s1
     token: "{{ vault_k3s_token }}"   # store in Ansible Vault
