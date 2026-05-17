@@ -5,3 +5,5 @@ resources:
   - configmaps.yaml
   - helmrepo.yaml
   - secrets.yaml
+  - helmrelease.yaml
+
