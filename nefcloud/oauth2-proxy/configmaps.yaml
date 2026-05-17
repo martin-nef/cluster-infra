@@ -1,0 +1,9 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: admin-emails
+  namespace: oauth2-proxy
+data:
+  allowed_emails.txt: |
+    martin.nefjodov@gmail.com
