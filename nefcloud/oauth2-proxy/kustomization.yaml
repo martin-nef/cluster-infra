@@ -6,4 +6,3 @@ resources:
   - helmrepo.yaml
   - secrets.yaml
   - helmrelease.yaml
-
