@@ -11,10 +11,8 @@ k3s_cluster:
           ansible_user: ubuntu
           tailscale_ip: 100.68.249.22
           tailscale_host: oci-small-1
-          extra_server_args: |
-            --node-ip {{ tailscale_ip }}
-            --advertise-address {{ tailscale_ip }}
-            --tls-san {{ tailscale_host }}
+          extra_server_args: >-
+            {{ default_server_args }}
             --disable-apiserver
             --disable-controller-manager
             --disable-scheduler
@@ -22,10 +20,8 @@ k3s_cluster:
           ansible_user: ubuntu
           tailscale_ip: 100.99.86.111
           tailscale_host: oci-small-2
-          extra_server_args: |
-            --node-ip {{ tailscale_ip }}
-            --advertise-address {{ tailscale_ip }}
-            --tls-san {{ tailscale_host }}
+          extra_server_args: >-
+            {{ default_server_args }}
             --disable-etcd
         oci-big-1:
           ansible_user: ubuntu
@@ -52,11 +48,14 @@ k3s_cluster:
     agent_config_yaml: |
       flannel-iface: tailscale0
 
+
     # Every server advertises and binds to its Tailscale IP.
-    extra_server_args: >-
+    extra_server_args: "{{ default_server_args }}"
+    default_server_args: >-
       --node-ip {{ tailscale_ip }}
       --advertise-address {{ tailscale_ip }}
       --tls-san {{ tailscale_host }}
 
     # Agents also bind to their Tailscale IP.
-    extra_agent_args: "--node-ip {{ tailscale_ip }}"
+    extra_agent_args: "{{ default_agent_args }}"
+    default_agent_args: "--node-ip {{ tailscale_ip }}"
