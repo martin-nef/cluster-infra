@@ -7,3 +7,5 @@ autoinstall/autoinstall.yaml
 ansible/collections/
 .codex
 .agents
+age.agekey
+
