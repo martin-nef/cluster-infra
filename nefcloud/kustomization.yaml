@@ -5,3 +5,4 @@ resources:
   - tailscale
   - apps
   - longhorn
+  - cloudflared
