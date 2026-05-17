@@ -16,6 +16,7 @@ k3s_cluster:
             --disable-apiserver
             --disable-controller-manager
             --disable-scheduler
+            --node-taint workload=no:NoSchedule
         oci-small-2:
           ansible_user: ubuntu
           tailscale_ip: 100.99.86.111
@@ -23,6 +24,7 @@ k3s_cluster:
           extra_server_args: >-
             {{ default_server_args }}
             --disable-etcd
+            --node-taint workload=no:NoSchedule
         oci-big-1:
           ansible_user: ubuntu
           # Tailscale 100.x IP — fill in from `tailscale ip -4` on the host
