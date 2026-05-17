@@ -6,7 +6,7 @@ metadata:
 data:
   config.yaml: |
     tunnel: 55b9993e-5d22-4ec0-b996-2cfa58ebaf33
-    credentials-file: /etc/cloudflared/credentials.json
+    credentials-file: /etc/cloudflared-credentials/credentials.json
 
     # Static pass-through: Forward ALL wildcard traffic straight to Traefik
     ingress:
