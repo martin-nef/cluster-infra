@@ -5,5 +5,5 @@ metadata:
   name: longhorn-repo
   namespace: longhorn-system
 spec:
-  interval: 2h0m0s
+  interval: 12h
   url: https://charts.longhorn.io
