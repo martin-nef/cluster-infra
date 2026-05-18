@@ -4,7 +4,6 @@ metadata:
   name: oauth2-proxy-ingress
   namespace: oauth2-proxy
 spec:
-  ingressClassName: nginx
   rules:
     - host: oauth2-proxy.nefcloud.top
       http:
@@ -13,6 +12,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: oauth2-proxy
+                name: oauth2-proxy-service
                 port:
                   number: 4180

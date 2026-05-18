@@ -7,3 +7,4 @@ resources:
   - helmrepo.yaml
   - secrets.yaml
   - ingress.yaml
+  - middleware.yaml

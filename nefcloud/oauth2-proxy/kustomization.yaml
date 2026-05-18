@@ -6,4 +6,4 @@ resources:
   - helmrepo.yaml
   - secrets.yaml
   - helmrelease.yaml
-  - ingress.yaml
+  - middleware.yaml
