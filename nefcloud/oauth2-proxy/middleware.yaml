@@ -1,0 +1,47 @@
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: oauth-forwardauth
+  namespace: oauth2-proxy
+spec:
+  forwardAuth:
+    address: "http://oauth2-proxy-release.oauth2-proxy.svc.cluster.local/oauth2/auth"
+    trustForwardHeader: true
+    authRequestHeaders:
+      - Authorization
+    authResponseHeaders:
+      - X-Auth-Request-User
+      - X-Auth-Request-Email
+      - X-Auth-Request-Preferred-Username
+      - Authorization
+      - Set-Cookie
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: oauth-errors
+  namespace: oauth2-proxy
+spec:
+  errors:
+    status:
+      - "401-403"
+    service:
+      name: oauth2-proxy-release
+      namespace: oauth2-proxy
+      port: http
+      passHostHeader: false
+    # query: "/oauth2/sign_in?rd=https://{host}{path}{query}"
+    # query: "/oauth2/sign_in?rd={url}"
+    query: "/oauth2/start?rd=https%3A%2F%2F{host}{escapedPath}"
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: google
+  namespace: oauth2-proxy
+spec:
+  chain:
+    middlewares:
+      - name: oauth-errors
+      - name: oauth-forwardauth

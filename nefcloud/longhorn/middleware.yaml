@@ -1,0 +1,19 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-auth
+  namespace: longhorn-system
+spec:
+  basicAuth:
+    secret: basic-auth
+    realm: "Authentication Required " # Equivalent to auth-realm
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: upload-limit
+  namespace: longhorn-system
+spec:
+  buffering:
+    # 10000m (10GB) converted to bytes: 10485760000
+    maxRequestBodyBytes: 10485760000

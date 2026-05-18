@@ -1,28 +1,44 @@
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: longhorn-ingress
   namespace: longhorn-system
   annotations:
-    # type of authentication
-    nginx.ingress.kubernetes.io/auth-type: basic
-    # prevent the controller from redirecting (308) to HTTPS
-    nginx.ingress.kubernetes.io/ssl-redirect: 'false'
-    # name of the secret that contains the user/password definitions
-    nginx.ingress.kubernetes.io/auth-secret: basic-auth
-    # message to display with an appropriate context why the authentication is required
-    nginx.ingress.kubernetes.io/auth-realm: 'Authentication Required '
-    # custom max body size for file uploading like backing image uploading
-    nginx.ingress.kubernetes.io/proxy-body-size: 10000m
+    traefik.ingress.kubernetes.io/router.middlewares: >-
+      longhorn-system-basic-auth@kubernetescrd,
+      longhorn-system-upload-limit@kubernetescrd
 spec:
-  ingressClassName: nginx
   rules:
-  - http:
-      paths:
-      - pathType: Prefix
-        path: "/"
-        backend:
-          service:
-            name: longhorn-frontend
-            port:
-              number: 80
+    - host: longhornbasic.nefcloud.top
+      http:
+        paths:
+          - pathType: Prefix
+            path: "/"
+            backend:
+              service:
+                name: longhorn-frontend
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn-ui-ingress
+  namespace: longhorn-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: >-
+      oauth2-proxy-google@kubernetescrd,
+      longhorn-system-upload-limit@kubernetescrd
+spec:
+  rules:
+    - host: longhorn.nefcloud.top
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: longhorn-frontend
+                port:
+                  number: 80

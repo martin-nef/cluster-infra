@@ -17,8 +17,24 @@ spec:
   values:
     config:
       existingSecret: google-oauth2-creds
+      provider: google
+      cookieDomain: .nefcloud.top
     extraArgs:
       cookie-secure: "true"
       cookie-refresh: "1h"
       cookie-expire: "168h"
       skip-provider-button: "true"
+      upstream: static://200
+      reverse-proxy: "true"
+      set-xauthrequest: "true"
+      email-domain: ""
+      whitelist-domain: .nefcloud.top
+      authenticated-emails-file: /etc/oauth2-proxy-config/allowed_emails.txt
+    volumes:
+      - name: config-volume
+        configMap:
+          name: admin-emails
+    volumeMounts:
+      - name: config-volume
+        mountPath: /etc/oauth2-proxy-config
+        readOnly: true

@@ -10,4 +10,5 @@ data:
 
     # Static pass-through: Forward ALL wildcard traffic straight to Traefik
     ingress:
-      - service: http://cluster.local
+      - hostname: .nefcloud.top
+        service: http://cluster.local
