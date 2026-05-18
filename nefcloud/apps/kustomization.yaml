@@ -4,3 +4,4 @@ resources:
   - minecraft.yaml
   - proj-kata.yaml
   - smart-reviewer.yaml
+  - cloudflared.yaml

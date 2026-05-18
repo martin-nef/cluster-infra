@@ -1,0 +1,30 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: cloudflared
+  namespace: flux-system
+spec:
+  interval: 1m
+  ref:
+    branch: main
+  secretRef:
+    name: cloudflared-auth
+  url: ssh://git@github.com/martin-nef/cluster-infra.git
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: cloudflared
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./nefcloud/apps/cloudflared
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: cloudflared
+  decryption:
+    provider: sops
+    secretRef:
+      name: flux-sops-age
