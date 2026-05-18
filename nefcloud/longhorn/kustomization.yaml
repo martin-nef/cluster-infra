@@ -5,6 +5,6 @@ resources:
   - namespace.yaml
   - helmrelease.yaml
   - helmrepo.yaml
-  - secrets.yaml
+  # - secrets.yaml
   - ingress.yaml
   - middleware.yaml
