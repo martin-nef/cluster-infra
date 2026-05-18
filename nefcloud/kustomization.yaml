@@ -6,3 +6,4 @@ resources:
   - apps
   - longhorn
   - oauth2-proxy
+  - cloudflared
