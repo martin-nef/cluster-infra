@@ -28,3 +28,4 @@ spec:
     provider: sops
     secretRef:
       name: flux-sops-age
+
