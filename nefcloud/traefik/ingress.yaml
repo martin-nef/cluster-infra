@@ -1,0 +1,21 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: traefik-dashboard-ingress
+  namespace: kube-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: >-
+      oauth2-proxy-google@kubernetescrd
+spec:
+  rules:
+    - host: traefik.nefcloud.top
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: traefik
+                port:
+                  number: 80
