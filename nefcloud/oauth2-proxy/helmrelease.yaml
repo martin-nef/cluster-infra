@@ -33,6 +33,7 @@ spec:
       skip-provider-button: "true"
       upstream: static://200
       reverse-proxy: "true"
+      proxy-prefix: "/oauth2"
       set-xauthrequest: "true"
       email-domain: ""
       whitelist-domain: .nefcloud.top
