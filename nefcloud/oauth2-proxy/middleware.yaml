@@ -10,6 +10,7 @@ spec:
     trustForwardHeader: true
     authRequestHeaders:
       - Authorization
+      - Cookie
     authResponseHeaders:
       - X-Auth-Request-User
       - X-Auth-Request-Email
