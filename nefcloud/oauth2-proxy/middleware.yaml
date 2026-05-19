@@ -6,7 +6,7 @@ metadata:
   namespace: oauth2-proxy
 spec:
   forwardAuth:
-    address: "http://oauth2-proxy-release.oauth2-proxy.svc.cluster.local/oauth2/validate"
+    address: "http://oauth2-proxy-release.oauth2-proxy.svc.cluster.local/oauth2/auth"
     trustForwardHeader: true
     authRequestHeaders:
       - Authorization
