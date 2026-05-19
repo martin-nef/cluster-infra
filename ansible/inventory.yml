@@ -27,7 +27,7 @@ k3s_cluster:
       hosts:
         oci-small-2:
           ansible_user: ubuntu
-          tailscale_ip: 100.99.86.111
+          tailscale_ip: 100.71.125.10
           tailscale_host: oci-small-2
     # TODO: set up this node at some point to add GPU capacity
     #     dumb-computer:
