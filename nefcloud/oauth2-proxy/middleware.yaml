@@ -45,5 +45,5 @@ metadata:
 spec:
   chain:
     middlewares:
-      # - name: oauth-errors
+      - name: oauth-errors
       - name: oauth-forwardauth

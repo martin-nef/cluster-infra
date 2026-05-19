@@ -21,6 +21,25 @@ spec:
                 port:
                   number: 80
 ---
+# No auth middleware — oauth2 callback/start must be reachable BEFORE the session cookie is set
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn-oauth2-ingress
+  namespace: longhorn-system
+spec:
+  rules:
+    - host: longhorn.nefcloud.top
+      http:
+        paths:
+          - path: /oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: oauth2-proxy-bridge
+                port:
+                  number: 80
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -35,13 +54,6 @@ spec:
     - host: longhorn.nefcloud.top
       http:
         paths:
-          - path: /oauth2
-            pathType: Prefix
-            backend:
-              service:
-                name: oauth2-proxy-bridge
-                port:
-                  number: 80
           - path: /
             pathType: Prefix
             backend:
