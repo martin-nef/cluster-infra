@@ -30,7 +30,7 @@ spec:
       name: oauth2-proxy-release
       namespace: oauth2-proxy
       port: http
-      passHostHeader: false
+      passHostHeader: true
     # query: "/oauth2/sign_in?rd=https://{host}{path}{query}"
     # query: "/oauth2/sign_in?rd={url}"
     query: "/oauth2/start?rd=https%3A%2F%2F{host}{escapedPath}"
