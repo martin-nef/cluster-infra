@@ -35,7 +35,8 @@ spec:
       passHostHeader: true
     # query: "/oauth2/sign_in?rd=https://{host}{path}{query}"
     # query: "/oauth2/sign_in?rd={url}"
-    query: "/oauth2/start?rd=https%3A%2F%2F{host}{escapedPath}"
+    # query: "/oauth2/start?rd=https%3A%2F%2F{host}{escapedPath}" # 100% Doesn't work
+    query: "/oauth2/start?rd={url}"
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
