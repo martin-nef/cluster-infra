@@ -19,6 +19,11 @@ spec:
       existingSecret: google-oauth2-creds
       provider: google
       cookieDomain: .nefcloud.top
+    authenticatedEmailsFile:
+      enabled: true
+      persistence: configmap
+      template: admin-emails
+      restrictedUserAccessKey: allowed_emails.txt
     extraArgs:
       cookie-secure: "true"
       cookie-refresh: "1h"
@@ -30,11 +35,11 @@ spec:
       email-domain: ""
       whitelist-domain: .nefcloud.top
       authenticated-emails-file: /etc/oauth2-proxy-config/allowed_emails.txt
-    volumes:
-      - name: config-volume
-        configMap:
-          name: admin-emails
-    volumeMounts:
-      - name: config-volume
-        mountPath: /etc/oauth2-proxy-config
-        readOnly: true
+    # extraVolumes:
+    #   - name: config-volume
+    #     configMap:
+    #       name: admin-emails
+    # extraVolumeMounts:
+    #   - name: config-volume
+    #     mountPath: /etc/oauth2-proxy-config
+    #     readOnly: true
