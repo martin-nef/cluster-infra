@@ -13,4 +13,4 @@ spec:
         kind: HelmRepository
         name: tailscale-repo
       version: 1.96.5
-  interval: 2h0m0s
+  interval: 1m

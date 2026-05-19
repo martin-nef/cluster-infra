@@ -6,4 +6,4 @@ metadata:
   namespace: oauth2-proxy
 spec:
   url: https://oauth2-proxy.github.io/manifests
-  interval: 12h
+  interval: 12h0m1s

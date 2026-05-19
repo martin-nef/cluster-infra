@@ -13,7 +13,7 @@ spec:
         kind: HelmRepository
         name: oauth2-proxy-repo
       version: ">=10.0.0 <11.0.0"
-  interval: 10m0s
+  interval: 1m
   values:
     config:
       existingSecret: google-oauth2-creds
