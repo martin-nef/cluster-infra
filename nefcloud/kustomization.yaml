@@ -7,3 +7,4 @@ resources:
   - longhorn
   - oauth2-proxy
   - cloudflared
+  - traefik
