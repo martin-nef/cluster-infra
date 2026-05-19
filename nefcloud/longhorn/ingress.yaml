@@ -70,3 +70,8 @@ metadata:
 spec:
   type: ExternalName
   externalName: oauth2-proxy-release.oauth2-proxy.svc.cluster.local
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
