@@ -5,5 +5,7 @@ ingress:
   - hostname: "minecraft2.nefcloud.top"
     service: tcp://minecraft.minecraft.svc.cluster.local:25565
   - hostname: "*.nefcloud.top"
-    service: http://traefik.kube-system.svc.cluster.local:80
+    service: https://traefik.kube-system.svc.cluster.local:443
+    originRequest:
+      noTLSVerify: true
   - service: http_status:404
