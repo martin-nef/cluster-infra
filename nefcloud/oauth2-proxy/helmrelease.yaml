@@ -32,7 +32,6 @@ spec:
       cookie-csrf-per-request: "true"
       skip-provider-button: "true"
       upstream: static://200
-      upstreams: [static://200]
       reverse-proxy: "true"
       proxy-prefix: "/oauth2"
       set-xauthrequest: "true"
