@@ -176,7 +176,9 @@
     git pull origin main
     git stash pop --index
     if ! git diff --cached --quiet; then
-      git commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
+      git -c user.name="Flux Bot" \
+        -c user.email="flux@users.noreply.github.com" \
+        commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
       git -c credential.helper="store --file=/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}" \
         push
     fi
