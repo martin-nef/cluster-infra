@@ -5,3 +5,4 @@ flux_apps:
   - name: minecraft
   - name: playit
     repo: playit-gg
+  - name: valheim
