@@ -24,3 +24,7 @@ spec:
   sourceRef:
     kind: GitRepository
     name: playit
+  decryption:
+    provider: sops
+    secretRef:
+      name: playit-sops-age
