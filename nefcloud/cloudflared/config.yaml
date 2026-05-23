@@ -2,8 +2,6 @@ tunnel: 55b9993e-5d22-4ec0-b996-2cfa58ebaf33
 credentials-file: /etc/cloudflared-credentials/credentials.json
 protocol: http2
 ingress:
-  - hostname: "minecraft2.nefcloud.top"
-    service: tcp://minecraft.minecraft.svc.cluster.local:25565
   - hostname: "*.nefcloud.top"
     service: https://traefik.kube-system.svc.cluster.local:443
     originRequest:
