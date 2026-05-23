@@ -158,7 +158,7 @@
 - name: Commit and push manifests
   become: false
   ansible.builtin.shell: |
-    set -e
+    set -eo pipefail
     cd "{{ playbook_dir }}/.."
     git add nefcloud/
     git stash push --staged
@@ -172,6 +172,8 @@
       git -c credential.helper="" \
         push "https://x-access-token:${PUSH_TOKEN}@github.com/martin-nef/cluster-infra.git"
     fi
+  args:
+    executable: /bin/bash
   environment:
     PUSH_TOKEN: "{{ vault_flux_github_token }}"
   delegate_to: localhost
