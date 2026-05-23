@@ -4,6 +4,7 @@
     curl -s https://fluxcd.io/install.sh | sudo bash
   args:
     creates: /usr/local/bin/flux
+  run_once: true
 
 - name: Check if Flux is already bootstrapped
   ansible.builtin.command: kubectl -n flux-system get deployment source-controller
@@ -12,6 +13,7 @@
   register: flux_check
   failed_when: false
   changed_when: false
+  run_once: true
 
 - name: Bootstrap Flux
   ansible.builtin.command: >
@@ -25,6 +27,7 @@
     GITHUB_TOKEN: "{{ vault_flux_github_token }}"
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   when: flux_check.rc != 0
+  run_once: true
 
 - name: Check if app manifest already exists
   become: false
@@ -139,6 +142,7 @@
   loop_control:
     index_var: idx
   when: not app_manifest.results[idx].stat.exists
+  run_once: true
 
 - name: Fetch manifests to repo
   ansible.builtin.fetch:
@@ -149,6 +153,7 @@
   loop_control:
     index_var: idx
   when: not app_manifest.results[idx].stat.exists
+  run_once: true
 
 - name: Set up git credentials for push
   ansible.builtin.copy:
@@ -157,8 +162,8 @@
     mode: '0600'
   no_log: true
   delegate_to: localhost
-  run_once: true
   when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
+  run_once: true
 
 - name: Commit and push manifests
   become: false
@@ -176,13 +181,13 @@
         push
     fi
   delegate_to: localhost
-  run_once: true
   when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
+  run_once: true
 
 - name: Clean up git credentials
   ansible.builtin.file:
     path: "/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}"
     state: absent
   delegate_to: localhost
-  run_once: true
   changed_when: false
+  run_once: true
