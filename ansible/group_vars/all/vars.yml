@@ -4,3 +4,4 @@ flux_apps:
   - name: proj-kata
   - name: minecraft
   - name: playit
+    repo: playit-gg
