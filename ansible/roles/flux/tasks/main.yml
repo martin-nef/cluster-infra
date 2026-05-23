@@ -155,16 +155,6 @@
   when: not app_manifest.results[idx].stat.exists
   run_once: true
 
-- name: Set up git credentials for push
-  ansible.builtin.copy:
-    content: "https://Flux:{{ vault_flux_github_token }}@github.com"
-    dest: "/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}"
-    mode: '0600'
-  no_log: true
-  delegate_to: localhost
-  when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
-  run_once: true
-
 - name: Commit and push manifests
   become: false
   ansible.builtin.shell: |
@@ -179,17 +169,11 @@
       git -c user.name="Flux Bot" \
         -c user.email="flux@users.noreply.github.com" \
         commit -m "chore(flux): register {{ flux_apps | map(attribute='name') | join(', ') }}"
-      git -c credential.helper="store --file=/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}" \
-        push
+      git -c credential.helper="" \
+        push "https://x-access-token:${PUSH_TOKEN}@github.com/martin-nef/cluster-infra.git"
     fi
+  environment:
+    PUSH_TOKEN: "{{ vault_flux_github_token }}"
   delegate_to: localhost
   when: not app_manifest.results | selectattr('stat.exists', 'equalto', false) | list | length == 0
-  run_once: true
-
-- name: Clean up git credentials
-  ansible.builtin.file:
-    path: "/tmp/.git-credentials-flux-{{ inventory_hostname_short | default('default') }}"
-    state: absent
-  delegate_to: localhost
-  changed_when: false
   run_once: true
