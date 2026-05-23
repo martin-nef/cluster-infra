@@ -12,3 +12,4 @@ decrypt:
 
 encrypt:
 	./encrypt.sh
+
