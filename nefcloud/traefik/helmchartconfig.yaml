@@ -1,0 +1,14 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    nodeSelector:
+      node-role.kubernetes.io/gateway: "true"
+    tolerations:
+      - key: node-role.kubernetes.io/gateway
+        operator: Equal
+        value: "true"
+        effect: NoSchedule

@@ -13,6 +13,13 @@ spec:
       labels:
         app: cloudflared
     spec:
+      nodeSelector:
+        node-role.kubernetes.io/gateway: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/gateway
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
       containers:
         - name: cloudflared
           image: cloudflare/cloudflared:latest
