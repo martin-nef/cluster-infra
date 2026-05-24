@@ -12,6 +12,9 @@ spec:
         operator: Equal
         value: "true"
         effect: NoSchedule
+    providers:
+      kubernetesCRD:
+        allowCrossNamespace: true
     ports:
       minecraft-modded:
         port: 25566
