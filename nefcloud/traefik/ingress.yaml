@@ -1,21 +1,18 @@
 ---
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
 metadata:
-  name: traefik-dashboard-ingress
+  name: traefik-dashboard
   namespace: kube-system
-  annotations:
-    traefik.ingress.kubernetes.io/router.middlewares: >-
-      oauth2-proxy-google@kubernetescrd
 spec:
-  rules:
-    - host: traefik.nefcloud.top
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: traefik
-                port:
-                  number: 80
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: Host(`traefik.nefcloud.top`)
+      middlewares:
+        - name: google
+          namespace: oauth2-proxy
+      services:
+        - kind: TraefikService
+          name: api@internal
