@@ -12,3 +12,10 @@ spec:
         operator: Equal
         value: "true"
         effect: NoSchedule
+    ports:
+      minecraft-modded:
+        port: 25566
+        expose:
+          default: true
+        exposedPort: 25566
+        protocol: TCP
