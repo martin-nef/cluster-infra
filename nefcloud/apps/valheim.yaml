@@ -27,4 +27,4 @@ spec:
   decryption:
     provider: sops
     secretRef:
-      name: flux-sops-age
+      name: valheim-sops-age
