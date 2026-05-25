@@ -22,7 +22,7 @@ spec:
           default: true
         exposedPort: 25566
         protocol: TCP
-      mc-vanilla:
+      minecraft-vanilla:
         port: 25565
         expose:
           default: true
