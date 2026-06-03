@@ -119,10 +119,15 @@
   ansible.builtin.shell: |
     set -eo pipefail
     AGEKEY="{{ playbook_dir }}/../age.agekey"
-    kubectl -n flux-system create secret generic $ITEM_NAME-sops-age \
-      --from-file=age.agekey="$AGEKEY" \
-      --dry-run=client -o yaml | kubectl apply -f -
-    echo "Created Kubernetes secret $ITEM_NAME-sops-age"
+    # Create-if-absent: never overwrite an existing key, as some apps
+    # were encrypted with their own age key.
+    if kubectl -n flux-system get secret "$ITEM_NAME-sops-age" >/dev/null 2>&1; then
+      echo "Secret $ITEM_NAME-sops-age already exists, skipping"
+    else
+      kubectl -n flux-system create secret generic "$ITEM_NAME-sops-age" \
+        --from-file=age.agekey="$AGEKEY"
+      echo "Created Kubernetes secret $ITEM_NAME-sops-age"
+    fi
   args:
     executable: /bin/bash
   environment:
