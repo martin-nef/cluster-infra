@@ -24,3 +24,7 @@ spec:
   sourceRef:
     kind: GitRepository
     name: smart-reviewer
+  decryption:
+    provider: sops
+    secretRef:
+      name: smart-reviewer-sops-age
