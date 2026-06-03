@@ -27,4 +27,4 @@ spec:
   decryption:
     provider: sops
     secretRef:
-      name: smart-reviewer-sops-age
+      name: flux-sops-age

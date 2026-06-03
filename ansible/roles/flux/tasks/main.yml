@@ -115,27 +115,6 @@
   when: not app_manifest.results[idx].stat.exists
   run_once: true
 
-- name: Create SOPS age encryption key secrets
-  ansible.builtin.shell: |
-    set -eo pipefail
-    AGEKEY="{{ playbook_dir }}/../age.agekey"
-    # Create-if-absent: never overwrite an existing key, as some apps
-    # were encrypted with their own age key.
-    if kubectl -n flux-system get secret "$ITEM_NAME-sops-age" >/dev/null 2>&1; then
-      echo "Secret $ITEM_NAME-sops-age already exists, skipping"
-    else
-      kubectl -n flux-system create secret generic "$ITEM_NAME-sops-age" \
-        --from-file=age.agekey="$AGEKEY"
-      echo "Created Kubernetes secret $ITEM_NAME-sops-age"
-    fi
-  args:
-    executable: /bin/bash
-  environment:
-    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-    ITEM_NAME: "{{ item.name }}"
-  loop: "{{ flux_apps }}"
-  run_once: true
-
 - name: Export app manifests with flux
   ansible.builtin.shell: |
     set -eo pipefail
