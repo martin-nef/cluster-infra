@@ -16,7 +16,7 @@ spec:
       kubernetesCRD:
         allowCrossNamespace: true
     ports:
-      minecraft-modded:
+      minecraft-rpg:
         port: 25566
         expose:
           default: true
@@ -27,4 +27,16 @@ spec:
         expose:
           default: true
         exposedPort: 25565
+        protocol: TCP
+      minecraft-atm:
+        port: 25567
+        expose:
+          default: true
+        exposedPort: 25567
+        protocol: TCP
+      minecraft-create:
+        port: 25568
+        expose:
+          default: true
+        exposedPort: 25568
         protocol: TCP
