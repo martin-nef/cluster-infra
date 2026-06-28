@@ -41,8 +41,8 @@ spec:
         exposedPort: 25568
         protocol: TCP
       valheim:
-        port: 1001
+        port: 2456
         expose:
           default: true
-        exposedPort: 1001
+        exposedPort: 2456
         protocol: UDP
