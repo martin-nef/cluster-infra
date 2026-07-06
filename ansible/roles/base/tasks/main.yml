@@ -22,6 +22,21 @@
   ansible.builtin.command: tailscale up --auth-key={{ vault_tailscale_auth_key }}
   when: tailscale_up.rc != 0
 
+# TODO: Add a task to apply optimization for exit nodes (only if <host>.gateway is true in inventory and host is linux)
+# https://tailscale.com/docs/reference/best-practices/performance#linux-optimizations-for-subnet-routers-and-exit-nodes
+# 
+# enable right now:
+# NETDEV=$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")
+# sudo ethtool -K $NETDEV rx-udp-gro-forwarding on rx-gro-list off
+# 
+# if sudo systemctl is-enabled networkd-dispatcher
+#   printf '#!/bin/sh\n\nethtool -K %s rx-udp-gro-forwarding on rx-gro-list off \n' "$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")" | sudo tee /etc/networkd-dispatcher/routable.d/50-tailscale
+#   sudo chmod 755 /etc/networkd-dispatcher/routable.d/50-tailscale
+# 
+# Test if succeeded
+# sudo /etc/networkd-dispatcher/routable.d/50-tailscale
+# test $? -eq 0 || echo 'An error occurred.'
+
 # --- Unattended upgrades ---
 
 - name: Install unattended-upgrades
