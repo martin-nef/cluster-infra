@@ -51,10 +51,11 @@
     state: directory
     mode: "0755"
 
-- name: Order k3s behind tailscaled and restart it when tailscaled restarts
-  # PartOf propagates an explicit `systemctl restart tailscaled` -- which is what
-  # Tailscale's own auto-update runs from the deb postinst -- through to k3s, so
-  # flannel re-resolves tailscale0 immediately after the update.
+- name: Order k3s behind tailscaled and wait for tailscale0 before starting
+  # Deliberately no PartOf=tailscaled.service. It would propagate an explicit
+  # `systemctl restart tailscaled` through to k3s, but it also propagates a plain
+  # `systemctl stop`, which would leave k3s stopped with nothing to start it
+  # again. The ifindex guard below covers the restart case without that hazard.
   ansible.builtin.copy:
     dest: "/etc/systemd/system/{{ k3s_unit }}.service.d/10-tailscale.conf"
     mode: "0644"
@@ -62,26 +63,50 @@
       [Unit]
       After=tailscaled.service
       Wants=tailscaled.service
-      PartOf=tailscaled.service
 
       [Service]
       ExecStartPre=/bin/sh -c 'for i in $(seq 60); do ip -4 addr show tailscale0 2>/dev/null | grep -q "inet " && exit 0; sleep 2; done; exit 1'
   notify: Reload systemd
 
 - name: Install the tailscale0 ifindex guard script
-  # PartOf only propagates explicit systemctl commands. If tailscaled crashes and
-  # its own Restart= brings it back, nothing is propagated, so watch the ifindex
-  # directly and bounce k3s when the interface is replaced underneath it.
+  # The sole recovery mechanism: watch tailscale0 and bounce k3s when the
+  # interface it bound to is replaced, whether tailscaled was restarted
+  # explicitly (Tailscale auto-update) or crashed and came back on its own.
   ansible.builtin.copy:
     dest: /usr/local/bin/tailscale-flannel-guard.sh
     mode: "0755"
     content: |
       #!/bin/sh
-      # Managed by Ansible (roles/base). Restarts $1 when tailscale0 is replaced.
+      # Managed by Ansible (roles/base). Restarts $1 when flannel has lost its
+      # binding to tailscale0.
       set -eu
 
       unit="$1"
-      state=/run/tailscale-flannel-guard.ifindex
+      state_dir=/run/tailscale-flannel-guard
+      ifindex_state="$state_dir/ifindex"
+      restart_state="$state_dir/last-restart"
+      grace=300     # give k3s this long to build flannel.1 before judging it
+      cooldown=600  # never restart more often than this
+
+      mkdir -p "$state_dir"
+
+      # Monotonic seconds since boot. Resets on reboot, which is fine: both
+      # state files live in /run and are cleared by the same reboot.
+      now=$(cut -d. -f1 /proc/uptime)
+
+      restart_unit() {
+        if [ -f "$restart_state" ]; then
+          last=$(cat "$restart_state")
+          if [ "$((now - last))" -lt "$cooldown" ]; then
+            logger -t tailscale-flannel-guard \
+              "$1, but $unit was restarted $((now - last))s ago; skipping"
+            return 0
+          fi
+        fi
+        logger -t tailscale-flannel-guard "$1; restarting $unit"
+        printf '%s\n' "$now" > "$restart_state"
+        systemctl restart "$unit"
+      }
 
       current=$(cat /sys/class/net/tailscale0/ifindex 2>/dev/null || true)
       if [ -z "$current" ]; then
@@ -90,16 +115,38 @@
         exit 0
       fi
 
-      if [ -f "$state" ]; then
-        previous=$(cat "$state")
-        if [ "$current" != "$previous" ]; then
-          logger -t tailscale-flannel-guard \
-            "tailscale0 ifindex $previous -> $current, restarting $unit"
-          systemctl restart "$unit"
-        fi
+      previous=""
+      if [ -f "$ifindex_state" ]; then
+        previous=$(cat "$ifindex_state")
+      fi
+      printf '%s\n' "$current" > "$ifindex_state"
+
+      if [ -n "$previous" ] && [ "$current" != "$previous" ]; then
+        restart_unit "tailscale0 ifindex $previous -> $current"
+        exit 0
       fi
 
-      printf '%s\n' "$current" > "$state"
+      # Ifindexes can be reused, so also check the symptom directly: k3s settled,
+      # tailscale0 present, but flannel never built its vxlan device. This is the
+      # state a missed transition leaves behind, and it is what flannel logs as
+      # "external interface  not found, retrying in 30s" forever.
+      if [ -e /sys/class/net/flannel.1 ]; then
+        exit 0
+      fi
+
+      if [ "$(systemctl is-active "$unit" 2>/dev/null || true)" != "active" ]; then
+        exit 0
+      fi
+
+      active_us=$(systemctl show "$unit" -p ActiveEnterTimestampMonotonic --value)
+      case "$active_us" in
+        ''|*[!0-9]*) exit 0 ;;
+      esac
+      if [ "$((now - active_us / 1000000))" -lt "$grace" ]; then
+        exit 0
+      fi
+
+      restart_unit "flannel.1 missing while tailscale0 is up"
   notify: Reload systemd
 
 - name: Install the tailscale0 ifindex guard service
