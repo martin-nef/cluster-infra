@@ -12,15 +12,135 @@
     curl -fsSL https://tailscale.com/install.sh | sh
   when: tailscale_installed.rc != 0
 
-- name: Check if Tailscale is up
-  ansible.builtin.command: tailscale status
-  register: tailscale_up
+- name: Get Tailscale status
+  ansible.builtin.command: tailscale status --json
+  register: tailscale_status
   changed_when: false
   failed_when: false
 
-- name: Bring Tailscale up
-  ansible.builtin.command: tailscale up --auth-key={{ vault_tailscale_auth_key }}
-  when: tailscale_up.rc != 0
+- name: Bring Tailscale up with the node tag
+  # Tagged devices do not expire their node key. An untagged node eventually
+  # drops off the tailnet, tailscale0 loses its address, and flannel dies with
+  # no way back short of a manual reauth.
+  no_log: true
+  ansible.builtin.command: >-
+    tailscale up
+    --auth-key={{ vault_tailscale_auth_key }}
+    --advertise-tags={{ tailscale_tag }}
+  vars:
+    _ts_state: "{{ (tailscale_status.stdout | from_json) if (tailscale_status.rc == 0 and tailscale_status.stdout | default('') | length > 0) else {} }}"
+  when: >-
+    tailscale_status.rc != 0
+    or _ts_state.get('BackendState') != 'Running'
+    or tailscale_tag not in _ts_state.get('Self', {}).get('Tags', [])
+
+# --- Keep flannel pinned to a live tailscale0 ---
+#
+# k3s resolves `flannel-iface: tailscale0` exactly once, at startup, to build
+# flannel.1 and derive its MTU. When tailscaled restarts, tailscale0 is
+# recreated with a new ifindex, flannel.1 keeps the stale binding, and
+# cross-node pod traffic blackholes silently until k3s is restarted by hand.
+
+- name: Determine the k3s systemd unit for this node
+  ansible.builtin.set_fact:
+    k3s_unit: "{{ 'k3s' if 'server' in group_names else 'k3s-agent' }}"
+
+- name: Create k3s systemd drop-in directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ k3s_unit }}.service.d"
+    state: directory
+    mode: "0755"
+
+- name: Order k3s behind tailscaled and restart it when tailscaled restarts
+  # PartOf propagates an explicit `systemctl restart tailscaled` -- which is what
+  # Tailscale's own auto-update runs from the deb postinst -- through to k3s, so
+  # flannel re-resolves tailscale0 immediately after the update.
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ k3s_unit }}.service.d/10-tailscale.conf"
+    mode: "0644"
+    content: |
+      [Unit]
+      After=tailscaled.service
+      Wants=tailscaled.service
+      PartOf=tailscaled.service
+
+      [Service]
+      ExecStartPre=/bin/sh -c 'for i in $(seq 60); do ip -4 addr show tailscale0 2>/dev/null | grep -q "inet " && exit 0; sleep 2; done; exit 1'
+  notify: Reload systemd
+
+- name: Install the tailscale0 ifindex guard script
+  # PartOf only propagates explicit systemctl commands. If tailscaled crashes and
+  # its own Restart= brings it back, nothing is propagated, so watch the ifindex
+  # directly and bounce k3s when the interface is replaced underneath it.
+  ansible.builtin.copy:
+    dest: /usr/local/bin/tailscale-flannel-guard.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Managed by Ansible (roles/base). Restarts $1 when tailscale0 is replaced.
+      set -eu
+
+      unit="$1"
+      state=/run/tailscale-flannel-guard.ifindex
+
+      current=$(cat /sys/class/net/tailscale0/ifindex 2>/dev/null || true)
+      if [ -z "$current" ]; then
+        # tailscale0 is gone entirely; wait for it to come back rather than
+        # restarting k3s into an interface that does not exist yet.
+        exit 0
+      fi
+
+      if [ -f "$state" ]; then
+        previous=$(cat "$state")
+        if [ "$current" != "$previous" ]; then
+          logger -t tailscale-flannel-guard \
+            "tailscale0 ifindex $previous -> $current, restarting $unit"
+          systemctl restart "$unit"
+        fi
+      fi
+
+      printf '%s\n' "$current" > "$state"
+  notify: Reload systemd
+
+- name: Install the tailscale0 ifindex guard service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tailscale-flannel-guard.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Restart {{ k3s_unit }} when tailscale0 is replaced
+      After=tailscaled.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/tailscale-flannel-guard.sh {{ k3s_unit }}
+  notify: Reload systemd
+
+- name: Install the tailscale0 ifindex guard timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tailscale-flannel-guard.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Periodically check whether tailscale0 was replaced
+
+      [Timer]
+      OnBootSec=60
+      OnUnitActiveSec=30
+      AccuracySec=5
+
+      [Install]
+      WantedBy=timers.target
+  notify: Reload systemd
+
+- name: Flush systemd handlers before enabling the guard timer
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the tailscale0 ifindex guard timer
+  ansible.builtin.systemd:
+    name: tailscale-flannel-guard.timer
+    enabled: true
+    state: started
 
 # TODO: Add a task to apply optimization for exit nodes (only if <host>.gateway is true in inventory and host is linux)
 # https://tailscale.com/docs/reference/best-practices/performance#linux-optimizations-for-subnet-routers-and-exit-nodes
