@@ -184,6 +184,9 @@
   ansible.builtin.meta: flush_handlers
 
 - name: Enable the tailscale0 ifindex guard timer
+  # Skipped under --check: the unit file above is not actually written in check
+  # mode, so systemd cannot find the timer to enable.
+  when: not ansible_check_mode
   ansible.builtin.systemd:
     name: tailscale-flannel-guard.timer
     enabled: true
