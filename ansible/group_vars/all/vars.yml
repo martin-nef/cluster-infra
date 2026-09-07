@@ -6,9 +6,3 @@ flux_apps:
   - name: playit
     repo: playit-gg
   - name: valheim
-
-# Tailscale ACL tag applied to every cluster node. Tagged devices have node-key
-# expiry disabled, so tailscale0 never goes away on its own and takes flannel
-# with it. Requires a matching tagOwners entry in the tailnet ACL and an auth
-# key issued for this tag.
-tailscale_tag: "tag:k3s"

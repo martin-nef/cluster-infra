@@ -6,6 +6,7 @@
   register: tailscale_installed
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: Install Tailscale
   ansible.builtin.shell: |
@@ -17,22 +18,21 @@
   register: tailscale_status
   changed_when: false
   failed_when: false
+  check_mode: false
 
-- name: Bring Tailscale up with the node tag
-  # Tagged devices do not expire their node key. An untagged node eventually
-  # drops off the tailnet, tailscale0 loses its address, and flannel dies with
-  # no way back short of a manual reauth.
+- name: Bring Tailscale up
+  # Tags are applied by hand at provisioning time, deliberately: advertising them
+  # from here would replace a node's whole tag set rather than add to it, and
+  # shitbox carries tag:flux-server and tag:shitbox alongside tag:k3s.
   no_log: true
   ansible.builtin.command: >-
     tailscale up
     --auth-key={{ vault_tailscale_auth_key }}
-    --advertise-tags={{ tailscale_tag }}
   vars:
     _ts_state: "{{ (tailscale_status.stdout | from_json) if (tailscale_status.rc == 0 and tailscale_status.stdout | default('') | length > 0) else {} }}"
   when: >-
     tailscale_status.rc != 0
     or _ts_state.get('BackendState') != 'Running'
-    or tailscale_tag not in _ts_state.get('Self', {}).get('Tags', [])
 
 # --- Keep flannel pinned to a live tailscale0 ---
 #
