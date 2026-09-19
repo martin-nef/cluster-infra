@@ -16,7 +16,8 @@ k3s_cluster:
             --disable-apiserver
             --disable-controller-manager
             --disable-scheduler
-            --node-taint hardware.capacity=low-ram:NoSchedule
+            --node-taint hardware.capacity/ram=low:NoExecute
+            --node-taint hardware.capacity/cpu=low:NoExecute
         oci-big-1:
           ansible_user: ubuntu
           tailscale_ip: 100.109.118.21
@@ -29,10 +30,10 @@ k3s_cluster:
           ansible_user: ubuntu
           tailscale_ip: 100.71.125.10
           tailscale_host: oci-small-2
-          gateway: true
           extra_agent_args: >-
             {{ default_agent_args }}
-            --node-taint node-role.kubernetes.io/gateway=true:NoSchedule
+            --node-taint hardware.capacity/ram=low:NoExecute
+            --node-taint hardware.capacity/cpu=low:NoExecute
     # TODO: set up this node at some point to add GPU capacity
     #     dumb-computer:
 
