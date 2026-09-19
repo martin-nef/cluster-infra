@@ -5,6 +5,18 @@ metadata:
   namespace: kube-system
 spec:
   valuesContent: |-
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                # oci-small-2 is an E2.1.Micro: ~90% steal under load, which
+                # stalled UDP/TCP forwarding by up to 327ms. Temporary until
+                # the gateway role is removed from it in ansible/inventory.yml.
+                - key: kubernetes.io/hostname
+                  operator: NotIn
+                  values:
+                    - oci-small-2
     nodeSelector:
       node-role.kubernetes.io/gateway: "true"
     tolerations:
