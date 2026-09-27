@@ -6,3 +6,4 @@ flux_apps:
   - name: playit
     repo: playit-gg
   - name: valheim
+  - name: runescape
