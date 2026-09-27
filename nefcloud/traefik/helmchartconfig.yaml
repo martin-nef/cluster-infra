@@ -58,3 +58,15 @@ spec:
           default: true
         exposedPort: 2456
         protocol: UDP
+      runescape-1:
+        port: 7777
+        expose:
+          default: true
+        exposedPort: 7777
+        protocol: UDP
+      runescape-2:
+        port: 8888
+        expose:
+          default: true
+        exposedPort: 8888
+        protocol: UDP
