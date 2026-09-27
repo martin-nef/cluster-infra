@@ -70,9 +70,9 @@
         name: "{{ 'k3s' if 'server' in group_names else 'k3s-agent' }}"
         state: restarted
 
-- name: Bootstrap Flux
-  hosts: server[0]                     # Flux controllers are deployed to the cluster and float across nodes.
-  become: true                         # Bootstrap only needs to run once, from the first server.
+- name: Install Flux CLI
+  hosts: server[0]                     # flux.sh (run from CI) bootstraps Flux and registers apps from here.
+  become: true
   gather_facts: false
   tags: [flux]
   roles:

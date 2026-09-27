@@ -25,20 +25,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ansible
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ansible
-          ansible-galaxy collection install -r ansible/requirements.yml
-
-      - name: Write vault password
-        run: |
-          echo -n "${{ secrets.VAULT_PASSWORD }}" > ansible/.vault_password
-          wc -c ansible/.vault_password
-
-      - name: Verify ansible config
-        run: make verify
-
       - name: Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -55,6 +41,10 @@ jobs:
           echo "$SSH_CONFIG" > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
-      - name: Run flux playbook
-        working-directory: ansible
-        run: ansible-playbook playbook.yml --tags flux
+      # The token goes in via stdin so it never shows up in the remote process list.
+      - name: Run flux.sh
+        env:
+          FLUX_GITHUB_TOKEN: ${{ secrets.FLUX_GITHUB_TOKEN }}
+        run: |
+          { printf "export GITHUB_TOKEN='%s'\n" "$FLUX_GITHUB_TOKEN"; cat ./flux.sh; } \
+            | ssh -F ~/.ssh/config shitbox bash -s

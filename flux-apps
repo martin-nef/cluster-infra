@@ -1,0 +1,8 @@
+# One app per line: name [repo] [branch] [path]. Use "-" to keep a default.
+# Defaults: repo=name, branch=main, path=./deploy
+smart-reviewer
+proj-kata
+minecraft
+playit playit-gg
+valheim
+runescape

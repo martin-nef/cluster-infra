@@ -1,9 +1,0 @@
----
-flux_apps:
-  - name: smart-reviewer
-  - name: proj-kata
-  - name: minecraft
-  - name: playit
-    repo: playit-gg
-  - name: valheim
-  - name: runescape

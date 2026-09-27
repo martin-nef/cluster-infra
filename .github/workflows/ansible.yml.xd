@@ -1,0 +1,13 @@
+# - name: Install ansible
+#   run: |
+#     sudo apt-get update
+#     sudo apt-get install -y ansible
+#     ansible-galaxy collection install -r ansible/requirements.yml
+
+# - name: Write vault password
+#   run: |
+#     echo -n "${{ secrets.VAULT_PASSWORD }}" > ansible/.vault_password
+#     wc -c ansible/.vault_password
+
+# - name: Verify ansible config
+#   run: make verify
