@@ -24,3 +24,7 @@ spec:
   sourceRef:
     kind: GitRepository
     name: runescape
+  decryption:
+    provider: sops
+    secretRef:
+      name: runescape-sops-age
