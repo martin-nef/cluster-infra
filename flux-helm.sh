@@ -19,7 +19,7 @@
 # file, not them. The `helm` file is only parsed, never executed.
 #
 # Supported: repo add (https), install/upgrade with <repo>/<chart>, -n/--namespace,
-# --version, -f/--values (a file next to the `helm` file, inlined into the
+# --version, -f/--values (a values*.yaml next to the `helm` file, inlined into the
 # HelmRelease), --create-namespace; --install/--wait/--atomic are ignored.
 # Anything else is an error rather than being silently dropped. The HelmRelease
 # is named after the release, so keep the release name of anything already
@@ -306,7 +306,11 @@ set_flag() {
     --version) version="$2" ;;
     --values | -f)
       case "$2" in
-        *[!A-Za-z0-9._/-]* | /* | ../* | */../* | *..) die "$helmfile: values file must be a plain path inside $dir: $2" ;;
+        values*.yaml) ;;
+        *) die "$helmfile: values file must be named values*.yaml next to $HELM_FILE (the workflow only watches those): $2" ;;
+      esac
+      case "$2" in
+        *[!A-Za-z0-9._-]*) die "$helmfile: invalid values file name: $2" ;;
       esac
       [ -f "$dir/$2" ] || die "$helmfile: values file not found: $dir/$2"
       values="$values $dir/$2" ;;
@@ -368,7 +372,8 @@ open_pr() {
   echo "changes:"
   echo "$files" | sed 's/^/  /'
 
-  if git fetch -q origin "$PR_BRANCH" 2>/dev/null && git diff --quiet FETCH_HEAD HEAD; then
+  if git fetch -q origin "$PR_BRANCH" 2>/dev/null && git diff --quiet FETCH_HEAD HEAD \
+    && [ "$(git rev-parse FETCH_HEAD^)" = "$(git rev-parse HEAD^)" ]; then
     echo "branch $PR_BRANCH already up to date"
   else
     git push -q -f origin "HEAD:refs/heads/$PR_BRANCH"
@@ -380,10 +385,16 @@ open_pr() {
   existing="$(curl -sS --fail --connect-timeout 10 --max-time 30 \
     -H "Authorization: token $GITHUB_TOKEN" \
     -H "Accept: application/vnd.github+json" \
-    "$api?state=open&head=$OWNER:$PR_BRANCH&base=$BASE_BRANCH" \
+    "$api?state=open&head=$OWNER:$PR_BRANCH" \
     | grep -o '"html_url": *"[^"]*/pull/[0-9]*"' | head -n 1 | sed 's/.*"\(http[^"]*\)"/\1/' || true)"
   if [ -n "$existing" ]; then
     echo "PR already open: $existing"
+    # e.g. a PR stacked on a branch that has since been merged
+    curl -sS --fail --connect-timeout 10 --max-time 30 -X PATCH \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "$api/${existing##*/}" -d "{\"base\":\"$BASE_BRANCH\"}" >/dev/null \
+      || echo "warning: could not set the PR base to $BASE_BRANCH" >&2
     return
   fi
 

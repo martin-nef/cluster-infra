@@ -68,7 +68,7 @@ helm upgrade --install tailscale-release tailscale/tailscale-operator \
 ```
 
 - Supported: `repo add` (http/https), `install`/`upgrade` of `<repo>/<chart>`, `-n/--namespace`,
-  `--version`, `-f/--values <file next to the helm file>`, `--create-namespace`. Other flags, `--set`,
+  `--version`, `-f/--values values*.yaml` (next to the helm file), `--create-namespace`. Other flags, `--set`,
   OCI and local charts are rejected rather than ignored. Non-helm lines (`kubectl ...`) are skipped.
 - Pin `--version`, otherwise the chart floats to the latest.
 - The release name is the HelmRelease name. Changing it makes Flux uninstall the old release and
