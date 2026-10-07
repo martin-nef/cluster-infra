@@ -1,0 +1,55 @@
+name: Flux Helm
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - nefcloud/*/helm
+      - nefcloud/*/values*.yaml
+      - flux-helm.sh
+      - .github/workflows/flux-helm.yml
+  workflow_dispatch:
+
+concurrency:
+  group: Flux Helm
+  cancel-in-progress: false
+
+env:
+  SSH_CONFIG: |
+    Host shitbox
+      HostName shitbox.tail43f455.ts.net
+      User deploy
+      IdentityFile ~/.ssh/shitbox.pem
+      StrictHostKeyChecking no
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:cluster-infra-ci
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/shitbox.pem
+          chmod 600 ~/.ssh/shitbox.pem
+          echo "$SSH_CONFIG" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      # The token goes in via stdin so it never shows up in the remote process list.
+      - name: Run flux-helm.sh
+        env:
+          FLUX_GITHUB_TOKEN: ${{ secrets.FLUX_GITHUB_TOKEN }}
+        run: |
+          { printf "export GITHUB_TOKEN='%s'\n" "$FLUX_GITHUB_TOKEN"; cat ./flux-helm.sh; } \
+            | ssh -F ~/.ssh/config shitbox bash -s

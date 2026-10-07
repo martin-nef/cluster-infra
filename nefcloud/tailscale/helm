@@ -1,0 +1,12 @@
+# Release name stays tailscale-release: renaming it would make Flux uninstall
+# the running operator and install a new one.
+helm repo add tailscale https://pkgs.tailscale.com/helmcharts
+helm repo update
+helm upgrade \
+  --install \
+  tailscale-release \
+  tailscale/tailscale-operator \
+  --namespace=tailscale \
+  --create-namespace \
+  --version 1.96.5 \
+  --wait

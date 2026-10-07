@@ -1,0 +1,8 @@
+# Release name stays oauth2-proxy-release: middleware.yaml and
+# callback-ingress.yaml reference the service it creates.
+helm repo add oauth2-proxy https://oauth2-proxy.github.io/manifests
+helm repo update
+helm upgrade --install oauth2-proxy-release oauth2-proxy/oauth2-proxy \
+  --namespace oauth2-proxy --create-namespace \
+  --version ">=10.0.0 <11.0.0" \
+  -f values.yaml
