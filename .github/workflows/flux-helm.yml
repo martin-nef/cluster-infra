@@ -15,13 +15,14 @@ concurrency:
   group: Flux Helm
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 env:
-  SSH_CONFIG: |
-    Host shitbox
-      HostName shitbox.tail43f455.ts.net
-      User deploy
-      IdentityFile ~/.ssh/shitbox.pem
-      StrictHostKeyChecking no
+  # The flux CLI renders the manifests, so its version decides their apiVersions
+  # and layout. Keep it equal to the controllers in
+  # nefcloud/flux-system/gotk-components.yaml; flux-helm.sh fails on a mismatch.
+  FLUX_VERSION: 2.8.6
 
 jobs:
   deploy:
@@ -30,26 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Tailscale
-        uses: tailscale/github-action@v4
+      - uses: fluxcd/flux2/action@04acaec6161ac4fb1a82ffafa88901c03271d34f  # v2.8.6
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:cluster-infra-ci
+          version: ${{ env.FLUX_VERSION }}
 
-      - name: Set up SSH
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/shitbox.pem
-          chmod 600 ~/.ssh/shitbox.pem
-          echo "$SSH_CONFIG" > ~/.ssh/config
-          chmod 600 ~/.ssh/config
-
-      # The token goes in via stdin so it never shows up in the remote process list.
+      # Needs neither the cluster nor the tailnet: it renders manifests from the
+      # helm files and talks to GitHub. The token is a PAT rather than the
+      # default GITHUB_TOKEN so that the PR it opens still triggers Flux Check
+      # (events created with the default token do not start other workflows).
       - name: Run flux-helm.sh
         env:
-          FLUX_GITHUB_TOKEN: ${{ secrets.FLUX_GITHUB_TOKEN }}
-        run: |
-          { printf "export GITHUB_TOKEN='%s'\n" "$FLUX_GITHUB_TOKEN"; cat ./flux-helm.sh; } \
-            | ssh -F ~/.ssh/config shitbox bash -s
+          GITHUB_TOKEN: ${{ secrets.FLUX_GITHUB_TOKEN }}
+        run: ./flux-helm.sh

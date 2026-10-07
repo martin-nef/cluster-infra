@@ -1,0 +1,41 @@
+name: shelltest
+
+# Runs tests/flux-helm.test.sh on PRs that touch flux-helm.sh or the tests. The
+# suite runs the script against throwaway local repos with a stubbed gh, so it
+# needs no secrets and nothing leaves the runner. It runs under dash (sh on
+# Ubuntu) and bash, since the script has to work in both.
+on:
+  pull_request:
+    paths:
+      - flux-helm.sh
+      - tests/**
+      - .github/workflows/shelltest.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shelltest-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # Same version as flux-helm.yml, which the generated manifests depend on.
+  FLUX_VERSION: 2.8.6
+
+jobs:
+  shelltest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [sh, bash]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: fluxcd/flux2/action@04acaec6161ac4fb1a82ffafa88901c03271d34f  # v2.8.6
+        with:
+          version: ${{ env.FLUX_VERSION }}
+
+      # kubectl and perl come with the runner image, so no check is skipped.
+      - name: Run tests
+        run: tests/flux-helm.test.sh "${{ matrix.shell }}"
