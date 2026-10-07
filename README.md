@@ -90,3 +90,15 @@ helm upgrade --install tailscale-release tailscale/tailscale-operator \
 - If GitHub Actions is down, run `GITHUB_TOKEN=... ./flux-helm.sh` from any machine with `flux`, `git` and
   `gh` (no cluster or tailnet access needed). Only core git is needed on the Flux side to apply the
   resulting merge.
+- Tests: `tests/flux-helm.test.sh [sh|bash]` runs the script against throwaway local repos with a stubbed
+  `gh`; nothing leaves the machine. Needs `git` and `flux`; without `kubectl` the render check is skipped,
+  without `perl` the three signal checks are. `.github/workflows/shelltest.yml` runs it under `sh` and
+  `bash` on PRs that touch `flux-helm.sh` or `tests/`.
+
+### Shell scripts
+
+`.github/workflows/shellcheck.yml` runs [shellcheck](https://www.shellcheck.net) on PRs that touch a
+`*.sh` file, and only on the scripts the PR changes (changing the workflow checks them all). It pins
+shellcheck 0.11.0; to run exactly that locally:
+`pipx run --spec shellcheck-py==0.11.0.1 shellcheck <file>`. A script declares its own dialect (shebang or `# shellcheck shell=...`)
+and any exception as a `# shellcheck disable=...` comment with the reason; there is no global config.

@@ -1,0 +1,57 @@
+name: shellcheck
+
+# Lints the shell scripts a PR adds or changes with shellcheck. It only starts
+# when the PR touches a *.sh file (or this workflow) and only checks the scripts
+# the PR changes; changing this workflow checks every tracked script. There is
+# no global config: each script carries its dialect (shebang or
+# `# shellcheck shell=...`) and any exception (`# shellcheck disable=...`, with
+# the reason next to it).
+on:
+  pull_request:
+    paths:
+      - "**.sh"
+      - .github/workflows/shellcheck.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shellcheck-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # PyPI package that bundles the shellcheck binary (0.11.0.1 is shellcheck 0.11.0).
+  SHELLCHECK_VERSION: 0.11.0.1
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      # The checkout is the PR's merge commit (refs/pull/N/merge): HEAD^1 is the
+      # target branch, so depth 2 is all the diff below needs.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Install shellcheck
+        run: pipx install "shellcheck-py==$SHELLCHECK_VERSION"
+
+      # Only scripts that exist after the PR (A/C/M/R), so deletions are ignored.
+      - name: Lint changed scripts
+        run: |
+          if git diff --name-only HEAD^1 HEAD | grep -qFx .github/workflows/shellcheck.yml; then
+            git ls-files -z -- '*.sh' > scripts.txt
+          else
+            git diff --name-only -z --diff-filter=ACMR HEAD^1 HEAD -- '*.sh' > scripts.txt
+          fi
+          if [ ! -s scripts.txt ]; then
+            echo "no shell scripts to check"
+            exit 0
+          fi
+          status=0
+          xargs -0 shellcheck --format=gcc < scripts.txt > findings.txt || status=$?
+          cat findings.txt
+          # One annotation per finding, so it shows on the PR diff.
+          sed -E -e 's/^([^:]+):([0-9]+):([0-9]+): (error|warning|note): (.*)$/::\4 file=\1,line=\2,col=\3::\5/' \
+            -e 's/^::note /::notice /' findings.txt
+          exit "$status"
