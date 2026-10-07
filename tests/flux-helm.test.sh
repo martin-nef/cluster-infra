@@ -21,6 +21,11 @@ for tool in git flux "$SH"; do
   command -v "$tool" > /dev/null 2>&1 || { echo "$tool is required" >&2; exit 2; }
 done
 
+# The script is configured through the environment (CI sets FLUX_VERSION, a
+# developer may have GITHUB_TOKEN, ...); the tests must see only their own.
+unset OWNER REPO BASE_BRANCH PR_BRANCH REPO_URL ROOT REPO_INTERVAL RELEASE_INTERVAL \
+  FLUX_VERSION PR_DRAFT DRY_RUN OPEN_PR GITHUB_TOKEN GH_TOKEN
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 # The script under test makes its scratch dir here, so a leak shows up as a leftover.
