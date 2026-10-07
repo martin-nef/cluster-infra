@@ -17,6 +17,12 @@ main() {
   : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
   export GITHUB_TOKEN
 
+  # On k3s hosts kubectl is the k3s binary, which defaults an unset KUBECONFIG
+  # to /etc/rancher/k3s/k3s.yaml (root-only) instead of ~/.kube/config, while
+  # flux uses ~/.kube/config. Pin both to the same file; non-interactive ssh
+  # sessions don't load the profile that might otherwise set it.
+  export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+
   if flux get sources git flux-system -n flux-system >/dev/null 2>&1; then
     echo "Flux already bootstrapped"
   else
