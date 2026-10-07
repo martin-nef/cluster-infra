@@ -24,19 +24,19 @@ jobs:
   yamllint:
     runs-on: ubuntu-latest
     steps:
+      # The checkout is the PR's merge commit (refs/pull/N/merge): HEAD^1 is the
+      # target branch, so depth 2 is all the diff below needs.
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - name: Install yamllint
         run: pipx install "yamllint==$YAMLLINT_VERSION"
 
       # Only files that exist after the PR (A/C/M/R), so deletions are ignored.
       - name: Lint changed files
-        env:
-          BASE_REF: ${{ github.base_ref }}
         run: |
-          git diff --name-only -z --diff-filter=ACMR "origin/$BASE_REF...HEAD" -- '*.yml' '*.yaml' > changed.txt
+          git diff --name-only -z --diff-filter=ACMR HEAD^1 HEAD -- '*.yml' '*.yaml' > changed.txt
           if [ ! -s changed.txt ]; then
             echo "no yaml files changed"
             exit 0

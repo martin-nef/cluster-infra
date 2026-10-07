@@ -61,9 +61,11 @@ jobs:
   flate:
     runs-on: ubuntu-latest
     steps:
+      # The checkout is the PR's merge commit (refs/pull/N/merge): HEAD^1 is the
+      # target branch, so depth 2 is all the diff below needs.
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - uses: home-operations/flate/action@631b76b69c4e58c6f4d1cb01e23616fa61aebafa  # v0.6.5
         with:
@@ -86,7 +88,7 @@ jobs:
           {
             echo "### Rendered changes vs \`$BASE_REF\`"
             echo '```diff'
-            flate diff all --path "$FLUX_PATH" --base "origin/$BASE_REF" \
+            flate diff all --path "$FLUX_PATH" --base HEAD^1 \
               --allow-missing-secrets --no-progress -o diff | head -c 900000
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
