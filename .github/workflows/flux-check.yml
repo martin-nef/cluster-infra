@@ -1,0 +1,94 @@
+name: Flux Check
+
+# Static checks on PRs that touch the Flux manifests. No cluster, tailnet or
+# secrets needed, everything runs on a plain GitHub-hosted runner.
+on:
+  pull_request:
+    paths:
+      - nefcloud/**
+      - .github/workflows/flux-check.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flux-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # The directory Flux reconciles (see nefcloud/flux-system/gotk-sync.yaml).
+  FLUX_PATH: nefcloud
+  # Kinds kubeconform does not validate: Secrets hold a SOPS block that the
+  # schema rejects (Flux decrypts them before applying), and the CRDs are
+  # Flux-generated (gotk-components.yaml).
+  KUBECONFORM_SKIP: Secret,CustomResourceDefinition
+  KUBECONFORM_VERSION: v0.8.0
+  # Schemas for the CRDs in use (Flux, Traefik, ...). Pinned to a commit of
+  # https://github.com/datreeio/CRDs-catalog, bump it to pick up newer CRDs.
+  CRD_SCHEMAS_REF: fd90051867733c60d32d16450556e9cd18459aef
+  FLATE_VERSION: 0.6.5
+
+jobs:
+  # `kustomize build` the way Flux does, then validate every object against its
+  # schema. Catches broken kustomizations, missing files, duplicate resources,
+  # unknown fields and kinds without a schema.
+  kubeconform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install kubeconform
+        run: |
+          base="https://github.com/yannh/kubeconform/releases/download/$KUBECONFORM_VERSION"
+          curl -sSfL -O "$base/kubeconform-linux-amd64.tar.gz" -O "$base/CHECKSUMS"
+          grep ' kubeconform-linux-amd64.tar.gz$' CHECKSUMS | sha256sum -c -
+          sudo tar -xzf kubeconform-linux-amd64.tar.gz -C /usr/local/bin kubeconform
+
+      - name: Render
+        run: kubectl kustomize "$FLUX_PATH" > rendered.yaml
+
+      - name: Validate
+        run: |
+          crds="https://raw.githubusercontent.com/datreeio/CRDs-catalog/$CRD_SCHEMAS_REF"
+          kubeconform -strict -summary -skip "$KUBECONFORM_SKIP" \
+            -schema-location default \
+            -schema-location "$crds/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" \
+            < rendered.yaml
+
+  # flate (the maintained successor of flux-local) reconciles the whole tree
+  # offline: Kustomizations are built and HelmReleases are rendered from their
+  # real charts, so bad values or missing chart versions fail here.
+  flate:
+    runs-on: ubuntu-latest
+    steps:
+      # The checkout is the PR's merge commit (refs/pull/N/merge): HEAD^1 is the
+      # target branch, so depth 2 is all the diff below needs.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - uses: home-operations/flate/action@631b76b69c4e58c6f4d1cb01e23616fa61aebafa  # v0.6.5
+        with:
+          version: ${{ env.FLATE_VERSION }}
+
+      # The apps' deploy-key secrets (<name>-auth) only exist in the cluster.
+      # The action exports FLATE_BASE (the default branch), which would make
+      # flate only test what changed vs. main; --base "" tests the whole tree.
+      - name: Test
+        run: flate test all --path "$FLUX_PATH" --base "" --allow-missing-secrets --no-progress
+
+      # What the PR changes in the rendered cluster, vs. its target branch.
+      # Informational: it shows up in the job summary and never fails the job.
+      - name: Diff
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          {
+            echo "### Rendered changes vs \`$BASE_REF\`"
+            echo '```diff'
+            flate diff all --path "$FLUX_PATH" --base HEAD^1 \
+              --allow-missing-secrets --no-progress -o diff | head -c 900000
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
