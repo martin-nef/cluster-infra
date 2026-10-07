@@ -107,8 +107,23 @@ open_pr() {
   echo "$name: opened draft PR $pr_url"
 }
 
+# Print the ids of the repo's deploy keys titled flux-<name>, one per line.
+# Parses with sed/awk since jq is not a requirement.
+list_deploy_key_ids() {
+  name="$1" repo="$2"
+  curl -sS --fail --connect-timeout 10 --max-time 30 \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER/$repo/keys?per_page=100" \
+    | grep -oE '"(id|title)": *("[^"]*"|[0-9]+)' \
+    | sed -E 's/^"id": *([0-9]+)$/id \1/; s/^"title": *"(.*)"$/title \1/' \
+    | awk -v t="flux-$name" '$1 == "id" { id = $2 } $1 == "title" && $2 == t { print id }'
+}
+
 # Generate a deploy key, register it on the app repo and store it as the
-# <name>-auth secret, unless that secret already exists.
+# <name>-auth secret, unless that secret already exists. A key left on the
+# repo by an earlier run that died before the secret was created is useless
+# (the private half is gone), so it is deleted and replaced.
 ensure_deploy_key() {
   name="$1" repo="$2" url="$3"
 
@@ -116,7 +131,16 @@ ensure_deploy_key() {
     return
   fi
 
+  for key_id in $(list_deploy_key_ids "$name" "$repo"); do
+    curl -sS --fail --connect-timeout 10 --max-time 30 -X DELETE \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$OWNER/$repo/keys/$key_id" >/dev/null
+    echo "$name: removed stale deploy key flux-$name ($key_id)"
+  done
+
   keyfile="$WORKDIR/$name-id_ed25519"
+  rm -f "$keyfile" "$keyfile.pub"
   ssh-keygen -t ed25519 -f "$keyfile" -N "" -C "flux-$name" -q
 
   curl -sS --fail --connect-timeout 10 --max-time 30 -X POST \
