@@ -6,3 +6,8 @@ resources:
   - ingress.yaml
   - rbac.yaml
   - auth-proxy.yaml
+configMapGenerator:
+  - name: headlamp-auth-nginx
+    namespace: kube-system
+    files:
+      - default.conf.template
