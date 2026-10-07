@@ -1,0 +1,22 @@
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ""      close;
+}
+server {
+  # oauth2-proxy (chunked Google tokens) and Headlamp cookies together exceed nginx's 8k default.
+  large_client_header_buffers 4 32k;
+  listen 8080;
+  location / {
+    if ($http_x_auth_request_email = "") { return 401; }
+    proxy_pass http://my-headlamp.kube-system.svc.cluster.local:80;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_set_header Authorization "Bearer ${TOKEN}";
+    proxy_set_header Impersonate-User $http_x_auth_request_email;
+    proxy_set_header Impersonate-Group "";
+    proxy_set_header Impersonate-Uid "";
+    proxy_read_timeout 1h;
+  }
+}
