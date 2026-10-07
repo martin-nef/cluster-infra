@@ -36,6 +36,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: headlamp-user-martin
+  annotations:
+    # roleRef is immutable; let Flux delete and recreate the binding when the role changes.
+    kustomize.toolkit.fluxcd.io/force: enabled
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
