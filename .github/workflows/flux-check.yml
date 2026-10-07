@@ -70,8 +70,10 @@ jobs:
           version: ${{ env.FLATE_VERSION }}
 
       # The apps' deploy-key secrets (<name>-auth) only exist in the cluster.
+      # The action exports FLATE_BASE (the default branch), which would make
+      # flate only test what changed vs. main; --base "" tests the whole tree.
       - name: Test
-        run: flate test all --path "$FLUX_PATH" --allow-missing-secrets --no-progress
+        run: flate test all --path "$FLUX_PATH" --base "" --allow-missing-secrets --no-progress
 
       # What the PR changes in the rendered cluster, vs. its target branch.
       # Informational: it shows up in the job summary and never fails the job.
