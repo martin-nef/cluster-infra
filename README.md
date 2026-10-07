@@ -1,5 +1,7 @@
 # cluster-infra
 
+This repo serves to manage my nodes and my cluster in a reproducible manner. It also does IaC from the trunk for my apps, my cluster, but not the nodes yet.
+
 ## Prerequisites
 
 - Ansible 2.15+ with Python 3.10+
