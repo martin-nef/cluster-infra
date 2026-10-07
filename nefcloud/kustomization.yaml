@@ -8,3 +8,4 @@ resources:
   - oauth2-proxy
   - cloudflared
   - traefik
+  - headlamp
