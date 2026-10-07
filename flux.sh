@@ -127,9 +127,16 @@ list_deploy_key_ids() {
 ensure_deploy_key() {
   name="$1" repo="$2" url="$3"
 
-  if kubectl -n flux-system get secret "$name-auth" >/dev/null 2>&1; then
+  # Only a genuine NotFound means the secret is missing. Any other failure
+  # (no kubeconfig, RBAC, API down) must not look like "missing", or every run
+  # would register another deploy key and overwrite the secret.
+  if out="$(kubectl -n flux-system get secret "$name-auth" 2>&1)"; then
     return
   fi
+  case "$out" in
+    *NotFound*|*"not found"*) ;;
+    *) echo "$name: cannot check secret $name-auth: $out" >&2; exit 1 ;;
+  esac
 
   for key_id in $(list_deploy_key_ids "$name" "$repo"); do
     curl -sS --fail --connect-timeout 10 --max-time 30 -X DELETE \
