@@ -1,0 +1,56 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headlamp-auth
+  namespace: kube-system
+---
+# The proxy authenticates as this account and impersonates the oauth2-proxy
+# email. Keep resourceNames in sync with oauth2-proxy's allowed_emails.txt.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: headlamp-impersonate
+rules:
+  - apiGroups: [""]
+    resources: ["users"]
+    verbs: ["impersonate"]
+    resourceNames:
+      - martin.nefjodov@gmail.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headlamp-impersonate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: headlamp-impersonate
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-auth
+    namespace: kube-system
+---
+# What the impersonated user may do. Bump to cluster-admin to manage from Headlamp.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headlamp-user-martin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: martin.nefjodov@gmail.com
+---
+# Long-lived token, populated by the token controller; never lives in git.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: headlamp-auth-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: headlamp-auth
+type: kubernetes.io/service-account-token

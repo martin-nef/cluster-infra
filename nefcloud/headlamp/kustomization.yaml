@@ -4,3 +4,5 @@ resources:
   - helmrepo.yaml
   - helmrelease.yaml
   - ingress.yaml
+  - rbac.yaml
+  - auth-proxy.yaml
