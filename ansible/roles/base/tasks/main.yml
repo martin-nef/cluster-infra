@@ -34,12 +34,73 @@
     tailscale_status.rc != 0
     or _ts_state.get('BackendState') != 'Running'
 
-# --- Keep flannel pinned to a live tailscale0 ---
+# --- Keep tailscale0 across tailscaled restarts ---
 #
-# k3s resolves `flannel-iface: tailscale0` exactly once, at startup, to build
-# flannel.1 and derive its MTU. When tailscaled restarts, tailscale0 is
-# recreated with a new ifindex, flannel.1 keeps the stale binding, and
-# cross-node pod traffic blackholes silently until k3s is restarted by hand.
+# tailscaled creates tailscale0 as an ordinary TUN device, which the kernel
+# destroys whenever tailscaled exits: on every restart, including the one each
+# Tailscale auto-update does. flannel.1 is a VXLAN device stacked on tailscale0,
+# so the kernel deletes it too, and k3s does not rebuild it. Up to v1.36.1 its
+# flannel looks the interface up under an empty name forever ("external
+# interface  not found, retrying in 30s"); later releases fix the name but
+# bundle flannel v0.28.4, whose rebuild panics on IPv4-only clusters. Either way
+# cross-node pod traffic stops until k3s restarts. The 2026-08-07 auto-update
+# did this to shitbox, oci-small-1 and oci-small-2 at once, for a month.
+#
+# A persistent TUN device outlives tailscaled: the next tailscaled attaches to
+# the same tailscale0 (same ifindex), so flannel.1 is never touched and an
+# update costs about two seconds of tailnet traffic instead of a k3s restart.
+
+- name: Install the tailscale0 persistence helper
+  ansible.builtin.copy:
+    src: tailscale-tun-persist.py
+    dest: /usr/local/sbin/tailscale-tun-persist
+    mode: "0755"
+
+- name: Create tailscaled systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/tailscaled.service.d
+    state: directory
+    mode: "0755"
+
+- name: Keep tailscale0 persistent whenever tailscaled starts
+  # Nothing here may restart tailscaled: on a node whose tailscale0 is not yet
+  # persistent, that restart is exactly the flannel outage this prevents. The
+  # drop-in applies from tailscaled's next start; the task below converts the
+  # device the running tailscaled already has.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tailscaled.service.d/10-persistent-tun.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/base). See /usr/local/sbin/tailscale-tun-persist.
+      [Service]
+      # Keep tailscale0, and with it flannel.1, across tailscaled restarts. The
+      # ready file records that this tailscaled really attached to tailscale0:
+      # systemd considers tailscaled started before it has opened the device.
+      ExecStartPre=-/bin/rm -f /run/tailscale-tun-persist.ready
+      ExecStartPost=-/bin/sh -c '/usr/local/sbin/tailscale-tun-persist tailscale0 && touch /run/tailscale-tun-persist.ready'
+      # A tailscaled that never attached may have been unable to open the kept
+      # device (a future release asking for other flags, say). Drop the device so
+      # Restart=on-failure comes back on a fresh one, which ExecStartPost keeps
+      # again. Any other stop, a crash included, leaves the device in place.
+      ExecStopPost=-/bin/sh -c '[ -e /run/tailscale-tun-persist.ready ] || ip link delete tailscale0 2>/dev/null; true'
+  notify: Reload systemd
+
+- name: Make the running tailscale0 persistent
+  # Same command as the drop-in's ExecStartPost. The ready file matters here
+  # too: without it the drop-in's ExecStopPost would delete tailscale0 the next
+  # time this already-running tailscaled stops. Skipped under --check.
+  ansible.builtin.shell: >-
+    /usr/local/sbin/tailscale-tun-persist tailscale0
+    && touch /run/tailscale-tun-persist.ready
+  register: tun_persist
+  changed_when: "'marked persistent' in tun_persist.stdout"
+
+# --- Restart k3s if flannel loses tailscale0 anyway ---
+#
+# With tailscale0 persistent this should not happen. It still can: after the
+# drop-in above replaces a device tailscaled could not attach to, or if
+# tailscale0 is deleted by hand. flannel.1 then goes with it, and k3s has to be
+# restarted to rebuild it (see above).
 
 - name: Determine the k3s systemd unit for this node
   ansible.builtin.set_fact:
@@ -69,9 +130,11 @@
   notify: Reload systemd
 
 - name: Install the tailscale0 ifindex guard script
-  # The sole recovery mechanism: watch tailscale0 and bounce k3s when the
-  # interface it bound to is replaced, whether tailscaled was restarted
-  # explicitly (Tailscale auto-update) or crashed and came back on its own.
+  # The backstop: watch tailscale0 and bounce k3s when the interface flannel
+  # bound to is replaced, or when flannel.1 is missing while tailscale0 is up.
+  # A Tailscale update reaches every node within seconds, so the guard restarts
+  # k3s, etcd members included, on all of them within about a minute: it is
+  # not a substitute for the persistent device.
   ansible.builtin.copy:
     dest: /usr/local/bin/tailscale-flannel-guard.sh
     mode: "0755"
@@ -194,15 +257,16 @@
 
 # TODO: Add a task to apply optimization for exit nodes (only if <host>.gateway is true in inventory and host is linux)
 # https://tailscale.com/docs/reference/best-practices/performance#linux-optimizations-for-subnet-routers-and-exit-nodes
-# 
+#
 # enable right now:
 # NETDEV=$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")
 # sudo ethtool -K $NETDEV rx-udp-gro-forwarding on rx-gro-list off
-# 
+#
 # if sudo systemctl is-enabled networkd-dispatcher
-#   printf '#!/bin/sh\n\nethtool -K %s rx-udp-gro-forwarding on rx-gro-list off \n' "$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")" | sudo tee /etc/networkd-dispatcher/routable.d/50-tailscale
+#   printf '#!/bin/sh\n\nethtool -K %s rx-udp-gro-forwarding on rx-gro-list off \n' "$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")" \
+#     | sudo tee /etc/networkd-dispatcher/routable.d/50-tailscale
 #   sudo chmod 755 /etc/networkd-dispatcher/routable.d/50-tailscale
-# 
+#
 # Test if succeeded
 # sudo /etc/networkd-dispatcher/routable.d/50-tailscale
 # test $? -eq 0 || echo 'An error occurred.'
@@ -221,3 +285,26 @@
     content: |
       APT::Periodic::Update-Package-Lists "1";
       APT::Periodic::Unattended-Upgrade "1";
+
+- name: Create apt-daily systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/apt-daily.service.d
+    state: directory
+    mode: "0755"
+
+- name: Bound how long the daily apt list refresh may run
+  # apt-daily.service is a oneshot with no start timeout. On oci-big-1 its
+  # `apt-get update` hung on 2026-06-06 and held the apt lists lock for four
+  # months, which silently stopped unattended-upgrades and every Tailscale
+  # auto-update, as both need that lock. Only the list refresh is bounded:
+  # apt-daily-upgrade.service runs dpkg, which must not be killed mid-install.
+  # The timeout counts from when a run started, so on a node that is already
+  # stuck the daemon-reload this triggers ends the stuck run straight away.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/apt-daily.service.d/10-timeout.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/base).
+      [Service]
+      TimeoutStartSec=30min
+  notify: Reload systemd
