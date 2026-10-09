@@ -34,10 +34,13 @@
         state: stopped
         enabled: false
 
+# Opt-in only (`--tags k3s`, or `make deploy_k3s`): k3s-ansible restarts k3s on
+# the first server on every run and rewrites each node's k3s env file, so it is
+# not safe to run on every deploy.
 - name: Install k3s cluster
   ansible.builtin.import_playbook: k3s.orchestration.site
   tags: [k3s]
-  when: "'all' in ansible_run_tags or 'k3s' in ansible_run_tags"
+  when: "'k3s' in ansible_run_tags"
 
 - name: Configure k3s registry credentials
   hosts: all

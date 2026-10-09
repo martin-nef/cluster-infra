@@ -1,4 +1,4 @@
-.PHONY: verify deploy deploy_host decrypt encrypt edit
+.PHONY: verify deploy deploy_host deploy_k3s decrypt encrypt edit
 
 verify:
 	cd ansible && ansible-playbook playbook.yml --syntax-check
@@ -10,6 +10,10 @@ deploy:
 # take host from first arg passed to make, e.g., `make deploy_host host=shitbox`
 deploy_host:
 	cd ansible && ansible-playbook playbook.yml --limit $(host)
+
+# install/upgrade k3s; restarts k3s on the first server (shitbox) every time
+deploy_k3s:
+	cd ansible && ansible-playbook playbook.yml --tags k3s
 
 decrypt:
 	./decrypt.sh
