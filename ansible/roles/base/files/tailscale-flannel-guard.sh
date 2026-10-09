@@ -7,14 +7,20 @@
 # Runs from a 30 s timer, and straight away whenever tailscaled creates a new
 # tailscale0 (the service is wanted by tailscale0's device unit).
 #
-# Servers (UNIT=k3s) each run an etcd member. A Tailscale update restarts
-# tailscaled on every node within seconds, and if every server then restarted
-# k3s at once, etcd would lose quorum. So before restarting k3s a server waits
-# until its etcd member is connected to all the others, holds off for
-# STAGGER_SECONDS, and restarts only if they are all still connected; if not,
-# it waits again. Servers with different STAGGER_SECONDS therefore take turns.
-# After MAX_WAIT it restarts regardless: a dead pod network is worse than a
-# short loss of quorum.
+# A Tailscale update restarts tailscaled on every node within seconds. If every
+# node running an etcd member then restarted k3s at once, etcd would lose
+# quorum, so those nodes take turns: before restarting k3s, a node whose etcd
+# member is up waits until it is connected to all the other members, holds off
+# for STAGGER_SECONDS, and restarts only if they are all still connected; if
+# not, it waits again. Nodes with different STAGGER_SECONDS therefore restart
+# one at a time. After MAX_WAIT it restarts regardless: a dead pod network is
+# worse than a short loss of quorum.
+#
+# Whether a node takes turns is decided at run time, not by its role: a server
+# can run without etcd (--disable-etcd, an external datastore) and an agent
+# never runs it. A node with nothing listening on etcd's metrics endpoint adds
+# nothing to quorum right now, so it restarts at once. That includes a server
+# whose k3s is already down.
 #
 # The GUARD_* variables only exist so that tests can point the script at a
 # fake /sys, /proc/uptime, state directory and etcd metrics endpoint.
@@ -53,11 +59,25 @@ etcd_peers_connected() {
   [ "$known" -ge 1 ] && [ "$active" -eq "$((known - 1))" ]
 }
 
+# True unless nothing is listening on the etcd metrics endpoint, i.e. unless
+# this node has no running etcd member. Any other failure (a timeout, an HTTP
+# error) means a member that is up but unwell, which still counts.
+etcd_running() {
+  rc=0
+  curl -sS --max-time 3 -o /dev/null "$etcd_metrics" 2>/dev/null || rc=$?
+  [ "$rc" -ne 7 ]
+}
+
 # Wait until all etcd members are connected, hold off for the stagger and
-# check again, so that servers restart one at a time. Fails after max_wait.
+# check again, so that etcd nodes restart one at a time. Succeeds early if this
+# node's own member goes away meanwhile, since restarting no longer costs
+# quorum. Fails after max_wait.
 wait_for_turn() {
   deadline=$(($(uptime_s) + max_wait))
   while [ "$(uptime_s)" -lt "$deadline" ]; do
+    if ! etcd_running; then
+      return 0
+    fi
     if etcd_peers_connected; then
       sleep "$stagger"
       if etcd_peers_connected; then
@@ -79,9 +99,7 @@ restart_unit() {
       return 0
     fi
   fi
-  # Only a running server takes turns: a stopped one has no etcd member to
-  # count peers with, and restarting it cannot cost the cluster quorum.
-  if [ "$unit" = k3s ] && systemctl is-active --quiet "$unit"; then
+  if etcd_running; then
     if ! wait_for_turn; then
       logger -t tailscale-flannel-guard \
         "$1; etcd members still not all connected after ${max_wait}s, restarting $unit anyway"

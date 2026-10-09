@@ -48,18 +48,20 @@
   ansible.builtin.set_fact:
     k3s_unit: "{{ 'k3s' if 'server' in group_names else 'k3s-agent' }}"
 
-- name: Give each server its turn for guard restarts, gateway first
-  # Servers each run an etcd member, and a Tailscale update reaches every node
-  # within seconds, so the guard makes them restart k3s one at a time: the
-  # gateway first (it carries all ingress), then the other servers in inventory
-  # order, 10 s apart. Agents don't take turns.
+- name: Give each node its turn for guard restarts, gateway first
+  # A Tailscale update reaches every node within seconds, so the guard makes the
+  # nodes running an etcd member restart k3s one at a time, in this order: the
+  # gateway first (it carries all ingress), then the rest in inventory order,
+  # 10 s apart. Every node gets a turn; the guard itself decides at run time
+  # whether it needs one (only while an etcd member runs on it), so nothing here
+  # assumes which nodes those are.
   vars:
-    _gateway_servers: >-
-      {{ groups['server'] | map('extract', hostvars) | selectattr('gateway', 'defined')
+    _gateways: >-
+      {{ groups['k3s_cluster'] | map('extract', hostvars) | selectattr('gateway', 'defined')
          | selectattr('gateway') | map(attribute='inventory_hostname') | list }}
-    _restart_order: "{{ _gateway_servers + (groups['server'] | reject('in', _gateway_servers) | list) }}"
+    _restart_order: "{{ _gateways + (groups['k3s_cluster'] | reject('in', _gateways) | list) }}"
   ansible.builtin.set_fact:
-    k3s_restart_stagger: "{{ _restart_order.index(inventory_hostname) * 10 if 'server' in group_names else 0 }}"
+    k3s_restart_stagger: "{{ _restart_order.index(inventory_hostname) * 10 }}"
 
 - name: Create k3s systemd drop-in directory
   ansible.builtin.file:
@@ -86,8 +88,8 @@
 
 - name: Install the tailscale0 ifindex guard script
   # The recovery mechanism: restart k3s when the tailscale0 flannel bound to is
-  # replaced, or when flannel.1 is missing while tailscale0 is up. Servers wait
-  # for their turn first so etcd keeps quorum; see the script.
+  # replaced, or when flannel.1 is missing while tailscale0 is up. A node running
+  # an etcd member waits for its turn first so etcd keeps quorum; see the script.
   # tests/tailscale-flannel-guard.test.sh covers it.
   ansible.builtin.copy:
     src: tailscale-flannel-guard.sh

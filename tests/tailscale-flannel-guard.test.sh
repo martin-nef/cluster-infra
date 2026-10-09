@@ -44,14 +44,22 @@ cat > "$STUBS/sleep" <<'EOF'
 #!/bin/sh
 echo $(($(cat "$W/uptime") + $1)) > "$W/uptime"
 EOF
-# curl: etcd metrics for the current fake time. $W/peers has "FROM STATE"
-# lines; the last line with FROM <= now wins. STATE is up (connected to both
-# other members), down (one of them missing) or gone (no answer at all).
-cat > "$STUBS/curl" <<'EOF'
+# curl: the etcd metrics endpoint at the current fake time. $W/etcd has
+# "FROM STATE" lines; the last line with FROM <= now wins. STATE is
+#   none  nothing listening (curl exit 7: no etcd member on this node)
+#   hung  a member that does not answer (curl exit 28)
+#   up    a member connected to both other members
+#   down  a member missing one of them
+# With -o (the "is anything listening" probe) the body is discarded.
+cat > "$STUBS/curl" <<'STUB'
 #!/bin/sh
 now=$(cat "$W/uptime")
-state=$(awk -v now="$now" '$1 <= now { s = $2 } END { print s }' "$W/peers")
-[ "$state" = gone ] && exit 7
+state=$(awk -v now="$now" '$1 <= now { s = $2 } END { print s }' "$W/etcd")
+case "$state" in
+  none) exit 7 ;;
+  hung) exit 28 ;;
+esac
+case " $* " in *" -o "*) exit 0 ;; esac
 echo "etcd_server_has_leader 1"
 echo 'etcd_network_known_peers{Local="a",Remote="a"} 1'
 echo 'etcd_network_known_peers{Local="a",Remote="b"} 1'
@@ -59,7 +67,7 @@ echo 'etcd_network_known_peers{Local="a",Remote="c"} 1'
 echo 'etcd_network_known_peers{Local="a",Remote="old"} 0'
 echo 'etcd_network_active_peers{Local="a",Remote="b"} 1'
 [ "$state" = down ] || echo 'etcd_network_active_peers{Local="a",Remote="c"} 1'
-EOF
+STUB
 chmod +x "$STUBS"/*
 
 pass=0
@@ -84,8 +92,8 @@ check() {
 }
 
 # A node at uptime 1000 s whose k3s has been up since 100 s, with tailscale0
-# at ifindex 5 (recorded by an earlier run), flannel.1 present and all etcd
-# members connected.
+# at ifindex 5 (recorded by an earlier run), flannel.1 present and no etcd
+# member (cases that need one set $W/etcd).
 fresh() {
   echo "== [$SH] $1"
   W="$WORK/case$((pass + fail))"
@@ -96,7 +104,7 @@ fresh() {
   echo 1000 > "$W/uptime"
   echo active > "$W/active"
   echo 100000000 > "$W/active_since_us"
-  echo "0 up" > "$W/peers"
+  echo "0 none" > "$W/etcd"
   : > "$W/calls"
   : > "$W/log"
 }
@@ -130,53 +138,65 @@ check "keeps the last ifindex it saw" state_is ifindex 5
 
 fresh "agent, tailscale0 replaced"
 new_ifindex 9
-guard k3s-agent 10
-check "restarts k3s-agent at once (agents do not take turns)" restarted_at k3s-agent 1000
+guard k3s-agent 30
+check "restarts k3s-agent at once: no etcd member, no turn to wait for" restarted_at k3s-agent 1000
 check "logs why" logged "tailscale0 ifindex 5 -> 9; restarting k3s-agent"
 check "records the new ifindex" state_is ifindex 9
 check "records the restart time for the cooldown" state_is last-restart 1000
 
-fresh "server, tailscale0 replaced, all etcd members connected"
+fresh "server without etcd (--disable-etcd, external datastore)"
 new_ifindex 9
+guard k3s 10
+check "restarts k3s at once: being a server is not what matters" restarted_at k3s 1000
+
+fresh "server whose k3s is down (nothing listening)"
+new_ifindex 9
+echo inactive > "$W/active"
+guard k3s 10
+check "restarts at once, a stopped member costs no quorum" restarted_at k3s 1000
+
+fresh "etcd member, all members connected"
+new_ifindex 9
+echo "0 up" > "$W/etcd"
 guard k3s 10
 check "restarts k3s after its 10 s stagger" restarted_at k3s 1010
 
-fresh "server with stagger 0 (the gateway)"
+fresh "etcd member with stagger 0 (the gateway)"
 new_ifindex 9
+echo "0 up" > "$W/etcd"
 guard k3s 0
 check "restarts k3s at once" restarted_at k3s 1000
 
-fresh "server, an etcd member is disconnected until 1040"
+fresh "etcd member, another member disconnected until 1040"
 new_ifindex 9
-printf '0 down\n1040 up\n' > "$W/peers"
+printf '0 down\n1040 up\n' > "$W/etcd"
 guard k3s 0
 check "waits until it is back, then restarts" restarted_at k3s 1040
 
-fresh "server, another server starts restarting during the stagger"
+fresh "etcd member, another starts restarting during the stagger"
 new_ifindex 9
-printf '0 up\n1005 down\n1030 up\n' > "$W/peers"
+printf '0 up\n1005 down\n1030 up\n' > "$W/etcd"
 guard k3s 10
-check "waits for that server, staggers again, then restarts" restarted_at k3s 1040
+check "waits for it, staggers again, then restarts" restarted_at k3s 1040
 
-fresh "server, etcd members never all connected"
+fresh "etcd member, its own member stops while it waits"
 new_ifindex 9
-echo "0 down" > "$W/peers"
+printf '0 down\n1020 none\n' > "$W/etcd"
+guard k3s 10
+check "stops waiting and restarts" restarted_at k3s 1020
+
+fresh "etcd member, members never all connected"
+new_ifindex 9
+echo "0 down" > "$W/etcd"
 guard k3s 10
 check "restarts anyway after 300 s" restarted_at k3s 1300
 check "says so" logged "still not all connected after 300s, restarting k3s anyway"
 
-fresh "server, etcd metrics unreachable"
+fresh "etcd member that does not answer (metrics time out)"
 new_ifindex 9
-echo "0 gone" > "$W/peers"
+echo "0 hung" > "$W/etcd"
 guard k3s 0
-check "restarts anyway after 300 s" restarted_at k3s 1300
-
-fresh "server, k3s is not running"
-new_ifindex 9
-echo inactive > "$W/active"
-echo "0 gone" > "$W/peers"
-guard k3s 10
-check "restarts at once, without waiting for etcd" restarted_at k3s 1000
+check "counts as a member and waits, then restarts anyway after 300 s" restarted_at k3s 1300
 
 fresh "restarted 100 s ago"
 new_ifindex 9
