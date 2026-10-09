@@ -194,15 +194,16 @@
 
 # TODO: Add a task to apply optimization for exit nodes (only if <host>.gateway is true in inventory and host is linux)
 # https://tailscale.com/docs/reference/best-practices/performance#linux-optimizations-for-subnet-routers-and-exit-nodes
-# 
+#
 # enable right now:
 # NETDEV=$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")
 # sudo ethtool -K $NETDEV rx-udp-gro-forwarding on rx-gro-list off
-# 
+#
 # if sudo systemctl is-enabled networkd-dispatcher
-#   printf '#!/bin/sh\n\nethtool -K %s rx-udp-gro-forwarding on rx-gro-list off \n' "$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")" | sudo tee /etc/networkd-dispatcher/routable.d/50-tailscale
+#   printf '#!/bin/sh\n\nethtool -K %s rx-udp-gro-forwarding on rx-gro-list off \n' "$(ip -o route get 8.8.8.8 | cut -f 5 -d " ")" \
+#     | sudo tee /etc/networkd-dispatcher/routable.d/50-tailscale
 #   sudo chmod 755 /etc/networkd-dispatcher/routable.d/50-tailscale
-# 
+#
 # Test if succeeded
 # sudo /etc/networkd-dispatcher/routable.d/50-tailscale
 # test $? -eq 0 || echo 'An error occurred.'
@@ -221,3 +222,26 @@
     content: |
       APT::Periodic::Update-Package-Lists "1";
       APT::Periodic::Unattended-Upgrade "1";
+
+- name: Create apt-daily systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/apt-daily.service.d
+    state: directory
+    mode: "0755"
+
+- name: Bound how long the daily apt list refresh may run
+  # apt-daily.service is a oneshot with no start timeout. On oci-big-1 its
+  # `apt-get update` hung on 2026-06-06 and held the apt lists lock for four
+  # months, which silently stopped unattended-upgrades and every Tailscale
+  # auto-update, as both need that lock. Only the list refresh is bounded:
+  # apt-daily-upgrade.service runs dpkg, which must not be killed mid-install.
+  # The timeout counts from when a run started, so on a node that is already
+  # stuck the daemon-reload this triggers ends the stuck run straight away.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/apt-daily.service.d/10-timeout.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/base).
+      [Service]
+      TimeoutStartSec=30min
+  notify: Reload systemd
