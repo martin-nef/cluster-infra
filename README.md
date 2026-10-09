@@ -104,3 +104,8 @@ helm upgrade --install tailscale-release tailscale/tailscale-operator \
 shellcheck 0.11.0; to run exactly that locally:
 `pipx run --spec shellcheck-py==0.11.0.1 shellcheck <file>`. A script declares its own dialect (shebang or `# shellcheck shell=...`)
 and any exception as a `# shellcheck disable=...` comment with the reason; there is no global config.
+
+`ansible/roles/base/files/tailscale-flannel-guard.sh` restarts k3s on a node whose flannel lost
+`tailscale0` (nodes running an etcd member take turns so etcd keeps quorum). `tests/tailscale-flannel-guard.test.sh [sh|bash]`
+runs it against a fake `/sys` with stubbed `systemctl`, `curl` and `sleep`, so it touches nothing and
+finishes instantly; `.github/workflows/shelltest.yml` runs it on PRs that touch the script or `tests/`.

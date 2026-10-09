@@ -1,13 +1,16 @@
 name: shelltest
 
-# Runs tests/flux-helm.test.sh on PRs that touch flux-helm.sh or the tests. The
-# suite runs the script against throwaway local repos with a stubbed gh, so it
-# needs no secrets and nothing leaves the runner. It runs under dash (sh on
-# Ubuntu) and bash, since the script has to work in both.
+# Runs the shell test suites on PRs that touch a tested script or the tests:
+# tests/flux-helm.test.sh (flux-helm.sh, against throwaway local repos with a
+# stubbed gh) and tests/tailscale-flannel-guard.test.sh (the k3s restart guard
+# from roles/base, against a fake /sys and stubbed systemctl). Neither needs
+# secrets and nothing leaves the runner. Both run under dash (sh on Ubuntu) and
+# bash, since the scripts have to work in both.
 on:
   pull_request:
     paths:
       - flux-helm.sh
+      - ansible/roles/base/files/tailscale-flannel-guard.sh
       - tests/**
       - .github/workflows/shelltest.yml
 
@@ -37,5 +40,10 @@ jobs:
           version: ${{ env.FLUX_VERSION }}
 
       # kubectl and perl come with the runner image, so no check is skipped.
-      - name: Run tests
+      - name: Run flux-helm tests
         run: tests/flux-helm.test.sh "${{ matrix.shell }}"
+
+      # Runs even if the flux-helm tests failed, so both results show.
+      - name: Run tailscale-flannel-guard tests
+        if: ${{ !cancelled() }}
+        run: tests/tailscale-flannel-guard.test.sh "${{ matrix.shell }}"
