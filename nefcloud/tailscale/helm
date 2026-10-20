@@ -1,5 +1,9 @@
 # Release name stays tailscale-release: renaming it would make Flux uninstall
 # the running operator and install a new one.
+#
+# No --version: the operator floats to the latest chart so it auto-updates (see
+# commit 59a48c1). Keep it unpinned here, otherwise flux-helm.sh regenerates a
+# version pin into helmrelease.yaml and reverses the auto-update.
 helm repo add tailscale https://pkgs.tailscale.com/helmcharts
 helm repo update
 helm upgrade \
@@ -8,5 +12,4 @@ helm upgrade \
   tailscale/tailscale-operator \
   --namespace=tailscale \
   --create-namespace \
-  --version 1.96.5 \
   --wait
