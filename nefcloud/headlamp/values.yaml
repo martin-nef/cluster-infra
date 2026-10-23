@@ -1,0 +1,9 @@
+# Headlamp's own pod ServiceAccount does not need cluster permissions. All API
+# access flows through the headlamp-auth proxy, which injects its own token and
+# impersonates the authenticated user (see rbac.yaml and auth-proxy.yaml); a
+# request that carries no token is rejected (401, verified by probe), so
+# Headlamp does not authorize with its own SA. The chart otherwise binds this
+# SA to cluster-admin, leaving a standing cluster-admin token in an
+# internet-adjacent pod. Drop that binding.
+clusterRoleBinding:
+  create: false

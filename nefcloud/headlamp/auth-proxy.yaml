@@ -81,3 +81,25 @@ spec:
               app.kubernetes.io/name: traefik
       ports:
         - port: 8080
+---
+# The Headlamp backend carries no auth of its own; it trusts the Authorization
+# token the headlamp-auth proxy injects. Only that proxy should reach it, or any
+# pod on the flat cluster network could call the backend directly and bypass
+# oauth2-proxy. Restrict ingress to the nginx auth proxy on the backend port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: headlamp-backend-from-auth-proxy
+  namespace: kube-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: headlamp
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: headlamp-auth
+      ports:
+        - port: 4466
