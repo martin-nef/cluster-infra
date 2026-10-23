@@ -58,3 +58,15 @@ spec:
           default: true
         exposedPort: 8888
         protocol: UDP
+      zomboid-1:
+        port: 16261
+        expose:
+          default: true
+        exposedPort: 16261
+        protocol: UDP
+      zomboid-2:
+        port: 16262
+        expose:
+          default: true
+        exposedPort: 16262
+        protocol: UDP
