@@ -55,9 +55,27 @@ main() {
     [ -n "${path:-}" ] && [ "$path" != - ] || path=./deploy
 
     url="ssh://git@github.com/$OWNER/$repo.git"
+    require_repo "$name" "$repo"
     open_pr "$name" "$url" "$branch" "$path"
     ensure_deploy_key "$name" "$repo" "$url"
   done
+}
+
+# Fail with a clear message if the app repo doesn't exist, before open_pr
+# pushes a branch and the deploy key calls die on a bare curl 404. Nothing
+# here creates app repos; they have to be made by hand first.
+require_repo() {
+  name="$1" repo="$2"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER/$repo")" || code=000
+  case "$code" in
+    200) ;;
+    404) echo "$name: repo $OWNER/$repo does not exist, or GITHUB_TOKEN cannot see it." \
+           "Create it (Flux manifests under the app's path) and re-run." >&2; exit 1 ;;
+    *) echo "$name: cannot check repo $OWNER/$repo (HTTP $code)" >&2; exit 1 ;;
+  esac
 }
 
 # Commit the app's Flux manifests to a new branch and open a draft PR,
