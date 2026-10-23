@@ -7,3 +7,4 @@ resources:
   - playit.yaml
   - valheim.yaml
   - runescape.yaml
+  - project-zomboid.yaml
