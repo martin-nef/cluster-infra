@@ -15,14 +15,17 @@ An app is its own GitHub repo under `martin-nef/` with its manifests in `deploy/
 5. Review and merge the draft PR (`flux-check.yml` validates PRs that touch `nefcloud/**`). Flux picks the app up after the merge. Until step 6 is done its Kustomization shows `kustomization path not found`, which is expected.
 6. After the PR is merged, stamp out the Kustomization in the app repo (skip if it already has one at the registered path):
 
-   ```bash
-   cd ../<repo>
-   mkdir -p deploy
-   cat > deploy/kustomization.yaml <<'EOF'
+   Create `deploy/kustomization.yaml` in the app repo containing:
+
+   ```yaml
    apiVersion: kustomize.config.k8s.io/v1beta1
    kind: Kustomization
    resources: []
-   EOF
+   ```
+
+   then, from the app repo root:
+
+   ```bash
    kubectl kustomize deploy   # must build; empty output is fine
    git add deploy/kustomization.yaml
    git commit -m "chore: add empty Flux kustomization in deploy/" -- deploy/kustomization.yaml
@@ -66,7 +69,7 @@ Do this after the Flux PR is merged and step 6 is done. Each app has its own age
    ```
 
 4. Commit only those two files (`git add .gitignore .sops.yaml && git commit -m "..." -- .gitignore .sops.yaml`), check `git show --stat HEAD` has no `age.agekey`, push.
-5. Here, add a `decryption` block to the app's `Kustomization` in `nefcloud/apps/<name>.yaml`, then commit and push. Do this after step 3, or the Kustomization fails on the missing secret:
+5. Back in `cluster-infra`, add a `decryption` block to the app's `Kustomization` in `nefcloud/apps/<name>.yaml`, then commit and push. Do this after step 3, or the Kustomization fails on the missing secret:
 
    ```yaml
    spec:
