@@ -1,6 +1,6 @@
 Manages the nodes (ansible/) and the k3s cluster (nefcloud/, reconciled by Flux from `main`). See README.md for the general layout.
 
-Important! Do not `kubectl apply`. Everything under nefcloud/ is managed through Flux: commit + push to `main`, then `flux reconcile kustomization <name> --with-source` if you don't want to wait.
+Important! Do not `kubectl apply`. Everything under nefcloud/ is managed through Flux: commit + push to `main`, then `flux reconcile kustomization <name> --with-source` if you don't want to wait. The one exception is an app's `<name>-sops-age` secret, which is created with kubectl (see SOPS below).
 
 ## Adding a new Flux app
 
@@ -34,19 +34,53 @@ An app is its own GitHub repo under `martin-nef/` with its manifests in `deploy/
 
 ### Follow-ups the generated manifest does not cover
 
-- **Secrets.** If the app repo has SOPS-encrypted secrets (`deploy/secrets.yaml`, matched by `.sops.yaml`), add a `decryption` block to the app's `Kustomization` in `nefcloud/apps/<name>.yaml`, as `project-zomboid` does:
-
-  ```yaml
-  spec:
-    decryption:
-      provider: sops
-      secretRef:
-        name: <name>-sops-age
-  ```
-
-  The `<name>-sops-age` secret lives in `flux-system` and nothing in this repo creates it, so check that it exists (`kubectl -n flux-system get secret <name>-sops-age`) before relying on it. `smart-reviewer` uses the shared `flux-sops-age` instead.
+- **Secrets.** See *SOPS for a new app* below.
 - **Non-HTTP ports (game servers).** Add an entrypoint per port to `nefcloud/traefik/helmchartconfig.yaml` (`port`, `expose.default: true`, `exposedPort`, `protocol: TCP|UDP`), and reference it from an `IngressRoute`/`IngressRouteUDP` in the app's `deploy/`. Entrypoint names are at most 15 characters.
 - **HTTP.** A plain `Ingress` in the app's `deploy/` with host `<name>.nefcloud.top` is enough (see `smart-reviewer`).
+
+### SOPS for a new app
+
+Do this after the Flux PR is merged and step 6 is done. Each app has its own age key (`smart-reviewer` is the exception, it uses the shared `flux-sops-age`).
+
+1. In the app repo, git-ignore the key **before** generating it:
+
+   ```bash
+   cd ../<repo>
+   echo age.agekey >> .gitignore
+   git check-ignore -q age.agekey && age-keygen -o age.agekey
+   ```
+
+2. Write `.sops.yaml` with the public key (`age-keygen -y age.agekey`):
+
+   ```yaml
+   creation_rules:
+     - path_regex: .*secrets?.*\.ya?ml$
+       encrypted_regex: ^(data|stringData)$
+       age: <public key>
+   ```
+
+3. Give Flux the private key. The data key must end in `.agekey`:
+
+   ```bash
+   kubectl -n flux-system create secret generic <name>-sops-age --from-file=age.agekey=age.agekey
+   ```
+
+4. Commit only those two files (`git add .gitignore .sops.yaml && git commit -m "..." -- .gitignore .sops.yaml`), check `git show --stat HEAD` has no `age.agekey`, push.
+5. Here, add a `decryption` block to the app's `Kustomization` in `nefcloud/apps/<name>.yaml`, then commit and push. Do this after step 3, or the Kustomization fails on the missing secret:
+
+   ```yaml
+   spec:
+     decryption:
+       provider: sops
+       secretRef:
+         name: <name>-sops-age
+   ```
+
+6. `flux reconcile kustomization flux-system -n flux-system --with-source`, then check `<name>` is `Ready` (below).
+
+Adding secrets later: in the app repo root run `sops deploy/secrets.yaml` (it opens an editor and encrypts on save), then add `secrets.yaml` to `resources:` in `deploy/kustomization.yaml`. Don't commit an empty placeholder `secrets.yaml`: sops refuses to encrypt an empty file, and `sops` won't open an unencrypted one.
+
+`age.agekey` exists only in the local checkout and the `<name>-sops-age` secret. To restore it: `kubectl -n flux-system get secret <name>-sops-age -o jsonpath='{.data.age\.agekey}' | base64 -d > age.agekey`.
 
 ### Checking it worked
 
