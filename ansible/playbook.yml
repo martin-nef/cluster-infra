@@ -1,4 +1,44 @@
 ---
+# This repo is public, so a vault file that is not encrypted is a leaked secret
+# (host_vars/oci-small-2 once was). Runs before anything else, whatever the
+# tags. It runs once, locally, from `hosts: all`: a `hosts: localhost` play would
+# be skipped by `--limit <host>`.
+- name: Refuse to run with an unencrypted vault file
+  hosts: all
+  become: false
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Find vault files
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}"
+        patterns: [vault.yml, vault.yaml]
+        recurse: true
+      register: vault_files
+
+    - name: Find the encrypted ones
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}"
+        patterns: [vault.yml, vault.yaml]
+        recurse: true
+        contains: '^\$ANSIBLE_VAULT;'
+      register: vault_files_encrypted
+
+    - name: Fail on unencrypted vault files
+      run_once: true
+      vars:
+        unencrypted: >-
+          {{ vault_files.files | map(attribute='path')
+             | difference(vault_files_encrypted.files | map(attribute='path')) }}
+      ansible.builtin.assert:
+        that: unencrypted | length == 0
+        fail_msg: "Not encrypted (run ./encrypt.sh, and do not commit them as they are): {{ unencrypted | join(', ') }}"
+        quiet: true
+
 - name: Provision cluster nodes
   hosts: all
   become: true
