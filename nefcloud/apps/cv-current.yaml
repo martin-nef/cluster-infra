@@ -1,0 +1,26 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: cv-current
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  ref:
+    branch: main
+  secretRef:
+    name: cv-current-auth
+  url: ssh://git@github.com/martin-nef/cv-current.git
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: cv-current
+  namespace: flux-system
+spec:
+  interval: 10m0s
+  path: ./deploy
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: cv-current
