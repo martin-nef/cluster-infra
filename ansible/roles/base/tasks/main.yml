@@ -24,10 +24,13 @@
   # Tags are applied by hand at provisioning time, deliberately: advertising them
   # from here would replace a node's whole tag set rather than add to it, and
   # shitbox carries tag:flux-server and tag:shitbox alongside tag:k3s.
+  # Only runs on a node that is not on the tailnet yet. No auth key is stored in
+  # the repo: create a one-off key and pass it for that run, e.g.
+  # `ansible-playbook playbook.yml --limit <host> -e tailscale_auth_key=tskey-auth-...`.
   no_log: true
   ansible.builtin.command: >-
     tailscale up
-    --auth-key={{ vault_tailscale_auth_key }}
+    --auth-key={{ tailscale_auth_key | mandatory }}
   vars:
     _ts_state: "{{ (tailscale_status.stdout | from_json) if (tailscale_status.rc == 0 and tailscale_status.stdout | default('') | length > 0) else {} }}"
   when: >-
