@@ -3,7 +3,6 @@ kind: Kustomization
 resources:
   - minecraft.yaml
   - smart-reviewer.yaml
-  - playit.yaml
   - valheim.yaml
   - runescape.yaml
   - project-zomboid.yaml

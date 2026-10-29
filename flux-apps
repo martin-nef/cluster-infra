@@ -2,7 +2,6 @@
 # Defaults: repo=name, branch=main, path=./deploy
 smart-reviewer
 minecraft
-playit playit-gg
 valheim
 runescape
 project-zomboid
