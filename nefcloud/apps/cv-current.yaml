@@ -24,3 +24,7 @@ spec:
   sourceRef:
     kind: GitRepository
     name: cv-current
+  decryption:
+    provider: sops
+    secretRef:
+      name: cv-current-sops-age
