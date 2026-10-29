@@ -23,16 +23,15 @@ spec:
       template: admin-emails
     config:
       cookieDomain: .nefcloud.top
+      emailDomains: []
       existingSecret: google-oauth2-creds
       provider: google
     extraArgs:
-      authenticated-emails-file: /etc/oauth2-proxy-config/allowed_emails.txt
       cookie-csrf-per-request: "true"
       cookie-expire: 168h
       cookie-refresh: 1h
       cookie-samesite: lax
       cookie-secure: "true"
-      email-domain: ""
       proxy-prefix: /oauth2
       reverse-proxy: "true"
       set-xauthrequest: "true"
