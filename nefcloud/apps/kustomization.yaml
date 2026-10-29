@@ -8,3 +8,4 @@ resources:
   - valheim.yaml
   - runescape.yaml
   - project-zomboid.yaml
+  - cv-current.yaml
