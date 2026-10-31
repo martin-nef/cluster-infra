@@ -120,9 +120,9 @@ Decided against:
 
 - **Installation tokens.** GitHub's docs list them for `POST /user/repos` too. Not used: the point is that you're the actor. It's also untested whether that creates the repo under your account.
 - **Adding repos to the agent App's installation.** Not needed: `martin-nef-agent` is installed on *All repositories*, so a new repo is covered at once. The endpoint (`PUT /user/installations/{id}/repositories/{repo}`) needs a separate "installation repository access" permission. It's also unclear whether one App's user token can change another App's installation. Revisit if the agent App moves to selected repos.
-- **Device flow.** It needs no callback URL, but you'd type a code on github.com/login/device, which is worse on a phone than a link that returns by itself.
+- **Device flow.** It needs no redirect URI, but you'd type a code on github.com/login/device, which is worse on a phone than a link that returns by itself.
 
-**Setup for an App made before v3.** New setups get the client secret from GitHub along with the key. An existing App needs two changes in its settings on GitHub, done once. Add the callback URL `https://ops.nefcloud.top/github/authorize`, then generate a client secret and paste it on <https://ops.nefcloud.top/github>. The minter checks it with GitHub before storing it. Trade-off: the pasted secret passes through the broker's HTTP handler once, as setup's one-time code does. Alone, it gets nothing without a code from your GitHub sign-in.
+**Setup for an App made before v3.** New setups get the client secret from GitHub along with the key. An existing App needs two changes in its settings on GitHub, done once. Under *Identifying and authorizing users*, add the redirect URI `https://ops.nefcloud.top/github/authorize`, then generate a client secret and paste it on <https://ops.nefcloud.top/github>. The minter checks it with GitHub before storing it. Trade-off: the pasted secret passes through the broker's HTTP handler once, as setup's one-time code does. Alone, it gets nothing without a code from your GitHub sign-in.
 
 ### The token minter
 
