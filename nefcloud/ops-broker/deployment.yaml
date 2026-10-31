@@ -45,6 +45,8 @@ spec:
           startupProbe:
             exec:
               command: [python, -c, "import os; os.stat('/run/minter/minter.sock')"]
+            # A cold python start can take over a second on this node.
+            timeoutSeconds: 5
             periodSeconds: 1
             failureThreshold: 30
           resources:
