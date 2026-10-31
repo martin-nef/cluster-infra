@@ -34,4 +34,4 @@ spec:
         memory: 512Mi
       max:
         cpu: "2"
-        memory: 4Gi
+        memory: 8Gi
