@@ -2,7 +2,8 @@
 # is the verb list: the API server refuses anything else before the broker
 # sees it. spec is immutable, so what you approve is what runs; status is a
 # subresource that only the broker can write. Cluster verbs take spec.target,
-# GitHub verbs spec.github.
+# GitHub verbs spec.github. spec.requester is set by admission.yaml, never by
+# the requester.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -28,7 +29,9 @@ spec:
         - {name: Namespace, type: string, jsonPath: .spec.target.namespace}
         - {name: Target, type: string, jsonPath: .spec.target.name}
         - {name: Repo, type: string, jsonPath: .spec.github.repo}
+        - {name: Requester, type: string, jsonPath: .spec.requester, priority: 1}
         - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Expires, type: date, jsonPath: .status.expiresAt, priority: 1}
         - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
       schema:
         openAPIV3Schema:
@@ -160,6 +163,20 @@ spec:
                   type: string
                   minLength: 1
                   maxLength: 1000
+                requester:
+                  description: >-
+                    Who created it (the API server's username). Stamped by the opsrequests-requester
+                    admission policy, whatever the request said; don't set it.
+                  type: string
+                  maxLength: 253
+                ttlSeconds:
+                  description: >-
+                    How long it may wait for a decision. Default the broker's REQUEST_TTL (15 min);
+                    capped at its MAX_TTL (12 h). An agent that runs at night asks for long enough to
+                    reach the morning.
+                  type: integer
+                  minimum: 60
+                  maximum: 86400
             status:
               type: object
               properties:
@@ -168,6 +185,11 @@ spec:
                   enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected]
                 message: {type: string}
                 specHash: {type: string}
+                expiresAt: {type: string, format: date-time}
+                notifiedAt:
+                  description: When it was announced; unset while it waits for the quiet hours' digest.
+                  type: string
+                  format: date-time
                 targetUID: {type: string}
                 decidedBy: {type: string}
                 decidedAt: {type: string, format: date-time}

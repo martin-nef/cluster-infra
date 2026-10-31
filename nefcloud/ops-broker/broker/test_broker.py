@@ -454,13 +454,41 @@ class TestDecide(Base):
         self.assertEqual(self.api.actions(), [])
 
     def test_replaced_pod_is_not_deleted(self):
+        # Seen by the check on approval: nothing is run.
         h = self.pending("delete-pod", "Pod", "app", "web-1")
         self.api.put("Pod", "app", "web-1", uid="uid-new", ownerReferences=[{"kind": "StatefulSet", "controller": True}])
-        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 502)
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 409)
+        st = self.api.status("r1")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("replaced", st["message"])
+        self.assertEqual(self.api.actions(), [])
+        self.assertIn(broker.KINDS["Pod"].format(ns="app", name="web-1"), self.api.objects)
+
+    def test_pod_replaced_after_the_check_is_not_deleted(self):
+        # Replaced between that check and the delete: the UID precondition stops it.
+        h = self.pending("delete-pod", "Pod", "app", "web-1")
+        self.api.put("Pod", "app", "web-1", uid="uid-new", ownerReferences=[{"kind": "StatefulSet", "controller": True}])
+        with mock.patch.object(broker, "check", return_value=(None, "uid-web-1")):
+            self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 502)
         st = self.api.status("r1")
         self.assertEqual(st["phase"], "Failed")
         self.assertIn("replaced", st["message"])
         self.assertIn(broker.KINDS["Pod"].format(ns="app", name="web-1"), self.api.objects)
+
+    def test_recreated_target_is_not_run(self):
+        # A Deployment deleted and made again since the request is not the one asked about.
+        h = self.pending()
+        self.api.put("Deployment", "app", "web", uid="uid-again")
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 409)
+        self.assertEqual(self.api.status("r1")["phase"], "Rejected")
+        self.assertEqual(self.api.actions(), [])
+
+    def test_recheck_outage_leaves_it_pending(self):
+        h = self.pending()
+        self.api.fail[("GET", broker.KINDS["Deployment"].format(ns="app", name="web"))] = broker.K8sError(503, "busy")
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 502)
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 200)
 
     def test_ambiguous_errors_are_unknown(self):
         path = broker.KINDS["Deployment"].format(ns="app", name="web")
@@ -489,9 +517,15 @@ class TestDecide(Base):
         broker.scan()
         self.assertEqual(self.api.status("r1")["phase"], "Unknown")
 
-    def test_failure_is_recorded(self):
+    def test_gone_target_is_not_run(self):
         h = self.pending()
         del self.api.objects[broker.KINDS["Deployment"].format(ns="app", name="web")]
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 409)
+        self.assertEqual(self.api.status("r1")["phase"], "Rejected")
+
+    def test_failure_is_recorded(self):
+        h = self.pending()
+        self.api.fail[("PATCH", broker.KINDS["Deployment"].format(ns="app", name="web"))] = broker.K8sError(422, "invalid")
         self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 502)
         self.assertEqual(self.api.status("r1")["phase"], "Failed")
 
@@ -664,6 +698,13 @@ class TestGitHubScan(GitHubBase):
 
 
 class TestGitHubDecide(GitHubBase):
+    def assertWrites(self, permissions):
+        """The approval re-checks with read tokens, then runs with one write token."""
+        *checks, run = self.gh.tokens
+        self.assertEqual(run, (["web"], permissions))
+        for repos, perms in checks:
+            self.assertEqual((repos, set(perms.values())), (["web"], {"read"}))
+
     def approve(self, verb, **github):
         st = self.admit_github("r1", verb, **github)
         self.assertEqual(st["phase"], "Pending", st.get("message"))
@@ -675,14 +716,14 @@ class TestGitHubDecide(GitHubBase):
     def test_commit_lands_on_exactly_the_base(self):
         code, st = self.approve("github-commit-workflows", **COMMIT)
         self.assertEqual((code, st["phase"]), (200, "Succeeded"))
-        self.assertEqual(self.gh.tokens, [(["web"], {"contents": "write", "workflows": "write"})])
+        self.assertWrites({"contents": "write", "workflows": "write"})
         tree, commit, ref = self.gh.writes()
         self.assertEqual(tree[2], {"base_tree": "basetree", "tree": [
             {"path": ".github/workflows/ci.yml", "mode": "100644", "type": "blob",
              "content": COMMIT["files"][0]["content"]}]})
         self.assertEqual(commit[2]["parents"], [BASE])
         self.assertEqual(ref[2], {"sha": "c" * 40, "force": False})
-        self.assertEqual(len(self.gh.revoked), 2)  # the check's token and the run's
+        self.assertEqual(len(self.gh.revoked), 3)  # every token: the checks' on admission and approval, and the run's
 
     def test_delete_is_a_null_sha(self):
         self.approve("github-commit-workflows", **{**COMMIT, "files": [{"path": ".github/workflows/ci.yml", "delete": True}]})
@@ -695,13 +736,19 @@ class TestGitHubDecide(GitHubBase):
             ("ref timeout", ref, broker.githubops.GitHubError(502, "bad gateway"), "Unknown"),
             ("ref reset", ref, ConnectionResetError("reset"), "Unknown"),
             ("tree 5xx", ("POST", f"{REPO}/git/trees"), broker.githubops.GitHubError(502, "x"), "Failed"),
-            ("no token", ("POST", "/app/installations/9/access_tokens"), broker.githubops.GitHubError(502, "x"), "Failed"),
+            # The approval's re-check can't get a token: nothing is decided, try again.
+            ("no token", ("POST", "/app/installations/9/access_tokens"), broker.githubops.GitHubError(502, "x"), "Pending"),
+            ("branch moved before approval", ("GET", f"{REPO}/branches/work"),
+             None, "Rejected"),
         ]
         for label, call, error, expected in cases:
             with self.subTest(label):
                 self.setUp()
                 st = self.admit_github("r1", "github-commit-workflows", **COMMIT)
-                self.gh.fail[call] = error
+                if error is None:
+                    self.gh.branches["work"]["commit"]["sha"] = MOVED
+                else:
+                    self.gh.fail[call] = error
                 broker.decide("r1", "approve", st["specHash"], APPROVER)
                 self.assertEqual(self.api.status("r1")["phase"], expected)
 
@@ -710,12 +757,20 @@ class TestGitHubDecide(GitHubBase):
         self.assertEqual((code, st["phase"]), (200, "Succeeded"))
         [(method, path, body)] = self.gh.writes()
         self.assertEqual((method, path, body), ("PUT", f"{REPO}/branches/main/protection", broker.githubops.PROTECTION))
-        self.assertEqual(self.gh.tokens, [(["web"], {"administration": "write"})])
+        self.assertWrites({"administration": "write"})
 
     def test_protect_never_replaces_a_rule(self):
+        # Someone set one up after the request: the approval's check sees it.
         st = self.admit_github("r1", "github-protect-branch", repo="web")
-        self.gh.protected.add("main")  # someone set one up after the request
+        self.gh.protected.add("main")
         broker.decide("r1", "approve", st["specHash"], APPROVER)
+        self.assertEqual(self.api.status("r1")["phase"], "Rejected")
+        # Or after that check: the run checks again just before writing.
+        self.setUp()
+        st = self.admit_github("r1", "github-protect-branch", repo="web")
+        self.gh.protected.add("main")
+        with mock.patch.object(broker, "check", return_value=(None, None)):
+            broker.decide("r1", "approve", st["specHash"], APPROVER)
         self.assertEqual(self.api.status("r1")["phase"], "Failed")
         self.assertEqual([w for w in self.gh.writes() if w[0] == "PUT"], [])
 
@@ -728,7 +783,7 @@ class TestGitHubDecide(GitHubBase):
         self.assertEqual(st["phase"], "Succeeded")
         self.assertEqual(self.gh.writes(), [("POST", f"{REPO}/actions/workflows/image.yml/dispatches",
                                              {"ref": "main", "inputs": {"tag": "1.2"}})])
-        self.assertEqual(self.gh.tokens, [(["web"], {"actions": "write"})])
+        self.assertWrites({"actions": "write"})
 
 
 class TestGitHubHTTP(Served, GitHubBase):
@@ -796,8 +851,9 @@ class TestGitHubHTTP(Served, GitHubBase):
         self.assertIn("token minter", self.request("GET", "/github")[1])
         self.add_github("r2", "github-rerun-workflow", repo="web", runID=7)
         self.api.requests["r2"]["status"] = {"phase": "Pending", "specHash": broker.spec_hash(self.api.requests["r2"])}
-        broker.decide("r2", "approve", self.api.status("r2")["specHash"], APPROVER)
-        self.assertEqual(self.api.status("r2")["phase"], "Failed")
+        # Without the minter, the approval can't check it again: nothing is decided.
+        self.assertEqual(broker.decide("r2", "approve", self.api.status("r2")["specHash"], APPROVER)[0], 502)
+        self.assertEqual(self.api.status("r2")["phase"], "Pending")
         self.assertEqual(self.gh.writes(), [])
 
     def test_broker_never_reads_secrets(self):
@@ -903,6 +959,113 @@ class TestCreateRepo(Served, GitHubBase):
         self.assertNotIn("CS", self.request("GET", "/github")[1])
 
 
+AGENT = "system:serviceaccount:claude-remote:claude-remote"
+NIGHT = "system:serviceaccount:night-shift:night-worker"
+
+
+class TestAsync(Base):
+    """Requests from agents that run while you sleep."""
+
+    def setUp(self):
+        super().setUp()
+        for p in (mock.patch.object(broker, "PENDING_CAPS", {AGENT: 2, NIGHT: 3}),
+                  mock.patch.object(broker, "MAX_TTL", 43200),
+                  mock.patch.object(broker, "QUIET_HOURS", ""),
+                  mock.patch.object(broker, "notify_digest", mock.Mock())):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def add(self, name, who=None, ttl=None, age=0):
+        self.api.add(name, "flux-reconcile", "Kustomization", "flux-system", "web", age=age)
+        spec = self.api.requests[name]["spec"]
+        if who:
+            spec["requester"] = who
+        if ttl:
+            spec["ttlSeconds"] = ttl
+
+    def test_requesters_have_their_own_slots(self):
+        for i in range(4):
+            self.add(f"n{i}", NIGHT, age=100 - i)
+        for i in range(3):
+            self.add(f"a{i}", AGENT, age=50 - i)
+        for i in range(3):
+            self.add(f"x{i}", age=20 - i)  # no requester: the shared pool (MAX_PENDING=2)
+        broker.scan()
+        phases = {n: self.api.status(n)["phase"] for n in self.api.requests}
+        self.assertEqual([phases[f"n{i}"] for i in range(4)], ["Pending"] * 3 + ["Rejected"])
+        self.assertEqual([phases[f"a{i}"] for i in range(3)], ["Pending"] * 2 + ["Rejected"])
+        self.assertEqual([phases[f"x{i}"] for i in range(3)], ["Pending"] * 2 + ["Rejected"])
+        self.assertIn(NIGHT, self.api.status("n3")["message"])
+
+    def test_ttl_is_the_requesters_choice_capped(self):
+        self.add("long", NIGHT, ttl=8 * 3600, age=3600)
+        self.add("huge", NIGHT, ttl=86400, age=13 * 3600)
+        self.add("default", AGENT, age=1000)
+        broker.scan()
+        self.assertEqual(self.api.status("long")["phase"], "Pending")
+        self.assertEqual(self.api.status("long")["expiresAt"], broker.stamp(broker.expires(self.api.requests["long"])))
+        self.assertEqual(self.api.status("huge")["phase"], "Expired")  # past MAX_TTL (12 h)
+        self.assertEqual(self.api.status("default")["phase"], "Expired")  # past REQUEST_TTL
+
+    def test_long_ttl_can_be_approved_late(self):
+        self.add("r1", NIGHT, ttl=8 * 3600)
+        broker.scan()
+        h = self.api.status("r1")["specHash"]
+        self.api.requests["r1"]["metadata"]["creationTimestamp"] = broker.stamp(broker.now() - timedelta(hours=7))
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 200)
+        self.assertEqual(self.api.status("r1")["phase"], "Succeeded")
+
+    def test_quiet_hours(self):
+        # 23:00-07:00 UTC; it is 02:00.
+        at = broker.parse_time("2026-11-01T02:00:00Z")
+        with mock.patch.object(broker, "QUIET_HOURS", "23:00-07:00"), mock.patch.object(broker, "QUIET_ZONE", broker.timezone.utc):
+            self.assertEqual(broker.quiet_until(at), broker.parse_time("2026-11-01T07:00:00Z"))
+            self.assertEqual(broker.quiet_until(broker.parse_time("2026-11-01T23:30:00Z")),
+                             broker.parse_time("2026-11-02T07:00:00Z"))
+            self.assertIsNone(broker.quiet_until(broker.parse_time("2026-11-01T12:00:00Z")))
+            with mock.patch.object(broker, "now", return_value=at):
+                self.add("night", NIGHT, ttl=8 * 3600)
+                self.add("urgent", AGENT)  # 15 minutes: worth nothing by 07:00
+                self.api.requests["night"]["metadata"]["creationTimestamp"] = broker.stamp(at)
+                self.api.requests["urgent"]["metadata"]["creationTimestamp"] = broker.stamp(at)
+                broker.scan()
+            self.assertEqual(self.api.status("night")["phase"], "Pending")
+            self.assertNotIn("notifiedAt", self.api.status("night"))
+            self.assertIn("notifiedAt", self.api.status("urgent"))
+            self.notify.assert_called_once()
+            self.assertEqual(self.notify.call_args[0][0]["metadata"]["name"], "urgent")
+            broker.notify_digest.assert_not_called()
+            # Morning: one digest for what the night held, once.
+            with mock.patch.object(broker, "now", return_value=broker.parse_time("2026-11-01T07:01:00Z")):
+                broker.scan()
+                broker.scan()
+            broker.notify_digest.assert_called_once()
+            self.assertEqual([r["metadata"]["name"] for r in broker.notify_digest.call_args[0][0]], ["night"])
+            self.assertIn("notifiedAt", self.api.status("night"))
+
+    def test_quiet_hours_in_a_zone(self):
+        zone = broker.ZoneInfo("Europe/London")
+        with mock.patch.object(broker, "QUIET_HOURS", "22:00-07:00"), mock.patch.object(broker, "QUIET_ZONE", zone):
+            # British summer time: 07:00 in London is 06:00 UTC.
+            self.assertEqual(broker.quiet_until(broker.parse_time("2026-07-01T01:00:00Z")),
+                             broker.parse_time("2026-07-01T06:00:00Z"))
+            self.assertIsNone(broker.quiet_until(broker.parse_time("2026-07-01T20:59:00Z")))
+
+    def test_page_shows_requester_and_expiry(self):
+        self.add("r1", NIGHT, ttl=3600)
+        broker.scan()
+        page = broker.request_page(self.api.requests["r1"])
+        self.assertIn(NIGHT, page)
+        self.assertIn(self.api.status("r1")["expiresAt"], page)
+        self.assertIn("night-worker", broker.index_page(list(self.api.requests.values())))
+
+    def test_audit_names_the_requester(self):
+        self.add("r1", NIGHT)
+        broker.scan()
+        lines = [json.loads(c.args[0]) for c in print.call_args_list if c.args and c.args[0].startswith("{")]
+        self.assertEqual({l["requester"] for l in lines}, {NIGHT})
+
+
 class TestNotify(unittest.TestCase):
     def test_posts_a_link_not_a_decision(self):
         req = {"metadata": {"name": "r1"},
@@ -917,6 +1080,18 @@ class TestNotify(unittest.TestCase):
         self.assertEqual(body["topic"], "topic123")
         self.assertEqual([a["action"] for a in body["actions"]], ["view"])
         self.assertEqual(body["click"], "https://ops.example.test/r/r1")
+
+    def test_digest_links_to_the_list(self):
+        req = {"metadata": {"name": "r1", "creationTimestamp": "2026-11-01T02:00:00Z"},
+               "spec": {"verb": "flux-resume", "requester": "someone",
+                        "target": {"kind": "Kustomization", "namespace": "flux-system", "name": "web"}, "reason": "x"}}
+        with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            broker.notify_digest([req, req])
+        body = json.loads(urlopen.call_args[0][0].data)
+        self.assertEqual(body["click"], "https://ops.example.test/")
+        self.assertIn("2 ops requests", body["title"])
+        self.assertIn("someone", body["message"])
 
     def test_off_without_url(self):
         with mock.patch.object(broker, "NTFY_URL", ""), mock.patch("urllib.request.urlopen") as urlopen:
