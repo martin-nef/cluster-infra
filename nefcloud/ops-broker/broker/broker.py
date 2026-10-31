@@ -9,8 +9,9 @@ CRD's schema already limits it to a fixed verb list:
   flux-suspend      (same kinds)
   flux-resume       (same kinds)
 
-and, through a separate GitHub App whose key only the broker holds, the GitHub
-actions the agent's own App may not take (githubops.py):
+and, through a separate GitHub App, the GitHub actions the agent's own App may
+not take (githubops.py). The App's key is held by the token minter sidecar
+(minter.py), not by this process, which only gets one-repo, one-step tokens:
 
   github-commit-workflows, github-protect-branch,
   github-rerun-workflow, github-dispatch-workflow
@@ -36,7 +37,6 @@ It is never run late or retried.
 
 Stdlib only, so it runs on a stock python image from a ConfigMap.
 """
-import base64
 import hashlib
 import html
 import json
@@ -65,16 +65,14 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose repos the GitHub verbs touch
-GITHUB_APP_NAME = os.environ.get("GITHUB_APP_NAME", "martin-nef-ops")
 
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 K8S_API = "https://kubernetes.default.svc"
 NAMESPACE = "ops-broker"
 REQUESTS = f"/apis/ops.nefcloud.top/v1alpha1/namespaces/{NAMESPACE}/opsrequests"
-# The GitHub App's id, slug and key. Created by the broker itself from the setup
-# page (/github), so the key never leaves the cluster; not in git.
-GITHUB_SECRET = "ops-broker-github-app"
-SECRETS = f"/api/v1/namespaces/{NAMESPACE}/secrets"
+# The token minter sidecar, the only container that holds the GitHub App's key
+# (minter.py). Its socket is in an emptyDir the two containers share.
+MINTER = githubops.Minter(os.environ.get("MINTER_SOCKET", "/run/minter/minter.sock"), GITHUB_OWNER)
 SETUP_TTL = 600  # seconds a started App setup may take on GitHub
 POLL = 5  # seconds between scans of the queue
 # An Approved request older than this was left by a broker that stopped mid-run
@@ -220,26 +218,13 @@ def check(req):
     return None, obj["metadata"].get("uid")
 
 
-def github_app():
-    """The ops GitHub App from its Secret, or None until it's set up."""
-    try:
-        data = k8s("GET", f"{SECRETS}/{GITHUB_SECRET}")["data"]
-    except K8sError as e:
-        if e.code == 404:
-            return None
-        raise
-    d = {k: base64.b64decode(v).decode() for k, v in data.items()}
-    return githubops.App(d["app-id"], d["slug"], d["private-key.pem"], GITHUB_OWNER)
-
-
 def check_github(spec):
     if not isinstance(spec.get("github"), dict) or "target" in spec:
         return "GitHub verbs take spec.github, not spec.target"
-    app = github_app()
-    if app is None:
-        return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
     try:
-        return githubops.check(app, spec)
+        if MINTER.status() is None:
+            return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
+        return githubops.check(MINTER, spec)
     except githubops.GitHubError as e:
         if e.transient:
             raise
@@ -261,13 +246,7 @@ def run(req):
 
 def act(spec, uid):
     if spec["verb"] in GITHUB_VERBS:
-        try:
-            app = github_app()
-        except (K8sError, OSError) as e:
-            raise githubops.NothingChanged(f"reading the App's Secret: {e}") from None
-        if app is None:
-            raise githubops.NothingChanged("the ops App isn't set up")
-        return githubops.act(app, spec)
+        return githubops.act(MINTER, spec)
     verb, path = spec["verb"], target_path(spec)
     if verb == "delete-pod":
         # Only the pod that was checked: a StatefulSet's replacement has the same name.
@@ -481,7 +460,7 @@ def request_page(req):
         # commit, the diff against the exact commit it will sit on. Decided
         # requests skip it; their status says what happened.
         try:
-            body += "<h2>What it does</h2>" + githubops.details(github_app(), s)
+            body += "<h2>What it does</h2>" + githubops.details(MINTER, s)
         except Exception as err:
             body += (f"<p class=warn>Couldn't show what this does ({e(err)}), so it can't be approved "
                      "from here. Reload, or deny it.</p>")
@@ -515,33 +494,33 @@ setups = {}
 def github_page():
     """The App's state, and a button that creates it if there is none."""
     try:
-        app = github_app()
-    except K8sError as err:
-        return f"<p>Can't read the App's Secret: {e(err)}</p>", False
+        app, manifest = MINTER.status(), MINTER.manifest()
+    except githubops.GitHubError as err:
+        return f"<p>Can't reach the token minter: {e(err)}</p>", False
     if app is not None:
-        return (f"<h1>GitHub App</h1><p>Set up: <code>{e(app.slug)}</code> (id {e(app.app_id)}), key in the "
-                f"<code>{GITHUB_SECRET}</code> Secret. "
-                f"{githubops.link(f'https://github.com/apps/{app.slug}/installations/new', 'Install or change repos')}. "
-                "To replace it, delete the App on GitHub and the Secret in Headlamp, then reload.</p>"
+        return (f"<h1>GitHub App</h1><p>Set up: <code>{e(app['slug'])}</code> (id {e(app['app_id'])}), key in "
+                "the <code>ops-broker-github-app</code> Secret, which only the token minter can read. "
+                f"{githubops.link(f'https://github.com/apps/{app['slug']}/installations/new', 'Install or change repos')}. "
+                "To replace it, delete the App on GitHub and the Secret in Headlamp, roll the pod, then reload.</p>"
                 '<p><a href="/">All requests</a></p>'), False
-    return ("<h1>GitHub App</h1><p>The GitHub verbs need an App only this broker holds the key of. "
-            f"The button asks GitHub to create <code>{e(GITHUB_APP_NAME)}</code>, private to "
-            f"<code>{e(GITHUB_OWNER)}</code>, with: <code>{e(json.dumps(githubops.PERMISSIONS))}</code>. "
-            "GitHub hands the key straight back to this broker, which keeps it in a Secret in its own "
-            "namespace: it never reaches git, a PC or the agent.</p>"
+    return ("<h1>GitHub App</h1><p>The GitHub verbs need an App whose key only the broker's token minter holds. "
+            f"The button asks GitHub to create <code>{e(manifest['name'])}</code>, private to "
+            f"<code>{e(GITHUB_OWNER)}</code>, with: <code>{e(json.dumps(manifest['default_permissions']))}</code>. "
+            "GitHub hands the key back to the minter, which keeps it in a Secret in its own "
+            "namespace: it never reaches git, a PC, the agent, or the broker's own process.</p>"
             '<form method=post action="/github"><button class=approve>Create the App on GitHub</button></form>'
             '<p><a href="/">All requests</a></p>'), True
 
 
 def start_setup(approver):
     """A page that posts the App manifest to GitHub straight away."""
+    manifest = json.dumps(MINTER.manifest())
     now_ = time.time()
     for state in [s for s, (_, deadline) in setups.items() if deadline < now_]:
         del setups[state]
     state = secrets.token_urlsafe(24)
     setups[state] = (approver, now_ + SETUP_TTL)
     target = f"https://github.com/settings/apps/new?state={urllib.parse.quote(state)}"
-    manifest = json.dumps(githubops.manifest(GITHUB_APP_NAME, PUBLIC_URL))
     return (f'<form method=post action="{e(target)}"><input type=hidden name=manifest value="{e(manifest)}">'
             "<p>GitHub will ask you to confirm the App's name, then send you back here.</p>"
             "<button class=approve>Continue to GitHub</button></form>")
@@ -552,22 +531,15 @@ def finish_setup(approver, code, state):
     started = setups.pop(state, None)
     if started is None or started[0] != approver or started[1] < time.time():
         return 400, "<p>This setup wasn't started from this page by you, or took too long. <a href=\"/github\">Start again</a>.</p>"
+    # The minter trades the code for the key itself; this process only relays it.
     try:
-        creds = githubops.convert(code, GITHUB_OWNER)
-    except (githubops.GitHubError, OSError, ValueError, KeyError) as err:
+        app = MINTER.setup(code)
+    except githubops.GitHubError as err:
         return 502, f"<p>Not set up: {e(err)}</p>"
-    try:
-        k8s("POST", SECRETS, {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
-                              "metadata": {"name": GITHUB_SECRET, "namespace": NAMESPACE,
-                                           "labels": {"app": "ops-broker"}},
-                              "stringData": creds}, content_type="application/json")
-    except K8sError as err:
-        return 502, (f"<p>GitHub created {e(creds['slug'])}, but storing its key failed ({e(err)}). Delete the "
-                     "App on GitHub and start again.</p>")
-    print(json.dumps({"time": stamp(), "event": "github-app-created", "slug": creds["slug"],
-                      "id": creds["app-id"], "by": approver}), flush=True)
-    install = githubops.link(f"https://github.com/apps/{creds['slug']}/installations/new", "install it")
-    return 200, (f"<p>Created <code>{e(creds['slug'])}</code>. Now {install} on {e(GITHUB_OWNER)}. All "
+    print(json.dumps({"time": stamp(), "event": "github-app-created", "slug": app["slug"],
+                      "id": app["app_id"], "by": approver}), flush=True)
+    install = githubops.link(f"https://github.com/apps/{app['slug']}/installations/new", "install it")
+    return 200, (f"<p>Created <code>{e(app['slug'])}</code>. Now {install} on {e(GITHUB_OWNER)}. All "
                  "repositories is fine: every token it mints is scoped to one repo and one step.</p>")
 
 
@@ -609,10 +581,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(403, "bad origin")
         if self.path == "/github":
             if not github_page()[1]:
-                return self.reply(409, "the App is already set up")
+                return self.reply(409, "the App is already set up, or the token minter can't be reached")
             # Only this page may post the manifest on to GitHub.
-            return self.reply(200, start_setup(approver), html_page=True,
-                              form_action="'self' https://github.com")
+            try:
+                page = start_setup(approver)
+            except githubops.GitHubError as err:
+                return self.reply(502, str(err))
+            return self.reply(200, page, html_page=True, form_action="'self' https://github.com")
         if not self.path.startswith("/r/"):
             return self.reply(404, "not found")
         try:

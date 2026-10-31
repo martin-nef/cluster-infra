@@ -4,7 +4,7 @@ The agent's App (martin-nef-agent) can push branches and open PRs, but has no
 `workflows`, `administration` or `actions: write`, so a pushed branch can't
 change CI to run with the repo's secrets, and nothing it does can loosen a
 repo's settings. These verbs do those things one approved request at a time,
-with a third App (the "ops" App) whose key exists only in the broker:
+with a third App (the "ops" App) whose key only the token minter holds:
 
   github-commit-workflows   Commit the request's files under .github/workflows/
                             onto a non-default, unprotected branch, on top of
@@ -14,45 +14,26 @@ with a third App (the "ops" App) whose key exists only in the broker:
   github-rerun-workflow     Re-run the failed jobs of one finished run.
   github-dispatch-workflow  Run a workflow_dispatch workflow on the default branch.
 
-Every call uses an installation token minted for one repo with only the
-permissions that step needs, revoked as soon as the step is done. Checks and
-the approval page use read-only tokens; only an approved run gets write.
-
-The App is created from the approval page (manifest(), convert()): GitHub
-hands the private key to the broker, which stores it in a Secret in its own
-namespace. It never touches git, a PC or the agent's pod.
-
-Stdlib only, like broker.py: the App's JWT is signed with RSA in pure Python,
-because the stock python image has no openssl CLI.
+Every call uses an installation token for one repo with only the permissions
+that step needs, asked of the minter sidecar (minter.py) by verb and step and
+revoked as soon as the step is done. Checks and the approval page use
+read-only tokens; only an approved run gets write. This process never sees
+the App's key.
 """
 import base64
 import difflib
-import hashlib
 import html
 import json
 import re
-import time
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
 
 GITHUB_API = "https://api.github.com"
 
-# What the ops App is created with. Each verb's tokens take a subset.
-PERMISSIONS = {
-    "actions": "write",
-    "administration": "write",
-    "contents": "write",
-    "metadata": "read",
-    "workflows": "write",
-}
-# verb -> (permissions to check it and show it, permissions to run it)
-VERBS = {
-    "github-commit-workflows": ({"contents": "read"}, {"contents": "write", "workflows": "write"}),
-    "github-protect-branch": ({"administration": "read"}, {"administration": "write"}),
-    "github-rerun-workflow": ({"actions": "read"}, {"actions": "write"}),
-    "github-dispatch-workflow": ({"actions": "read", "contents": "read"}, {"actions": "write"}),
-}
+# The verbs this module runs. Their tokens' permissions are minter.TOKENS.
+VERBS = ("github-commit-workflows", "github-protect-branch", "github-rerun-workflow", "github-dispatch-workflow")
 # The one rule github-protect-branch applies: changes reach the branch only
 # through a PR with an approval; enforce_admins off, so you can still merge your
 # own and the bot's PRs. The same rule as in claude-remote's docs/design.md.
@@ -83,54 +64,6 @@ class NothingChanged(Exception):
     """A step failed before anything visible on GitHub changed."""
 
 
-# --- RS256 in pure Python ------------------------------------------------------
-
-def _tlv(data, i=0):
-    """One DER element at data[i:]: (tag, value, index after it)."""
-    tag, length, i = data[i], data[i + 1], i + 2
-    if length & 0x80:
-        n = length & 0x7F
-        length, i = int.from_bytes(data[i:i + n], "big"), i + n
-    return tag, data[i:i + length], i + length
-
-
-def _children(data):
-    items, i = [], 0
-    while i < len(data):
-        tag, value, i = _tlv(data, i)
-        items.append((tag, value))
-    return items
-
-
-def rsa_key(pem):
-    """(n, d) of a PKCS#1 or PKCS#8 PEM RSA private key."""
-    body = "".join(line for line in pem.strip().splitlines() if not line.startswith("-----"))
-    _, seq, _ = _tlv(base64.b64decode(body))
-    items = _children(seq)
-    if items[1][0] == 0x30:  # PKCS#8: version, AlgorithmIdentifier, OCTET STRING { PKCS#1 }
-        _, seq, _ = _tlv(items[2][1])
-        items = _children(seq)
-    # RSAPrivateKey: version, n, e, d, p, q, ...
-    return int.from_bytes(items[1][1], "big"), int.from_bytes(items[3][1], "big")
-
-
-# DigestInfo for SHA-256, which PKCS#1 v1.5 signs.
-SHA256_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
-
-
-def rs256(pem, data):
-    """An RSASSA-PKCS1-v1_5 SHA-256 signature, as `openssl dgst -sha256 -sign` makes."""
-    n, d = rsa_key(pem)
-    k = (n.bit_length() + 7) // 8
-    t = SHA256_INFO + hashlib.sha256(data).digest()
-    em = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
-    return pow(int.from_bytes(em, "big"), d, n).to_bytes(k, "big")
-
-
-def b64url(data):
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
 # --- the API -------------------------------------------------------------------
 
 def api(method, path, token=None, body=None):
@@ -152,39 +85,42 @@ def api(method, path, token=None, body=None):
         raise GitHubError(e.code, message) from None
 
 
-class App:
-    """The ops App, as stored in its Secret, acting on one owner's repos."""
+class Minter:
+    """The token minter sidecar (minter.py), over its Unix socket. It holds the
+    App's key; this side only ever gets one-repo, one-step tokens."""
 
-    def __init__(self, app_id, slug, pem, owner):
-        self.app_id, self.slug, self.pem, self.owner = app_id, slug, pem, owner
+    def __init__(self, path, owner):
+        self.path, self.owner = path, owner
 
-    def jwt(self):
-        now = int(time.time())
-        header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
-        # iat is backdated to allow for clock drift, as GitHub recommends.
-        claims = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(self.app_id)}).encode())
-        signing_input = f"{header}.{claims}"
-        return f"{signing_input}.{b64url(rs256(self.pem, signing_input.encode()))}"
-
-    def token(self, repo, permissions):
-        """A Token for one repo with only these permissions."""
-        jwt = self.jwt()
+    def call(self, op, **args):
         try:
-            installation = api("GET", f"/users/{q(self.owner)}/installation", jwt)
-        except GitHubError as e:
-            if e.code == 404:
-                raise GitHubError(404, f"{self.slug} isn't installed on {self.owner}: "
-                                       f"https://github.com/apps/{self.slug}/installations/new") from None
-            raise
-        try:
-            minted = api("POST", f"/app/installations/{installation['id']}/access_tokens", jwt,
-                         {"repositories": [repo], "permissions": permissions})
-        except GitHubError as e:
-            if e.code == 422:
-                raise GitHubError(422, f"{self.slug} can't get {permissions} on {self.owner}/{repo} "
-                                       f"(not installed there, or the repo doesn't exist): {e}") from None
-            raise
-        return Token(minted["token"], self.owner, repo)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(60)  # the minter's own GitHub calls time out after 20s each
+                s.connect(self.path)
+                s.sendall(json.dumps({"op": op, **args}).encode())
+                s.shutdown(socket.SHUT_WR)
+                data = b"".join(iter(lambda: s.recv(65536), b""))
+            reply = json.loads(data)
+        except (OSError, ValueError) as e:
+            raise GitHubError(503, f"the token minter didn't answer: {e!r}") from None
+        if "error" in reply:
+            raise GitHubError(reply["error"]["code"], reply["error"]["message"])
+        return reply
+
+    def status(self):
+        """{app_id, slug} of the ops App, or None until it's set up."""
+        return self.call("status")["app"]
+
+    def manifest(self):
+        return self.call("manifest")["manifest"]
+
+    def setup(self, code):
+        """Hand GitHub's one-time code to the minter, which trades it for the key."""
+        return self.call("setup", code=code)["app"]
+
+    def token(self, repo, verb, step):
+        """A Token for one repo, with what this verb's step ("check" or "run") needs."""
+        return Token(self.call("token", repo=repo, verb=verb, step=step)["token"], self.owner, repo)
 
 
 class Token:
@@ -226,13 +162,13 @@ def describe(owner, spec):
     return f"{verb} {where}"
 
 
-def check(app, spec):
+def check(minter, spec):
     """Why the request can't be run, or None. Raises GitHubError (transient
     ones mean: try again on the next scan)."""
     g = spec["github"]
     if not REPO_NAME.fullmatch(g.get("repo", "")) or g["repo"] in (".", ".."):
         return f"{g.get('repo')!r} isn't a repo name"
-    with app.token(g["repo"], VERBS[spec["verb"]][0]) as tok:
+    with minter.token(g["repo"], spec["verb"], "check") as tok:
         repo = tok("GET")
         return CHECKS[spec["verb"]](tok, repo, g)
 
@@ -308,14 +244,14 @@ def protection(tok, branch):
         raise
 
 
-def act(app, spec):
+def act(minter, spec):
     """Run an approved request; returns a message for the status. Raises
     GitHubError when GitHub refused it (transient: it may have taken effect)
     and NothingChanged when it failed before changing anything."""
     g = spec["github"]
     try:
-        tok = app.token(g["repo"], VERBS[spec["verb"]][1])
-    except (GitHubError, OSError) as e:
+        tok = minter.token(g["repo"], spec["verb"], "run")
+    except GitHubError as e:
         raise NothingChanged(f"no token: {e}") from None
     with tok:
         return ACTS[spec["verb"]](tok, g)
@@ -382,12 +318,12 @@ def link(url, text):
     return f'<a href="{e(url)}">{e(text)}</a>'
 
 
-def details(app, spec):
+def details(minter, spec):
     """HTML showing exactly what approving would do, read live from GitHub.
     Raises when it can't be shown; the page then offers no Approve."""
     g = spec["github"]
-    web = f"https://github.com/{app.owner}/{g['repo']}"
-    with app.token(g["repo"], VERBS[spec["verb"]][0]) as tok:
+    web = f"https://github.com/{minter.owner}/{g['repo']}"
+    with minter.token(g["repo"], spec["verb"], "check") as tok:
         repo = tok("GET")
         if spec["verb"] == "github-commit-workflows":
             return details_commit(tok, web, g)
@@ -434,33 +370,3 @@ def diff_line(line):
     if line.startswith(("+++", "---")):
         cls = ""
     return f"<span class={cls}>{e(line)}</span>" if cls else e(line)
-
-
-# --- creating the App ----------------------------------------------------------
-
-def manifest(name, public_url):
-    """The manifest the setup page posts to GitHub."""
-    return {
-        "name": name,
-        "url": f"{public_url}/github",
-        "description": "Break-glass GitHub actions for the nefcloud agent, each approved on ops.nefcloud.top.",
-        "public": False,
-        "redirect_url": f"{public_url}/github/callback",
-        "default_permissions": PERMISSIONS,
-        "default_events": [],
-    }
-
-
-def convert(code, owner):
-    """Trade the manifest flow's one-time code for the new App's credentials
-    and check GitHub made what was asked for. Returns {app-id, slug, private-key.pem}."""
-    app = api("POST", f"/app-manifests/{q(code)}/conversions", body={})
-    problems = []
-    if app["owner"]["login"].lower() != owner.lower():
-        problems.append(f"it belongs to {app['owner']['login']}, not {owner}")
-    if app["permissions"] != PERMISSIONS:
-        problems.append(f"its permissions are {app['permissions']}, not {PERMISSIONS}")
-    if problems:
-        raise ValueError(f"GitHub created {app['slug']}, but {'; '.join(problems)}. Delete it at "
-                         f"{app['html_url']} and start again; nothing was stored.")
-    return {"app-id": str(app["id"]), "slug": app["slug"], "private-key.pem": app["pem"]}

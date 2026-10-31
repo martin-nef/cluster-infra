@@ -12,7 +12,7 @@ resources:
   - deployment.yaml
   - ingress.yaml
 configMapGenerator:
-  # Hashed: an edit to either rolls the pod.
+  # Hashed: an edit to any of them rolls the pod.
   - name: ops-broker-config
     namespace: ops-broker
     envs:
@@ -22,3 +22,8 @@ configMapGenerator:
     files:
       - broker/broker.py
       - broker/githubops.py
+  # Its own ConfigMap, so the minter container mounts only its own code.
+  - name: ops-broker-minter
+    namespace: ops-broker
+    files:
+      - broker/minter.py

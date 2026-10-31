@@ -21,8 +21,53 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        # So the minter (same user) can read its 0440 Secret volume.
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        # Native sidecar: starts before the broker and runs beside it. The only
+        # container that mounts the GitHub App's key; the broker asks it for
+        # one-repo, one-step tokens over a Unix socket (minter.py).
+        - name: minter
+          image: python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+          restartPolicy: Always
+          command: [python, -I, /app/minter.py]
+          envFrom:
+            - configMapRef:
+                name: ops-broker-config
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          # The broker container starts once the socket is there.
+          startupProbe:
+            exec:
+              command: [python, -c, "import os; os.stat('/run/minter/minter.sock')"]
+            periodSeconds: 1
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: minter-code
+              mountPath: /app
+              readOnly: true
+            - name: github-app
+              mountPath: /etc/github-app
+              readOnly: true
+            - name: minter-socket
+              mountPath: /run/minter
       containers:
         - name: broker
           # Multi-arch index digest, the same one cv-current's webhook runs.
@@ -62,10 +107,26 @@ spec:
             - name: code
               mountPath: /app
               readOnly: true
+            - name: minter-socket
+              mountPath: /run/minter
       volumes:
         - name: code
           configMap:
             name: ops-broker-code
+        - name: minter-code
+          configMap:
+            name: ops-broker-minter
+        # Optional, so the pod runs before the App exists. The minter keeps the
+        # key it just set up in memory until the kubelet fills this in.
+        - name: github-app
+          secret:
+            secretName: ops-broker-github-app
+            optional: true
+            defaultMode: 0440
+        - name: minter-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
 ---
 apiVersion: v1
 kind: Service

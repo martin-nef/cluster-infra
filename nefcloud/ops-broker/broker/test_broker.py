@@ -3,8 +3,10 @@
   cd nefcloud/ops-broker/broker && python3 -I -m unittest -v
 
 Stdlib only. Nothing touches a cluster, GitHub or ntfy: the Kubernetes and
-GitHub APIs are faked in memory and the HTTP handler is driven through a real
-local server.
+GitHub APIs are faked in memory, the HTTP handler is driven through a real
+local server, and the GitHub verbs get their tokens from a real minter
+(minter.py) on a Unix socket in a temporary directory. test_minter.py covers
+the minter on its own.
 """
 import base64
 import copy
@@ -34,6 +36,7 @@ os.environ.update(
     GITHUB_OWNER="owner",
 )
 import broker  # noqa: E402  (reads the environment above at import)
+import minter  # noqa: E402
 
 APPROVER = "boss@example.test"
 
@@ -54,7 +57,6 @@ class FakeAPI:
         self.calls = []
         self.versions = itertools.count(1)
         self.fail = {}  # (method, path) -> exception to raise once
-        self.secrets = {}
 
     def put(self, kind, ns, name, uid=None, **meta):
         self.objects[broker.KINDS[kind].format(ns=ns, name=name)] = {
@@ -74,18 +76,6 @@ class FakeAPI:
             raise self.fail.pop((method, path))
         if path == broker.REQUESTS and method == "GET":
             return {"items": copy.deepcopy(list(self.requests.values()))}
-        if path == broker.SECRETS and method == "POST":
-            name = body["metadata"]["name"]
-            if name in self.secrets:
-                raise broker.K8sError(409, "already exists")
-            self.secrets[name] = {"data": {k: base64.b64encode(v.encode()).decode()
-                                           for k, v in body["stringData"].items()}}
-            return body
-        if path.startswith(broker.SECRETS + "/") and method == "GET":
-            name = path.rpartition("/")[2]
-            if name not in self.secrets:
-                raise broker.K8sError(404, "not found")
-            return copy.deepcopy(self.secrets[name])
         if path.startswith(broker.REQUESTS + "/"):
             name, _, sub = path[len(broker.REQUESTS) + 1:].partition("/")
             if name not in self.requests:
@@ -121,11 +111,6 @@ class FakeAPI:
     def actions(self):
         """Calls that touched something other than the request queue."""
         return [(m, p, b) for m, p, b in self.calls if m != "GET" and not p.startswith(broker.REQUESTS)]
-
-    def set_up_github(self):
-        self.secrets[broker.GITHUB_SECRET] = {"data": {
-            k: base64.b64encode(v.encode()).decode()
-            for k, v in {"app-id": "42", "slug": "ops-app", "private-key.pem": "unused"}.items()}}
 
 
 class Base(unittest.TestCase):
@@ -224,20 +209,60 @@ class FakeGitHub:
         return [(m, p, b) for m, p, b in self.calls
                 if m != "GET" and p not in ("/installation/token",) and "access_tokens" not in p]
 
+    def for_minter(self, method, path, token=None, body=None):
+        """The same API as minter.api() sees it: its own GitHubError."""
+        try:
+            return self(method, path, token, body)
+        except broker.githubops.GitHubError as e:
+            raise minter.GitHubError(e.code, str(e).partition(": ")[2]) from None
+
 
 COMMIT = {"repo": "web", "branch": "work", "baseSHA": BASE, "message": "ci: build <arm64>",
           "files": [{"path": ".github/workflows/ci.yml", "content": "on: [push, pull_request]\njobs: {}\n"}]}
 
 
-class GitHubBase(Base):
+def write_key(key_dir, app_id="42", slug="ops-app"):
+    """What the kubelet puts in the minter's Secret volume."""
+    for k, v in {"app-id": app_id, "slug": slug, "private-key.pem": "unused"}.items():
+        with open(os.path.join(key_dir, k), "w") as f:
+            f.write(v)
+
+
+class MinterBase(unittest.TestCase):
+    """A real minter on a Unix socket, with GitHub faked."""
+
     def setUp(self):
         super().setUp()
         self.gh = FakeGitHub()
-        for p in (mock.patch.object(broker.githubops, "api", self.gh),
-                  mock.patch.object(broker.githubops.App, "jwt", lambda app: "jwt")):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        self.key_dir = os.path.join(d, "key")
+        os.mkdir(self.key_dir)
+        sock = os.path.join(d, "minter.sock")
+        for p in (mock.patch.object(minter, "api", self.gh.for_minter),
+                  mock.patch.object(minter.App, "jwt", lambda app: "jwt"),
+                  mock.patch.object(minter, "KEY_DIR", self.key_dir),
+                  mock.patch.object(minter, "GITHUB_OWNER", "owner"),
+                  mock.patch.object(minter, "PUBLIC_URL", broker.PUBLIC_URL),
+                  mock.patch.object(minter, "created", None),
+                  mock.patch.object(minter, "audit", mock.Mock())):
             p.start()
             self.addCleanup(p.stop)
-        self.api.set_up_github()
+        server = minter.serve(sock)
+        threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.minter = broker.githubops.Minter(sock, "owner")
+
+
+class GitHubBase(MinterBase, Base):
+    def setUp(self):
+        super().setUp()
+        for p in (mock.patch.object(broker.githubops, "api", self.gh),
+                  mock.patch.object(broker, "MINTER", self.minter)):
+            p.start()
+            self.addCleanup(p.stop)
+        write_key(self.key_dir)
 
     def add_github(self, name, verb, age=0, **github):
         self.api.add(name, verb, "Pod", "x", "x", age=age)
@@ -545,22 +570,6 @@ class TestHTTP(Served, Base):
         self.assertTrue(all(p.startswith(broker.REQUESTS + "/") for _, p, _ in self.api.calls))
 
 
-class TestRS256(unittest.TestCase):
-    @unittest.skipUnless(shutil.which("openssl"), "needs the openssl CLI to compare against")
-    def test_matches_openssl(self):
-        with tempfile.TemporaryDirectory() as d:
-            for fmt in ("-traditional", ""):  # PKCS#1, as GitHub hands out; PKCS#8
-                with self.subTest(fmt or "pkcs8"):
-                    key = os.path.join(d, "key.pem")
-                    subprocess.run(["openssl", "genrsa", "-out", key, "2048"], check=True, capture_output=True)
-                    if fmt:
-                        subprocess.run(["openssl", "rsa", fmt, "-in", key, "-out", key], check=True, capture_output=True)
-                    expected = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key], input=b"header.claims",
-                                              check=True, capture_output=True).stdout
-                    with open(key) as f:
-                        self.assertEqual(broker.githubops.rs256(f.read(), b"header.claims"), expected)
-
-
 class TestGitHubScan(GitHubBase):
     def test_commit_waits_with_read_only_tokens(self):
         st = self.admit_github("r1", "github-commit-workflows", **COMMIT)
@@ -571,7 +580,8 @@ class TestGitHubScan(GitHubBase):
         self.assertEqual(self.gh.revoked, ["tok1"])
 
     def test_not_set_up_is_rejected(self):
-        self.api.secrets.clear()
+        for f in os.listdir(self.key_dir):
+            os.remove(os.path.join(self.key_dir, f))
         st = self.admit_github("r1", "github-commit-workflows", **COMMIT)
         self.assertEqual(st["phase"], "Rejected")
         self.assertIn("/github", st["message"])
@@ -721,7 +731,8 @@ class TestGitHubHTTP(Served, GitHubBase):
         self.assertIn("Fix &lt;b&gt;it&lt;/b&gt;", body)
 
     def test_setup_creates_the_secret(self):
-        self.api.secrets.clear()
+        for f in os.listdir(self.key_dir):
+            os.remove(os.path.join(self.key_dir, f))
         status, body = self.request("GET", "/github")
         self.assertIn("Create the App", body)
         self.assertEqual(self.request("POST", "/github", origin="https://evil.test")[0], 403)
@@ -737,30 +748,40 @@ class TestGitHubHTTP(Served, GitHubBase):
         self.assertFalse(manifest["public"])
 
         creds = {"app-id": "5", "slug": "martin-nef-ops", "private-key.pem": "KEY"}
-        with mock.patch.object(broker.githubops, "convert", return_value=creds) as convert:
+        with mock.patch.object(minter, "convert", return_value=creds) as convert, \
+                mock.patch.object(minter, "store_secret") as store:
             self.assertEqual(self.request("GET", "/github/callback?code=c&state=forged")[0], 400)
             self.assertEqual(self.request("GET", f"/github/callback?code=c&state={state}",
                                           email="someone@else.test")[0], 403)
             status, body = self.request("GET", f"/github/callback?code=c&state={state}")
             self.assertEqual(status, 200, body)
             self.assertIn("installations/new", body)
+            # The minter got the code and stored the key; the broker never saw it.
             convert.assert_called_once_with("c", "owner")
+            store.assert_called_once_with(creds)
+            self.assertNotIn("KEY", body)
             # The state is single use.
             self.assertEqual(self.request("GET", f"/github/callback?code=c&state={state}")[0], 400)
-        self.assertEqual(broker.github_app().slug, "martin-nef-ops")
+        # Before the kubelet fills the Secret volume in, the minter uses the key it holds.
+        self.assertEqual(self.minter.status(), {"app_id": "5", "slug": "martin-nef-ops"})
         self.assertEqual(self.request("POST", "/github", form={})[0], 409)
 
-    def test_convert_refuses_an_app_it_didnt_ask_for(self):
-        made = {"id": 5, "slug": "x", "pem": "KEY", "html_url": "https://github.test/apps/x",
-                "owner": {"login": "Owner"}, "permissions": dict(broker.githubops.PERMISSIONS)}
-        with mock.patch.object(broker.githubops, "api", return_value=made):
-            self.assertEqual(broker.githubops.convert("c", "owner")["app-id"], "5")
-            made["permissions"] = {**made["permissions"], "secrets": "write"}
-            with self.assertRaisesRegex(ValueError, "nothing was stored"):
-                broker.githubops.convert("c", "owner")
-            made["permissions"], made["owner"] = broker.githubops.PERMISSIONS, {"login": "someone"}
-            with self.assertRaisesRegex(ValueError, "belongs to someone"):
-                broker.githubops.convert("c", "owner")
+    def test_minter_down(self):
+        broker.MINTER.path = "/nonexistent/minter.sock"
+        st = self.admit_github("r1", "github-commit-workflows", **COMMIT)
+        self.assertNotIn("phase", st)  # left for the next scan, not rejected
+        self.assertIn("token minter", self.request("GET", "/github")[1])
+        self.add_github("r2", "github-rerun-workflow", repo="web", runID=7)
+        self.api.requests["r2"]["status"] = {"phase": "Pending", "specHash": broker.spec_hash(self.api.requests["r2"])}
+        broker.decide("r2", "approve", self.api.status("r2")["specHash"], APPROVER)
+        self.assertEqual(self.api.status("r2")["phase"], "Failed")
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_broker_never_reads_secrets(self):
+        st = self.admit_github("r1", "github-commit-workflows", **COMMIT)
+        broker.decide("r1", "approve", st["specHash"], APPROVER)
+        self.request("GET", "/github")
+        self.assertEqual([c for c in self.api.calls if "/secrets" in c[1]], [])
 
 
 class TestNotify(unittest.TestCase):
