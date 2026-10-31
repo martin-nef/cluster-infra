@@ -4,6 +4,8 @@ Some fixes can't wait for a PR, or can't be made by one: a pod stuck after a str
 
 v2 does the same for GitHub. The agent's own App can push branches and open PRs, but it deliberately can't change CI workflows, repo settings or workflow runs (claude-remote `docs/design.md` §1, §3). Those were the remaining things that needed your PC. Now the agent asks, and the broker does them with a separate App whose key only the broker's token minter holds ([GitHub verbs](#github-verbs-v2)).
 
+v3 covers what GitHub only lets *you* do, not an App: creating a repo. Approving one also sends you through GitHub's sign-in, and the action runs once with your token ([Acting as you](#acting-as-you-v3)).
+
 ## How it works
 
 1. The agent creates an `OpsRequest` in the `ops-broker` namespace:
@@ -44,6 +46,7 @@ GitHub requests take `spec.github` instead of `spec.target`. `repo` is a repo na
 | `github-protect-branch` | `repo` | Protects the repo's default branch, if it has no rule yet, with the standard one: PRs only, one approval, admins exempt (so you can still merge). |
 | `github-rerun-workflow` | `repo`, `runID` | Re-runs the failed jobs of a finished, failed run. |
 | `github-dispatch-workflow` | `repo`, `workflow` (file name), `inputs` | Runs a `workflow_dispatch` workflow on the default branch. |
+| `github-create-repo` | `repo`, `private` (default `true`), `description` | Creates `GITHUB_OWNER/<repo>` with a README as its first commit, so it has a default branch to protect. Rejected if the name is taken. |
 
 The page shows what approving would do, read live from GitHub: for a commit, the diff against `baseSHA`; for a run, which run it is and how it ended; for protection, the exact rule. If it can't load that, it offers only Deny.
 
@@ -103,6 +106,24 @@ A lost ntfy message only costs time: the page lists every waiting request first.
 - **The key lives in a sidecar** ([below](#the-token-minter)).
 - **Pure-Python RS256.** The stock python image has no `openssl` CLI, which the token broker in claude-remote uses to sign the App JWT. Building an image for this would mean a registry and a workflow change; signing PKCS#1 v1.5 is a few lines of `pow()`. The test compares it byte for byte with `openssl dgst -sign`. It isn't constant-time. It only signs the broker's own JWTs, and nothing outside the pod can time it.
 
+### Acting as you (v3)
+
+GitHub creates a repo under a user account only for that user, so `github-create-repo` runs with your token, not the App's. Approve opens a "Continue to GitHub" link to the ops App's OAuth flow. GitHub sends you back to `/github/authorize` with a one-time code, and only then is the request claimed and run.
+
+- **The minter holds your token, briefly.** The broker only relays the code. The minter trades it using the App's client secret, which only it can read (`ops-broker-github-oauth`). It checks the token belongs to `GITHUB_OWNER`, makes the one call (`POST /user/repos`), and revokes the token in a `finally`. No user token is stored, and none reaches the broker. A user token can't be scoped to one repo, so it stays in the process that already holds the key.
+- **The approval needs both logins.** The Google one for the page, and your GitHub session for the code. The `state` is single-use, tied to the approver, the request and its spec hash, and lasts 10 minutes. If you stop on GitHub, the request stays `Pending` and expires. A plain Approve, or `decide()` without a code, runs nothing.
+- **Same failure rules.** Anything before the create call (code refused, wrong account, minter down) ends `Failed`. A 5xx or timeout on the create call ends `Unknown`.
+- **The check can see every repo's metadata.** The name doesn't exist yet, so the scan's token can't be scoped to it. It's `metadata: read` across the installation, used for one `GET`.
+- **No new App permission.** `POST /user/repos` takes the App's existing `administration: write`.
+
+Decided against:
+
+- **Installation tokens.** GitHub's docs list them for `POST /user/repos` too. Not used: the point is that you're the actor. It's also untested whether that creates the repo under your account.
+- **Adding repos to the agent App's installation.** Not needed: `martin-nef-agent` is installed on *All repositories*, so a new repo is covered at once. The endpoint (`PUT /user/installations/{id}/repositories/{repo}`) needs a separate "installation repository access" permission. It's also unclear whether one App's user token can change another App's installation. Revisit if the agent App moves to selected repos.
+- **Device flow.** It needs no callback URL, but you'd type a code on github.com/login/device, which is worse on a phone than a link that returns by itself.
+
+**Setup for an App made before v3.** New setups get the client secret from GitHub along with the key. An existing App needs two changes in its settings on GitHub, done once. Add the callback URL `https://ops.nefcloud.top/github/authorize`, then generate a client secret and paste it on <https://ops.nefcloud.top/github>. The minter checks it with GitHub before storing it. Trade-off: the pasted secret passes through the broker's HTTP handler once, as setup's one-time code does. Alone, it gets nothing without a code from your GitHub sign-in.
+
 ### The token minter
 
 The process that serves the approval page, parses agent-written requests and runs the cluster verbs is the part most exposed to input it doesn't control. It shouldn't also hold a key that can mint anything the ops App can do on every repo. So the App side is split out into `minter.py`, a native sidecar (an init container with `restartPolicy: Always`) in the same pod, the same pattern as claude-remote's `github-token-broker`:
@@ -129,15 +150,16 @@ Decided against, for now:
 - **Audit lives in etcd for 90 days.** Each request's status records who decided what and when, and the broker prints one JSON line per transition (`kubectl -n ops-broker logs deploy/ops-broker`). Logs go when the pod does, and there is no API server audit log on k3s here.
 - **The pod may create any Secret in its namespace.** RBAC can't limit `create` to a name, so storing the App key means `create` on Secrets in `ops-broker`, and both containers share that ServiceAccount. Neither can read a Secret through the API; only the minter sees the key, through its volume. Nothing else runs in that namespace, so a Secret created there reaches nothing. The one thing the broker could do with it is create `ops-broker-github-app` before setup, with a key of its own choosing. That gets it nothing: the minter's JWTs would name an App that key isn't registered for, and GitHub refuses them.
 - **Setup is the one moment the broker could get the key.** GitHub's redirect, carrying the one-time code, comes back through the broker's HTTP handler, since the minter has no port. A broker compromised at that moment could trade the code itself. Setup happens once, from a page you opened, and the code is single-use, so a broker that stole it leaves the minter with a failed setup you'd see. Routing the callback straight to the minter would need it to serve HTTP behind Traefik, which is the exposure this split removes.
+- **A compromised broker could swap the request behind your GitHub sign-in.** It serves the page and the link, so it could show one repo and relay your code to the minter for another user action. The minter does only what's in `USER_ACTIONS` (today: create one repo), with the name the broker passes. So the worst case is a repo with a different name.
 - **The broker still gets tokens.** A compromised broker can ask for any verb's run token on any repo the App is installed on, without an approval: the approval is checked in the broker, not in the minter. That's still much less than the key: one repo and one verb's permissions per token, an hour at most, and every mint is logged by a process the broker can't change. Having the minter check approvals itself (read the request, check it's `Approved` with a matching hash) would close it, at the cost of the minter reading the queue too.
 - **The App key isn't in git.** Like the apps' `<name>-sops-age` keys, it lives only in the cluster. If it's lost (namespace deleted, cluster rebuilt), delete the App on GitHub and run the setup again. That is three taps, and safer than a restore copy somewhere.
 - **The ops App is powerful.** It can change any workflow, protection rule or setting on every repo it's installed on. Only the minter holds the key, and only approved requests reach the code that writes. A bug in the broker gets scoped tokens (above); a compromise of the minter container, or of the node, would have the App's full permissions. Its commits and changes show up on GitHub as `martin-nef-ops[bot]`, and each request's status says who approved it.
 - **The diff is as good as your reading of it on a phone.** Long workflow changes are hard to review on a small screen. Keep them small: the agent can split them across requests.
-- **The verb list is short on purpose.** Things like removing a finalizer or scaling to zero are left out. They can lose data or take a service down, they're rare, and Headlamp still covers them. Adding a verb means a PR here that touches the CRD, the ClusterRole and `broker.py` (for a GitHub verb: `githubops.py` and its token permissions in `minter.py`).
+- **The verb list is short on purpose.** Things like removing a finalizer or scaling to zero are left out. They can lose data or take a service down, they're rare, and Headlamp still covers them. Adding a verb means a PR here that touches the CRD, the ClusterRole and `broker.py` (for a GitHub verb: `githubops.py` and its token permissions in `minter.py`; for a user action, `minter.USER_ACTIONS`).
 
 ## Later
 
-- **GitHub actions that need you as the actor.** Creating a repo under `martin-nef` and adding a repo to the agent App's installation can't be done with an App's installation token, only with a user token. The plan is for the approve button to run GitHub's OAuth flow for the ops App on the spot, use the user access token for that one action, and drop it. That way no long-lived user token is stored. To check first: that `PUT /user/installations/{id}/repositories/{repo}` accepts a user token of a *different* App than the one installed.
+- More user actions (e.g. adding a repo to the agent App's installation, if it ever moves off *All repositories*): one entry in `minter.USER_ACTIONS` each.
 - **Repo secrets and variables** (`secrets: write`): useful for CI that needs a token. The value must not travel through the request, which the agent can read. It needs a page where you paste it, or one the broker generates.
 - **New apps' SOPS keys.** `kubectl create secret <name>-sops-age` is the last imperative step in adding an app (`CLAUDE.md`). A verb could generate the age key in the broker, store it in `flux-system` and return only the public key, so the private key is never outside the cluster. That needs X25519 in pure Python, or an image with `age`.
 - **Discord** instead of, or beside, ntfy. It's planned as its own project: a generic, secure integration for the whole cluster. When it exists, `notify()` becomes one more sender. The approval stays on this page either way, for the same reason as with ntfy.

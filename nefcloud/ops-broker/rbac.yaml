@@ -55,7 +55,7 @@ rules:
   - apiGroups: [ops.nefcloud.top]
     resources: [opsrequests/status]
     verbs: [get, patch]
-  # The GitHub App's key: the minter sidecar stores it from the setup page
+  # The GitHub App's key and OAuth client: the minter sidecar stores them from the setup page
   # (create can't be limited to a name, so any Secret in this namespace). No
   # get: only the minter reads it, through its Secret volume, which the kubelet
   # fills in. Not the ntfy Secret, which Flux gives the pod as an env var.

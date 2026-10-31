@@ -63,7 +63,8 @@ spec:
                 verb:
                   type: string
                   enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume,
-                         github-commit-workflows, github-protect-branch, github-rerun-workflow, github-dispatch-workflow]
+                         github-commit-workflows, github-protect-branch, github-rerun-workflow, github-dispatch-workflow,
+                         github-create-repo]
                 target:
                   type: object
                   required: [kind, namespace, name]
@@ -147,6 +148,13 @@ spec:
                       additionalProperties:
                         type: string
                         maxLength: 1000
+                    private:
+                      description: github-create-repo; default true.
+                      type: boolean
+                    description:
+                      description: github-create-repo; the repo's description.
+                      type: string
+                      maxLength: 350
                 reason:
                   description: Why, in a sentence or two. Shown to the approver as the requester's claim.
                   type: string
