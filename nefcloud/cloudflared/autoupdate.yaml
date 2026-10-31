@@ -1,0 +1,56 @@
+# cloudflared runs :latest. Restarting it daily makes the pods pull whatever
+# :latest points at now; the rolling update keeps one replica up throughout.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudflared-autoupdate
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cloudflared-autoupdate
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cloudflared"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cloudflared-autoupdate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cloudflared-autoupdate
+subjects:
+  - kind: ServiceAccount
+    name: cloudflared-autoupdate
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cloudflared-autoupdate
+spec:
+  schedule: "0 4 * * *"
+  timeZone: Europe/London
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: cloudflared-autoupdate
+          restartPolicy: Never
+          containers:
+            - name: kubectl
+              image: registry.k8s.io/kubectl:v1.36.6
+              args: ["rollout", "restart", "deployment/cloudflared"]
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 65532
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
