@@ -18,18 +18,18 @@ Some fixes can't wait for a PR, or can't be made by one: a pod stuck after a str
      reason: Stuck on the old ReplicaSet after the strategy change in valheim#12.
    ```
 
-2. The broker checks the target exists (and, for `delete-pod`, that the pod has an owner that will recreate it), marks it `Pending`, and sends an ntfy notification with a **Review** button.
+2. The broker checks the target exists (and, for `delete-pod`, that a controller will recreate the pod), marks it `Pending`, and sends an ntfy notification with a **Review** button.
 3. The button opens `https://ops.nefcloud.top/r/<name>`, behind the same Google login as Headlamp. It shows the verb, the target and the agent's reason, with **Approve** and **Deny**.
 4. On Approve the broker runs the action and writes the result to the request's status. The agent watches it with `kubectl -n ops-broker get opsrequest <name> -w`.
 
 | Verb | Kinds | What it does |
 |---|---|---|
-| `delete-pod` | Pod | Deletes it. Refused for pods with no owner, which would be gone for good. |
+| `delete-pod` | Pod | Deletes that exact pod (by the UID seen when the request came in, so a StatefulSet's same-named replacement is safe). Only pods a ReplicaSet, StatefulSet or DaemonSet controls; bare and Job pods may not come back. |
 | `rollout-restart` | Deployment, StatefulSet, DaemonSet | What `kubectl rollout restart` does: bumps `restartedAt` in the pod template. |
 | `flux-reconcile` | Kustomization, HelmRelease, GitRepository, HelmRepository | What `flux reconcile` does: bumps `reconcile.fluxcd.io/requestedAt`. No `--with-source`; request the source separately. |
 | `flux-suspend` / `flux-resume` | same | Sets `spec.suspend`. |
 
-A request is `Pending` → `Succeeded` / `Failed` / `Denied` / `Expired`, or `Rejected` straight away (target missing, bare pod, too many pending). Requests expire after 15 minutes, at most 3 wait at once, and finished ones are kept 90 days (`config.env`).
+A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired`, or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 15 minutes, at most 3 wait at once, and finished ones are kept 90 days, or 7 for `Rejected` and `Expired`, which decided nothing (`config.env`).
 
 ## Design decisions
 
@@ -40,11 +40,18 @@ A request is `Pending` → `Succeeded` / `Failed` / `Denied` / `Expired`, or `Re
 - The schema is the verb list. CEL rules tie each verb to its kinds, so `kubectl create` refuses anything else before the broker sees it. The broker checks again, in case the CRD is ever loosened.
 - `spec` is immutable (`self == oldSelf`), so what you read on the page is what runs. The page also posts the spec's hash back, and a mismatch is refused.
 - `status` is a subresource. The agent's Role is `create/get/list/watch` on `opsrequests` only, so it can't mark its own request approved, edit it, or delete it from the audit trail.
-- A ResourceQuota caps the namespace at 200 requests, even if the broker is down.
+- An admission policy (`admission.yaml`) refuses `ownerReferences` and `finalizers` on new requests. Either would let a requester undo the audit trail: an owner, even a made-up one, hands the record to the garbage collector, and a finalizer blocks its cleanup and holds quota.
+- A ResourceQuota caps the namespace at 200 requests, even if the broker is down. Junk (`Rejected`, `Expired`) is deleted after 7 days, so filling it takes sustained, visible effort, and the fallback is Headlamp.
 
 **It lives in cluster-infra, code in a ConfigMap.** The broker holds cluster-wide delete and patch rights. If it lived in a repo the agent can open PRs to and Flux deploys without impersonation, one rushed merge could widen what it does. Here it sits with the sandbox it extends, on the same protected `main`. `broker.py` is stdlib Python on the stock `python:3.13-slim` image (pinned by digest, the one cv-current uses), mounted from a hashed ConfigMap, so there is no image to build and no workflow to change. An edit rolls the pod.
 
-**Fail closed.** If the broker restarts between Approve and running the action, it marks the request `Failed` instead of running it later, when the situation may have changed. A lost ntfy message only costs time: the page lists every request. Without the ntfy Secret the broker still runs; requests just wait unannounced.
+**Fail closed, and say so honestly.** An approved action runs once, right away, or never:
+
+- Every status write carries the resourceVersion the broker read. `Recreate` doesn't stop a deleted pod's replacement from starting while the old one shuts down. If two brokers overlap, only one can claim an approval, and the other stops before running anything.
+- If the outcome isn't known, the request ends `Unknown`, not `Failed`. That covers a timeout or 5xx from the API server, or the broker stopping after Approve but before recording the result. "Failed, request it again" could mean deleting or restarting twice. A stranded `Approved` is marked `Unknown` after a minute, and never run late.
+- A 429 or 5xx while checking a new request leaves it for the next scan instead of rejecting it. Stale requests are expired before new ones are admitted, so after an outage they don't take the pending slots.
+
+A lost ntfy message only costs time: the page lists every waiting request first. Without the ntfy Secret the broker still runs; requests just wait unannounced.
 
 **The page trusts a header, so only Traefik may reach it.** `X-Auth-Request-Email` is set by the oauth2-proxy forwardAuth. A NetworkPolicy lets only Traefik's pods connect, as for headlamp-auth. POSTs must also carry `Origin: https://ops.nefcloud.top`, which stops cross-site form posts. The oauth2-proxy cookie is `SameSite=Lax`, which mostly does too. The page escapes everything the agent wrote and sends a strict CSP.
 

@@ -7,6 +7,7 @@ memory and the HTTP handler is driven through a real local server.
 """
 import copy
 import http.client
+import itertools
 import json
 import os
 import sys
@@ -34,24 +35,35 @@ class FakeAPI:
     """The slice of the Kubernetes API that broker.k8s() is used for."""
 
     def __init__(self):
-        self.objects = {
-            broker.KINDS["Pod"].format(ns="app", name="web-1"): {"metadata": {"ownerReferences": [{"kind": "ReplicaSet"}]}},
-            broker.KINDS["Pod"].format(ns="app", name="bare"): {"metadata": {}},
-            broker.KINDS["Deployment"].format(ns="app", name="web"): {"metadata": {}, "spec": {}},
-            broker.KINDS["Kustomization"].format(ns="flux-system", name="web"): {"metadata": {}, "spec": {}},
-        }
+        rs = [{"kind": "ReplicaSet", "controller": True}]
+        self.objects = {}
+        self.put("Pod", "app", "web-1", ownerReferences=rs)
+        self.put("Pod", "app", "bare")
+        self.put("Pod", "app", "job-1", ownerReferences=[{"kind": "Job", "controller": True}])
+        self.put("Pod", "app", "loose", ownerReferences=[{"kind": "ReplicaSet"}])  # an owner, not a controller
+        self.put("Deployment", "app", "web")
+        self.put("Kustomization", "flux-system", "web")
         self.requests = {}
         self.calls = []
+        self.versions = itertools.count(1)
+        self.fail = {}  # (method, path) -> exception to raise once
+
+    def put(self, kind, ns, name, uid=None, **meta):
+        self.objects[broker.KINDS[kind].format(ns=ns, name=name)] = {
+            "metadata": {"uid": uid or f"uid-{name}", **meta}, "spec": {}}
 
     def add(self, name, verb, kind, ns, target, age=0, **status):
         self.requests[name] = {
-            "metadata": {"name": name, "creationTimestamp": broker.stamp(broker.now() - timedelta(seconds=age))},
+            "metadata": {"name": name, "resourceVersion": str(next(self.versions)),
+                         "creationTimestamp": broker.stamp(broker.now() - timedelta(seconds=age))},
             "spec": {"verb": verb, "target": {"kind": kind, "namespace": ns, "name": target}, "reason": f"because {name}"},
             **({"status": status} if status else {}),
         }
 
     def __call__(self, method, path, body=None, content_type="application/merge-patch+json"):
         self.calls.append((method, path, body))
+        if (method, path) in self.fail:
+            raise self.fail.pop((method, path))
         if path == broker.REQUESTS and method == "GET":
             return {"items": copy.deepcopy(list(self.requests.values()))}
         if path.startswith(broker.REQUESTS + "/"):
@@ -61,8 +73,12 @@ class FakeAPI:
             if method == "GET":
                 return copy.deepcopy(self.requests[name])
             if method == "PATCH" and sub == "status":
-                self.requests[name].setdefault("status", {}).update(body["status"])
-                return {}
+                req = self.requests[name]
+                if body["metadata"]["resourceVersion"] != req["metadata"]["resourceVersion"]:
+                    raise broker.K8sError(409, "the object has been modified")
+                req.setdefault("status", {}).update(body["status"])
+                req["metadata"]["resourceVersion"] = str(next(self.versions))
+                return copy.deepcopy(req)
             if method == "DELETE":
                 del self.requests[name]
                 return {}
@@ -70,6 +86,9 @@ class FakeAPI:
             if method == "GET":
                 return copy.deepcopy(self.objects[path])
             if method == "DELETE":
+                uid = (body or {}).get("preconditions", {}).get("uid")
+                if uid and uid != self.objects[path]["metadata"]["uid"]:
+                    raise broker.K8sError(409, "Precondition failed: UID in precondition")
                 del self.objects[path]
                 return {}
             if method == "PATCH":
@@ -124,10 +143,31 @@ class TestScan(Base):
         st = self.admit("r1", "exec", "Pod", "app", "web-1")
         self.assertEqual(st["phase"], "Rejected")
 
-    def test_bare_pod_is_rejected(self):
-        st = self.admit("r1", "delete-pod", "Pod", "app", "bare")
-        self.assertEqual(st["phase"], "Rejected")
-        self.assertIn("no owner", st["message"])
+    def test_pods_that_may_not_come_back_are_rejected(self):
+        for pod in ("bare", "job-1", "loose"):
+            with self.subTest(pod):
+                st = self.admit(pod, "delete-pod", "Pod", "app", pod)
+                self.assertEqual(st["phase"], "Rejected")
+                self.assertIn("may not come back", st["message"])
+
+    def test_pod_uid_is_recorded(self):
+        st = self.admit("r1", "delete-pod", "Pod", "app", "web-1")
+        self.assertEqual((st["phase"], st["targetUID"]), ("Pending", "uid-web-1"))
+
+    def test_transient_lookup_error_is_retried(self):
+        self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
+        self.api.fail[("GET", broker.KINDS["Deployment"].format(ns="app", name="web"))] = broker.K8sError(503, "busy")
+        broker.scan()
+        self.assertNotIn("phase", self.api.status("r1"))
+        broker.scan()
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")
+
+    def test_one_bad_request_doesnt_stop_the_scan(self):
+        self.api.add("a", "rollout-restart", "Deployment", "app", "web", age=2)
+        self.api.add("b", "rollout-restart", "Deployment", "app", "web", age=1)
+        self.api.fail[("PATCH", f"{broker.REQUESTS}/a/status")] = broker.K8sError(409, "conflict")
+        broker.scan()
+        self.assertEqual(self.api.status("b")["phase"], "Pending")
 
     def test_pending_cap(self):
         for i in range(3):
@@ -135,6 +175,15 @@ class TestScan(Base):
         broker.scan()
         self.assertEqual([self.api.status(f"r{i}")["phase"] for i in range(3)], ["Pending", "Pending", "Rejected"])
         self.assertEqual(self.notify.call_count, 2)
+
+    def test_stale_new_requests_expire_before_taking_slots(self):
+        # After a broker outage: three stale unadmitted requests and a fresh one.
+        for i in range(3):
+            self.api.add(f"stale{i}", "flux-reconcile", "Kustomization", "flux-system", "web", age=2000 + i)
+        st = self.admit("fresh", "flux-reconcile", "Kustomization", "flux-system", "web")
+        self.assertEqual([self.api.status(f"stale{i}")["phase"] for i in range(3)], ["Expired"] * 3)
+        self.assertEqual(st["phase"], "Pending")
+        self.notify.assert_called_once()
 
     def test_expiry_frees_a_slot(self):
         self.admit("old1", "flux-reconcile", "Kustomization", "flux-system", "web")
@@ -145,17 +194,28 @@ class TestScan(Base):
         self.assertEqual(self.api.status("old1")["phase"], "Expired")
         self.assertEqual(st["phase"], "Pending")
 
-    def test_approved_after_restart_is_failed_not_run(self):
-        self.api.add("r1", "delete-pod", "Pod", "app", "web-1", phase="Approved")
+    def test_stranded_approval_is_unknown_not_run(self):
+        decided = broker.stamp(broker.now() - timedelta(seconds=120))
+        self.api.add("r1", "delete-pod", "Pod", "app", "web-1", phase="Approved", decidedAt=decided)
         broker.scan()
-        self.assertEqual(self.api.status("r1")["phase"], "Failed")
+        st = self.api.status("r1")
+        self.assertEqual(st["phase"], "Unknown")
+        self.assertIn("check the target", st["message"])
         self.assertEqual(self.api.actions(), [])
+
+    def test_fresh_approval_is_left_to_the_pod_running_it(self):
+        self.api.add("r1", "delete-pod", "Pod", "app", "web-1", phase="Approved", decidedAt=broker.stamp())
+        broker.scan()
+        self.assertEqual(self.api.status("r1")["phase"], "Approved")
 
     def test_old_finished_requests_are_deleted(self):
         self.api.add("old", "delete-pod", "Pod", "app", "web-1", age=91 * 86400, phase="Succeeded")
         self.api.add("recent", "delete-pod", "Pod", "app", "web-1", age=89 * 86400, phase="Succeeded")
+        self.api.add("old-junk", "delete-pod", "Pod", "app", "web-1", age=8 * 86400, phase="Rejected")
+        self.api.add("old-expired", "delete-pod", "Pod", "app", "web-1", age=8 * 86400, phase="Expired")
+        self.api.add("recent-junk", "delete-pod", "Pod", "app", "web-1", age=6 * 86400, phase="Rejected")
         broker.scan()
-        self.assertEqual(list(self.api.requests), ["recent"])
+        self.assertEqual(sorted(self.api.requests), ["recent", "recent-junk"])
 
 
 class TestDecide(Base):
@@ -201,6 +261,55 @@ class TestDecide(Base):
     def test_unadmitted_is_refused(self):
         self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
         self.assertEqual(broker.decide("r1", "approve", "", APPROVER)[0], 409)
+
+    def test_concurrent_decision_stops_before_running(self):
+        # Another broker pod decided it between this one's read and its claim.
+        h = self.pending()
+        real = self.api.__call__
+
+        def racing(method, path, body=None, **kw):
+            if method == "PATCH" and path.endswith("/r1/status") and body["status"].get("phase") == "Approved":
+                self.api.requests["r1"]["metadata"]["resourceVersion"] = "other"
+            return real(method, path, body, **kw)
+        with mock.patch.object(broker, "k8s", racing):
+            self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 409)
+        self.assertEqual(self.api.actions(), [])
+
+    def test_replaced_pod_is_not_deleted(self):
+        h = self.pending("delete-pod", "Pod", "app", "web-1")
+        self.api.put("Pod", "app", "web-1", uid="uid-new", ownerReferences=[{"kind": "StatefulSet", "controller": True}])
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 502)
+        st = self.api.status("r1")
+        self.assertEqual(st["phase"], "Failed")
+        self.assertIn("replaced", st["message"])
+        self.assertIn(broker.KINDS["Pod"].format(ns="app", name="web-1"), self.api.objects)
+
+    def test_ambiguous_errors_are_unknown(self):
+        path = broker.KINDS["Deployment"].format(ns="app", name="web")
+        for error in (broker.K8sError(504, "timeout"), TimeoutError("read timed out")):
+            with self.subTest(error):
+                self.setUp()
+                h = self.pending()
+                self.api.fail[("PATCH", path)] = error
+                self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 502)
+                self.assertEqual(self.api.status("r1")["phase"], "Unknown")
+
+    def test_lost_result_is_unknown_not_failed(self):
+        # The action ran, but recording Succeeded failed: a later scan must not
+        # call it not run.
+        h = self.pending()
+        real = self.api.__call__
+
+        def lose_result(method, path, body=None, **kw):
+            if method == "PATCH" and path.endswith("/r1/status") and body["status"].get("phase") == "Succeeded":
+                raise OSError("connection reset")
+            return real(method, path, body, **kw)
+        with mock.patch.object(broker, "k8s", lose_result):
+            self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 200)
+        self.assertEqual(self.api.status("r1")["phase"], "Approved")
+        self.api.requests["r1"]["status"]["decidedAt"] = broker.stamp(broker.now() - timedelta(seconds=120))
+        broker.scan()
+        self.assertEqual(self.api.status("r1")["phase"], "Unknown")
 
     def test_failure_is_recorded(self):
         h = self.pending()
@@ -258,6 +367,15 @@ class TestHTTP(Base):
         self.assertEqual(self.request("GET", "/", email=None)[0], 403)
         self.assertEqual(self.request("GET", "/", email="someone@else.test")[0], 403)
         self.assertEqual(self.request("GET", "/", email="BOSS@example.test")[0], 200)
+
+    def test_index_always_lists_pending(self):
+        self.admit("waiting", "rollout-restart", "Deployment", "app", "web")
+        for i in range(40):
+            self.api.add(f"done{i}", "rollout-restart", "Deployment", "app", "web", phase="Succeeded")
+        status, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("/r/waiting", body)
+        self.assertEqual(body.count("/r/done"), 30)
 
     def test_page_escapes_the_reason(self):
         self.api.add("r1", "rollout-restart", "Deployment", "app", "web")

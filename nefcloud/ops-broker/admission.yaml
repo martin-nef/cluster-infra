@@ -1,0 +1,32 @@
+# RBAC's create lets a requester set any metadata, and two fields would undo
+# the audit trail: an ownerReference (even to an object that doesn't exist)
+# hands the request to the garbage collector, which deletes it; a finalizer
+# stops the broker's retention cleanup and holds quota forever. The CRD's own
+# rules can't see metadata, so this refuses both on create, for every requester.
+# Only CREATE: nothing but admins may update requests, and the API server's own
+# foreground-deletion finalizer must keep working.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: opsrequests-plain-metadata
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [ops.nefcloud.top]
+        apiVersions: ["*"]
+        operations: [CREATE]
+        resources: [opsrequests]
+  validations:
+    - expression: "!has(object.metadata.ownerReferences) || size(object.metadata.ownerReferences) == 0"
+      message: OpsRequests may not have ownerReferences (they would let the garbage collector delete the audit record)
+    - expression: "!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0"
+      message: OpsRequests may not have finalizers (they would block retention cleanup)
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: opsrequests-plain-metadata
+spec:
+  policyName: opsrequests-plain-metadata
+  validationActions: [Deny]

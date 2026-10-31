@@ -76,9 +76,10 @@ spec:
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Approved, Succeeded, Failed, Denied, Expired, Rejected]
+                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected]
                 message: {type: string}
                 specHash: {type: string}
+                targetUID: {type: string}
                 decidedBy: {type: string}
                 decidedAt: {type: string, format: date-time}
                 finishedAt: {type: string, format: date-time}

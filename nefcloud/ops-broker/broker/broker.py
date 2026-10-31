@@ -3,7 +3,7 @@
 The agent (or anyone allowed to) creates an OpsRequest in this namespace. The
 CRD's schema already limits it to a fixed verb list:
 
-  delete-pod        Pod (one with an owner, so it comes back)
+  delete-pod        Pod (one a ReplicaSet, StatefulSet or DaemonSet recreates)
   rollout-restart   Deployment, StatefulSet, DaemonSet
   flux-reconcile    Kustomization, HelmRelease, GitRepository, HelmRepository
   flux-suspend      (same kinds)
@@ -17,9 +17,16 @@ approve anything, so it doesn't matter who else reads the topic: the agent can
 reach ntfy.sh too, but it can't log in as you.
 
 Every transition is written to the request's status (the audit trail, kept for
-RETENTION_DAYS) and printed as one JSON line. Unanswered requests expire after
-REQUEST_TTL seconds; at most MAX_PENDING wait at once. A request approved but
-not run when the broker stopped is failed, never run late.
+RETENTION_DAYS; Rejected and Expired ones, which decided nothing, for
+SHORT_RETENTION_DAYS) and printed as one JSON line. Unanswered requests expire
+after REQUEST_TTL seconds; at most MAX_PENDING wait at once.
+
+Status writes carry the resourceVersion the broker read, so if two broker pods
+overlap (a deleted pod's replacement starts before it has gone), only one can
+claim an approval. When the broker can't tell whether an action took effect (a
+timeout or 5xx from the API server, or a stop between approving and recording
+the result), the request ends Unknown: check the target before asking again.
+It is never run late or retried.
 
 Stdlib only, so it runs on a stock python image from a ConfigMap.
 """
@@ -42,6 +49,7 @@ ALLOWED_APPROVERS = {e.strip().lower() for e in os.environ["ALLOWED_APPROVERS"].
 REQUEST_TTL = int(os.environ.get("REQUEST_TTL", "900"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "3"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
+SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
 
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -49,6 +57,9 @@ K8S_API = "https://kubernetes.default.svc"
 NAMESPACE = "ops-broker"
 REQUESTS = f"/apis/ops.nefcloud.top/v1alpha1/namespaces/{NAMESPACE}/opsrequests"
 POLL = 5  # seconds between scans of the queue
+# An Approved request older than this was left by a broker that stopped mid-run
+# (running takes seconds); younger ones may still be running in another pod.
+STRANDED_AFTER = 60
 NAME = re.compile(r"[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?")
 
 # Where each target kind lives in the API.
@@ -71,7 +82,10 @@ VERBS = {
     "flux-suspend": FLUX_KINDS,
     "flux-resume": FLUX_KINDS,
 }
-FINISHED = {"Succeeded", "Failed", "Denied", "Expired", "Rejected"}
+# Pods these recreate under a controller; Job pods and bare pods may not come back.
+POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
+FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected"}
+SHORT_LIVED = {"Expired", "Rejected"}
 
 # Serialises every status change, so a request is decided and run at most once.
 # The Deployment is Recreate, so this process is the only broker.
@@ -82,6 +96,15 @@ class K8sError(Exception):
     def __init__(self, code, message):
         super().__init__(f"{code}: {message}")
         self.code = code
+
+    @property
+    def transient(self):
+        """Worth trying again later; for a write, it may also have taken effect."""
+        return self.code in (408, 429) or self.code >= 500
+
+
+class Unknown(Exception):
+    """The action may or may not have taken effect."""
 
 
 def k8s(method, path, body=None, content_type="application/merge-patch+json"):
@@ -138,8 +161,11 @@ def audit(event, req, **fields):
 
 
 def set_status(req, **status):
-    """Merge into the request's status; the local copy follows, for callers."""
-    k8s("PATCH", f"{REQUESTS}/{req['metadata']['name']}/status", {"status": status})
+    """Merge into the request's status if it is unchanged since it was read; a
+    409 K8sError otherwise. The local copy follows, for callers."""
+    patch = {"metadata": {"resourceVersion": req["metadata"]["resourceVersion"]}, "status": status}
+    updated = k8s("PATCH", f"{REQUESTS}/{req['metadata']['name']}/status", patch)
+    req["metadata"]["resourceVersion"] = updated["metadata"]["resourceVersion"]
     req.setdefault("status", {}).update(status)
 
 
@@ -149,25 +175,49 @@ def target_path(spec):
 
 
 def check(req):
-    """Why the request can't be run, or None. Looks the target up."""
+    """Look the target up. Returns (why it can't be run or None, the target's
+    UID). Raises on transient API errors, so the next scan tries again."""
     spec = req.get("spec", {})
     target = spec.get("target", {})
     if target.get("kind") not in VERBS.get(spec.get("verb"), ()):
-        return f"verb {spec.get('verb')!r} can't target kind {target.get('kind')!r}"
+        return f"verb {spec.get('verb')!r} can't target kind {target.get('kind')!r}", None
     try:
         obj = k8s("GET", target_path(spec))
     except K8sError as e:
-        return f"target: {e}"
-    if spec["verb"] == "delete-pod" and not obj["metadata"].get("ownerReferences"):
-        return "pod has no owner, so deleting it would lose it for good; do that by hand"
-    return None
+        if e.transient:
+            raise
+        return f"target: {e}", None
+    if spec["verb"] == "delete-pod":
+        owners = [o for o in obj["metadata"].get("ownerReferences", []) if o.get("controller")]
+        if not owners or owners[0].get("kind") not in POD_OWNERS:
+            return ("pod isn't controlled by a ReplicaSet, StatefulSet or DaemonSet, so it may not "
+                    "come back; do that by hand"), None
+    return None, obj["metadata"].get("uid")
 
 
-def run(spec):
-    """Run the action. Returns a message for the status; raises on failure."""
+def run(req):
+    """Run the action. Returns a message for the status. Raises K8sError when
+    the API server refused it, Unknown when it may have taken effect."""
+    try:
+        return act(req["spec"], req["status"].get("targetUID"))
+    except K8sError as e:
+        if e.transient:
+            raise Unknown(str(e)) from None
+        raise
+    except (OSError, json.JSONDecodeError) as e:  # timeouts, resets: it may have arrived
+        raise Unknown(repr(e)) from None
+
+
+def act(spec, uid):
     verb, path = spec["verb"], target_path(spec)
     if verb == "delete-pod":
-        k8s("DELETE", path)
+        # Only the pod that was checked: a StatefulSet's replacement has the same name.
+        try:
+            k8s("DELETE", path, {"preconditions": {"uid": uid}}, content_type="application/json")
+        except K8sError as e:
+            if e.code == 409:
+                raise K8sError(409, "the pod was replaced since the request; nothing deleted") from None
+            raise
         return "deleted"
     if verb == "rollout-restart":
         k8s("PATCH", path, {"spec": {"template": {"metadata": {"annotations": {
@@ -211,38 +261,66 @@ def list_requests():
     return k8s("GET", REQUESTS)["items"]
 
 
+def age(req):
+    return (now() - parse_time(req["metadata"]["creationTimestamp"])).total_seconds()
+
+
+def tidy(req):
+    """Expire, recover or delete one request that is past its time."""
+    p = phase(req)
+    if p in ("", "Pending") and age(req) > REQUEST_TTL:
+        set_status(req, phase="Expired", message="nobody approved it in time", finishedAt=stamp())
+        audit("expired", req)
+    elif p == "Approved" and (now() - parse_time(req["status"].get("decidedAt") or stamp())).total_seconds() > STRANDED_AFTER:
+        # The broker stopped while running it, before recording the outcome.
+        # Running it now could be long after the decision, so it never is.
+        set_status(req, phase="Unknown", finishedAt=stamp(),
+                   message="the broker stopped while running it; check the target before requesting it again")
+        audit("unknown", req, error="broker stopped mid-run")
+    elif p in FINISHED and age(req) > 86400 * (SHORT_RETENTION_DAYS if p in SHORT_LIVED else RETENTION_DAYS):
+        k8s("DELETE", f"{REQUESTS}/{req['metadata']['name']}")
+
+
+def admit(req, pending):
+    """Check a new request and either reject it or make it Pending. Returns
+    whether it is now Pending."""
+    problem, uid = check(req)
+    if problem is None and pending >= MAX_PENDING:
+        problem = f"{MAX_PENDING} requests already wait for a decision"
+    if problem:
+        set_status(req, phase="Rejected", message=problem, finishedAt=stamp())
+        audit("rejected", req, reason=problem)
+        return False
+    set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid,
+               message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
+    audit("pending", req, reason=req["spec"]["reason"])
+    notify(req)
+    return True
+
+
+def each(items, fn):
+    """fn on every item; one request's error (a conflict with another broker
+    pod, a transient API error) only skips it until the next scan."""
+    for req in items:
+        try:
+            fn(req)
+        except Exception as e:
+            print(f"scan {req['metadata']['name']}: {e!r}", flush=True)
+
+
 def scan():
-    """One pass over the queue: admit new requests, expire and recover old ones."""
+    """One pass over the queue: expire, recover and delete old requests first,
+    so stale ones never take a pending slot, then admit new ones."""
     with lock:
         items = sorted(list_requests(), key=lambda r: r["metadata"]["creationTimestamp"])
+        each(items, tidy)
         pending = sum(phase(r) == "Pending" for r in items)
-        for req in items:
-            p, created = phase(req), parse_time(req["metadata"]["creationTimestamp"])
-            if p == "":
-                problem = check(req)
-                if problem is None and pending >= MAX_PENDING:
-                    problem = f"{MAX_PENDING} requests already wait for a decision"
-                if problem:
-                    set_status(req, phase="Rejected", message=problem, finishedAt=stamp())
-                    audit("rejected", req, reason=problem)
-                    continue
-                set_status(req, phase="Pending", specHash=spec_hash(req),
-                           message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
+
+        def admit_new(req):
+            nonlocal pending
+            if phase(req) == "" and admit(req, pending):
                 pending += 1
-                audit("pending", req, reason=req["spec"]["reason"])
-                notify(req)
-            elif p == "Pending" and (now() - created).total_seconds() > REQUEST_TTL:
-                set_status(req, phase="Expired", message="nobody approved it in time", finishedAt=stamp())
-                pending -= 1
-                audit("expired", req)
-            elif p == "Approved":
-                # Only possible if the broker stopped between approving and
-                # running. Running it now could be long after the decision.
-                set_status(req, phase="Failed", finishedAt=stamp(),
-                           message="the broker restarted before running it; not retried, request it again")
-                audit("failed", req, error="restarted before running")
-            elif p in FINISHED and (now() - created).days > RETENTION_DAYS:
-                k8s("DELETE", f"{REQUESTS}/{req['metadata']['name']}")
+        each(items, admit_new)
 
 
 def decide(name, decision, seen_hash, approver):
@@ -254,27 +332,42 @@ def decide(name, decision, seen_hash, approver):
             return (404 if e.code == 404 else 502), str(e)
         if phase(req) != "Pending":
             return 409, f"it is {phase(req) or 'not yet admitted'}, not Pending"
-        if (now() - parse_time(req["metadata"]["creationTimestamp"])).total_seconds() > REQUEST_TTL:
+        if age(req) > REQUEST_TTL:
             return 409, "it has expired"
         # spec is immutable in the CRD; this also catches a page that went stale.
         if seen_hash != spec_hash(req) or seen_hash != req["status"].get("specHash"):
             return 409, "the request changed since the page was loaded"
-        if decision == "deny":
-            set_status(req, phase="Denied", decidedBy=approver, decidedAt=stamp(),
-                       finishedAt=stamp(), message=f"denied by {approver}")
-            audit("denied", req, by=approver)
-            return 200, "Denied."
-        set_status(req, phase="Approved", decidedBy=approver, decidedAt=stamp(), message="running")
+        # The claim is conditional on the version just read: if another broker
+        # pod decided it in the meantime, this one stops here.
+        try:
+            if decision == "deny":
+                set_status(req, phase="Denied", decidedBy=approver, decidedAt=stamp(),
+                           finishedAt=stamp(), message=f"denied by {approver}")
+                audit("denied", req, by=approver)
+                return 200, "Denied."
+            set_status(req, phase="Approved", decidedBy=approver, decidedAt=stamp(), message="running")
+        except K8sError as e:
+            return (409 if e.code == 409 else 502), f"not recorded: {e}"
         audit("approved", req, by=approver)
         try:
-            result = run(req["spec"])
+            result = run(req)
+        except Unknown as e:
+            return finish(req, "Unknown", f"may or may not have taken effect ({e}); check the target",
+                          502, "Approved, but the outcome is unknown")
         except Exception as e:
-            set_status(req, phase="Failed", finishedAt=stamp(), message=str(e))
-            audit("failed", req, error=str(e))
-            return 502, f"Approved, but it failed: {e}"
-        set_status(req, phase="Succeeded", finishedAt=stamp(), message=result)
-        audit("succeeded", req, result=result)
-        return 200, f"Done: {result}."
+            return finish(req, "Failed", str(e), 502, "Approved, but it failed")
+        return finish(req, "Succeeded", result, 200, "Done")
+
+
+def finish(req, final, message, code, summary):
+    """Record the outcome. If even that fails, the request stays Approved and
+    the scan marks it Unknown, which is still true."""
+    audit(final.lower(), req, result=message)
+    try:
+        set_status(req, phase=final, finishedAt=stamp(), message=message)
+    except Exception as e:
+        print(f"recording {req['metadata']['name']} as {final}: {e!r}", flush=True)
+    return code, f"{summary}: {message}."
 
 
 def scan_loop():
@@ -326,7 +419,9 @@ def request_page(req):
 
 
 def index_page(items):
-    items = sorted(items, key=lambda r: r["metadata"]["creationTimestamp"], reverse=True)[:30]
+    """Every request waiting for a decision, then the 30 newest others."""
+    items = sorted(items, key=lambda r: r["metadata"]["creationTimestamp"], reverse=True)
+    items = [r for r in items if phase(r) == "Pending"] + [r for r in items if phase(r) != "Pending"][:30]
     rows = "".join(
         f'<tr><td><a href="/r/{e(r["metadata"]["name"])}">{e(r["metadata"]["name"])}</a></td>'
         f"<td><code>{e(describe(r))}</code></td><td>{e(phase(r) or 'new')}</td></tr>"
