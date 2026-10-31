@@ -544,7 +544,7 @@ def oauth_section(app):
     settings = f"https://github.com/settings/apps/{app['slug']}"
     return ("<h2>Approvals that need you on GitHub</h2><p>Creating a repo needs your own GitHub token, "
             f"so it needs the App's OAuth client too. Once, in {githubops.link(settings, 'the App settings')}: "
-            f"add the callback URL <code>{e(PUBLIC_URL)}/github/authorize</code>, save, then generate a "
+            f"under <i>Identifying and authorizing users</i>, add the redirect URI <code>{e(PUBLIC_URL)}/github/authorize</code>, save, then generate a "
             "client secret and paste it here. The minter checks it with GitHub and keeps it in a Secret only it "
             "can read.</p>"
             '<form method=post action="/github/oauth"><input name=client_secret autocomplete=off required>'
