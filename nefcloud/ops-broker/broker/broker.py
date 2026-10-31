@@ -16,6 +16,11 @@ not take (githubops.py). The App's key is held by the token minter sidecar
   github-commit-workflows, github-protect-branch,
   github-rerun-workflow, github-dispatch-workflow
 
+and one GitHub only takes as you, so approving it also sends you through
+GitHub's sign-in, and the minter acts with your token for that one call:
+
+  github-create-repo
+
 The broker checks the target exists, marks the request Pending, and sends an
 ntfy notification linking to PUBLIC_URL/r/<name>. That page is behind Traefik's
 oauth2-proxy (Google) login; the broker runs the action only when someone in
@@ -101,6 +106,7 @@ VERBS = {
     "flux-resume": FLUX_KINDS,
 }
 GITHUB_VERBS = set(githubops.VERBS)
+USER_VERBS = set(githubops.USER_VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
 POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
 FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected"}
@@ -231,11 +237,11 @@ def check_github(spec):
         return f"GitHub: {e}"
 
 
-def run(req):
+def run(req, code=None):
     """Run the action. Returns a message for the status. Raises K8sError when
     the API server refused it, Unknown when it may have taken effect."""
     try:
-        return act(req["spec"], req["status"].get("targetUID"))
+        return act(req["spec"], req["status"].get("targetUID"), code)
     except (K8sError, githubops.GitHubError) as e:
         if e.transient:
             raise Unknown(str(e)) from None
@@ -244,9 +250,9 @@ def run(req):
         raise Unknown(repr(e)) from None
 
 
-def act(spec, uid):
+def act(spec, uid, code=None):
     if spec["verb"] in GITHUB_VERBS:
-        return githubops.act(MINTER, spec)
+        return githubops.act(MINTER, spec, code)
     verb, path = spec["verb"], target_path(spec)
     if verb == "delete-pod":
         # Only the pod that was checked: a StatefulSet's replacement has the same name.
@@ -361,20 +367,31 @@ def scan():
         each(items, admit_new)
 
 
-def decide(name, decision, seen_hash, approver):
-    """Approve (and run) or deny one request. Returns (http status, message)."""
+def decidable(name, seen_hash):
+    """(the request, None) if it can still be decided as seen, else (None, (http status, message))."""
+    try:
+        req = k8s("GET", f"{REQUESTS}/{name}")
+    except K8sError as e:
+        return None, ((404 if e.code == 404 else 502), str(e))
+    if phase(req) != "Pending":
+        return None, (409, f"it is {phase(req) or 'not yet admitted'}, not Pending")
+    if age(req) > REQUEST_TTL:
+        return None, (409, "it has expired")
+    # spec is immutable in the CRD; this also catches a page that went stale.
+    if seen_hash != spec_hash(req) or seen_hash != req["status"].get("specHash"):
+        return None, (409, "the request changed since the page was loaded")
+    return req, None
+
+
+def decide(name, decision, seen_hash, approver, code=None):
+    """Approve (and run) or deny one request. Returns (http status, message).
+    code: GitHub's OAuth code, which a USER_VERBS approval needs."""
     with lock:
-        try:
-            req = k8s("GET", f"{REQUESTS}/{name}")
-        except K8sError as e:
-            return (404 if e.code == 404 else 502), str(e)
-        if phase(req) != "Pending":
-            return 409, f"it is {phase(req) or 'not yet admitted'}, not Pending"
-        if age(req) > REQUEST_TTL:
-            return 409, "it has expired"
-        # spec is immutable in the CRD; this also catches a page that went stale.
-        if seen_hash != spec_hash(req) or seen_hash != req["status"].get("specHash"):
-            return 409, "the request changed since the page was loaded"
+        req, refused = decidable(name, seen_hash)
+        if refused:
+            return refused
+        if decision == "approve" and req["spec"]["verb"] in USER_VERBS and not code:
+            return 400, "this one needs you to sign in to GitHub; approve it from its page"
         # The claim is conditional on the version just read: if another broker
         # pod decided it in the meantime, this one stops here.
         try:
@@ -388,7 +405,7 @@ def decide(name, decision, seen_hash, approver):
             return (409 if e.code == 409 else 502), f"not recorded: {e}"
         audit("approved", req, by=approver)
         try:
-            result = run(req)
+            result = run(req, code)
         except Unknown as e:
             return finish(req, "Unknown", f"may or may not have taken effect ({e}); check the target",
                           502, "Approved, but the outcome is unknown")
@@ -467,8 +484,10 @@ def request_page(req):
             can_approve = False
     if st.get("phase") == "Pending":
         h = e(st.get("specHash", ""))
+        # A USER_VERBS approval goes through GitHub's sign-in first.
+        signin = '<input type=hidden name=signin value=github>' if s["verb"] in USER_VERBS else ""
         body += "".join(
-            f'<form method=post><input type=hidden name=hash value="{h}">'
+            f'<form method=post><input type=hidden name=hash value="{h}">{signin if d == "approve" else ""}'
             f'<button class={d} name=decision value={d}>{d.capitalize()}</button></form>'
             for d in ("approve", "deny") if d == "deny" or can_approve)
     return body + '<p><a href="/">All requests</a></p>'
@@ -501,8 +520,8 @@ def github_page():
         return (f"<h1>GitHub App</h1><p>Set up: <code>{e(app['slug'])}</code> (id {e(app['app_id'])}), key in "
                 "the <code>ops-broker-github-app</code> Secret, which only the token minter can read. "
                 f"{githubops.link(f'https://github.com/apps/{app['slug']}/installations/new', 'Install or change repos')}. "
-                "To replace it, delete the App on GitHub and the Secret in Headlamp, roll the pod, then reload.</p>"
-                '<p><a href="/">All requests</a></p>'), False
+                "To replace it, delete the App on GitHub and the Secrets in Headlamp, roll the pod, then reload.</p>"
+                + oauth_section(app) + '<p><a href="/">All requests</a></p>'), False
     return ("<h1>GitHub App</h1><p>The GitHub verbs need an App whose key only the broker's token minter holds. "
             f"The button asks GitHub to create <code>{e(manifest['name'])}</code>, private to "
             f"<code>{e(GITHUB_OWNER)}</code>, with: <code>{e(json.dumps(manifest['default_permissions']))}</code>. "
@@ -510,6 +529,26 @@ def github_page():
             "namespace: it never reaches git, a PC, the agent, or the broker's own process.</p>"
             '<form method=post action="/github"><button class=approve>Create the App on GitHub</button></form>'
             '<p><a href="/">All requests</a></p>'), True
+
+
+def oauth_section(app):
+    """The OAuth client's state, and a form to add one to an App set up before
+    user actions existed (new setups get it from GitHub with the key)."""
+    try:
+        oauth = MINTER.oauth()
+    except githubops.GitHubError as err:
+        return f"<p>Can't reach the token minter: {e(err)}</p>"
+    if oauth is not None:
+        return (f"<p>OAuth client set up (<code>{e(oauth['client_id'])}</code>), in the "
+                "<code>ops-broker-github-oauth</code> Secret: approvals that need you on GitHub work.</p>")
+    settings = f"https://github.com/settings/apps/{app['slug']}"
+    return ("<h2>Approvals that need you on GitHub</h2><p>Creating a repo needs your own GitHub token, "
+            f"so it needs the App's OAuth client too. Once, in {githubops.link(settings, 'the App settings')}: "
+            f"add the callback URL <code>{e(PUBLIC_URL)}/github/authorize</code>, save, then generate a "
+            "client secret and paste it here. The minter checks it with GitHub and keeps it in a Secret only it "
+            "can read.</p>"
+            '<form method=post action="/github/oauth"><input name=client_secret autocomplete=off required>'
+            "<button class=approve>Save</button></form>")
 
 
 def start_setup(approver):
@@ -543,6 +582,46 @@ def finish_setup(approver, code, state):
                  "repositories is fine: every token it mints is scoped to one repo and one step.</p>")
 
 
+# Approvals waiting on GitHub's sign-in: state -> (approver, request name, spec hash, deadline).
+authorizations = {}
+
+
+def start_authorize(name, seen_hash, approver):
+    """For a USER_VERBS approval: a link to GitHub's sign-in, which comes back
+    to finish_authorize with a code. Nothing is claimed or run yet: if you
+    stop on GitHub, the request stays Pending and expires. Returns (http status, page)."""
+    req, refused = decidable(name, seen_hash)
+    if refused:
+        return refused[0], f"<p>{e(refused[1])}</p>"
+    try:
+        oauth = MINTER.oauth()
+    except githubops.GitHubError as err:
+        return 502, f"<p>Can't reach the token minter: {e(err)}</p>"
+    if oauth is None:
+        return 409, '<p>The App\'s OAuth client isn\'t set up. <a href="/github">Set it up</a>.</p>'
+    now_ = time.time()
+    for state in [s for s, a in authorizations.items() if a[3] < now_]:
+        del authorizations[state]
+    state = secrets.token_urlsafe(24)
+    authorizations[state] = (approver, name, seen_hash, now_ + SETUP_TTL)
+    url = "https://github.com/login/oauth/authorize?" + urllib.parse.urlencode({
+        "client_id": oauth["client_id"], "redirect_uri": f"{PUBLIC_URL}/github/authorize", "state": state,
+        "login": GITHUB_OWNER, "allow_signup": "false"})
+    return 200, (f"<p>Sign in to GitHub as <code>{e(GITHUB_OWNER)}</code> to {e(describe(req))}. GitHub "
+                 "sends you back here and it runs once, with your token, which is then revoked.</p>"
+                 f'<p><a href="{e(url)}">Continue to GitHub</a></p>')
+
+
+def finish_authorize(approver, code, state):
+    """GitHub's sign-in came back: approve and run the request with the code."""
+    started = authorizations.pop(state, None)
+    if started is None or started[0] != approver or started[3] < time.time() or not code:
+        return 400, "<p>This sign-in wasn't started from an approval by you, or took too long. Approve it again.</p>"
+    _, name, seen_hash, _ = started
+    status, message = decide(name, "approve", seen_hash, approver, code=code)
+    return status, f'<p>{e(message)}</p><p><a href="/r/{e(name)}">Back</a></p>'
+
+
 class Handler(BaseHTTPRequestHandler):
     def approver(self):
         """The signed-in email if it may approve. Set by oauth2-proxy via Traefik,
@@ -561,6 +640,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, index_page(list_requests()), html_page=True)
             if self.path == "/github":
                 return self.reply(200, github_page()[0], html_page=True)
+            if url.path == "/github/authorize":
+                query = urllib.parse.parse_qs(url.query)
+                status, page = finish_authorize(self.approver(), query.get("code", [""])[0],
+                                                query.get("state", [""])[0])
+                return self.reply(status, page, html_page=True)
             if url.path == "/github/callback":
                 query = urllib.parse.parse_qs(url.query)
                 status, page = finish_setup(self.approver(), query.get("code", [""])[0],
@@ -579,6 +663,17 @@ class Handler(BaseHTTPRequestHandler):
         # Blocks cross-site form posts; the SameSite=lax cookie mostly does too.
         if self.headers.get("Origin") != PUBLIC_URL:
             return self.reply(403, "bad origin")
+        if self.path == "/github/oauth":
+            form = self.form()
+            if form is None:
+                return self.reply(413, "too large")
+            try:
+                MINTER.oauth_setup(form.get("client_secret", [""])[0])
+            except githubops.GitHubError as err:
+                return self.reply(err.code if 400 <= err.code < 600 else 502, str(err))
+            print(json.dumps({"time": stamp(), "event": "github-oauth-set-up", "by": approver}), flush=True)
+            return self.reply(200, '<p>Done: approvals that need you on GitHub work now.</p><p><a href="/">All requests</a></p>',
+                              html_page=True)
         if self.path == "/github":
             if not github_page()[1]:
                 return self.reply(409, "the App is already set up, or the token minter can't be reached")
@@ -594,18 +689,26 @@ class Handler(BaseHTTPRequestHandler):
             name = self.request_name()
         except K8sError as err:
             return self.reply(404, str(err))
-        try:
-            length = int(self.headers["Content-Length"])
-        except (TypeError, ValueError):
-            return self.reply(411, "length required")
-        if not 0 <= length <= 4096:
-            return self.reply(413, "too large")
-        form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        form = self.form()
+        if form is None:
+            return self.reply(413, "too large or no length")
         decision = form.get("decision", [""])[0]
         if decision not in ("approve", "deny"):
             return self.reply(400, "decision must be approve or deny")
+        if decision == "approve" and form.get("signin", [""])[0] == "github":
+            return self.reply(*start_authorize(name, form.get("hash", [""])[0], approver), html_page=True)
         status, message = decide(name, decision, form.get("hash", [""])[0], approver)
         self.reply(status, f"<p>{e(message)}</p><p><a href=\"{e(self.path)}\">Back</a></p>", html_page=True)
+
+    def form(self):
+        """The posted form, or None if it has no length or is too large."""
+        try:
+            length = int(self.headers["Content-Length"])
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= length <= 4096:
+            return None
+        return urllib.parse.parse_qs(self.rfile.read(length).decode())
 
     def request_name(self):
         """The object name from /r/<name>; a 404 for anything that isn't one."""

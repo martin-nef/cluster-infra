@@ -53,7 +53,8 @@ class TestTokens(MinterBase):
     def test_every_verb_has_a_token_table_entry(self):
         self.assertEqual(set(minter.TOKENS), set(githubops.VERBS))
         for verb, steps in minter.TOKENS.items():
-            self.assertEqual(set(steps), {"check", "run"}, verb)
+            # User verbs run with your token, not an installation token.
+            self.assertEqual(set(steps), {"check"} if verb in githubops.USER_VERBS else {"check", "run"}, verb)
             for perms in steps.values():
                 # Each step's permissions are within what the App was created with.
                 self.assertLessEqual(perms.keys(), minter.PERMISSIONS.keys(), verb)
@@ -114,7 +115,8 @@ class TestTokens(MinterBase):
 
 
 class TestSetup(MinterBase):
-    CREDS = {"app-id": "5", "slug": "martin-nef-ops", "private-key.pem": "KEY"}
+    CREDS = ({"app-id": "5", "slug": "martin-nef-ops", "private-key.pem": "KEY"},
+             {"client-id": "Iv1.c", "client-secret": "CS"})
 
     def test_mounted_key_wins_over_memory(self):
         with mock.patch.object(minter, "convert", return_value=self.CREDS), mock.patch.object(minter, "store_secret"):
@@ -137,17 +139,28 @@ class TestSetup(MinterBase):
                 self.minter.setup("c")
         self.assertIsNone(self.minter.status())
 
+    def test_setup_stores_the_oauth_client_too(self):
+        with mock.patch.object(minter, "convert", return_value=self.CREDS), \
+                mock.patch.object(minter, "store_secret") as store:
+            self.minter.setup("c")
+        self.assertEqual(store.call_args_list, [mock.call(self.CREDS[0]), mock.call(self.CREDS[1], minter.OAUTH_SECRET)])
+        self.assertEqual(self.minter.oauth(), {"client_id": "Iv1.c"})
+        self.assertNotIn("CS", json.dumps(self.minter.call("status")))
+
     def test_manifest(self):
         m = self.minter.manifest()
         self.assertEqual(m["redirect_url"], "https://ops.example.test/github/callback")
+        self.assertEqual(m["callback_urls"], ["https://ops.example.test/github/authorize"])
         self.assertEqual(m["default_permissions"], minter.PERMISSIONS)
         self.assertFalse(m["public"])
 
     def test_convert_refuses_an_app_it_didnt_ask_for(self):
         made = {"id": 5, "slug": "x", "pem": "KEY", "html_url": "https://github.test/apps/x",
+                "client_id": "Iv1.c", "client_secret": "CS",
                 "owner": {"login": "Owner"}, "permissions": dict(minter.PERMISSIONS)}
         with mock.patch.object(minter, "api", return_value=made):
-            self.assertEqual(minter.convert("c", "owner")["app-id"], "5")
+            creds, client = minter.convert("c", "owner")
+            self.assertEqual((creds["app-id"], client), ("5", {"client-id": "Iv1.c", "client-secret": "CS"}))
             made["permissions"] = {**made["permissions"], "secrets": "write"}
             with self.assertRaisesRegex(ValueError, "nothing was stored"):
                 minter.convert("c", "owner")
@@ -163,6 +176,87 @@ class TestSetup(MinterBase):
                 self.minter.setup("c")
         store.assert_not_called()
         self.assertIsNone(self.minter.status())
+
+
+class TestUserActions(MinterBase):
+    """Creating a repo with the owner's own token, from GitHub's OAuth code."""
+
+    def setUp(self):
+        super().setUp()
+        write_key(self.key_dir)
+        p = mock.patch.object(minter, "created_oauth", ("Iv1.c", "CS"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def act(self, **github):
+        return self.minter.user_action("github-create-repo", "code1", {"repo": "new", **github})
+
+    def test_creates_with_the_owners_token_and_revokes_it(self):
+        self.assertEqual(self.act(description="d"), "created owner/new (private)")
+        create = [c for c in self.gh.calls if c[1] == "/user/repos"]
+        self.assertEqual(create, [("POST", "/user/repos", {"name": "new", "private": True, "description": "d",
+                                                           "auto_init": True})])
+        self.assertEqual(self.gh.user_tokens_revoked, ["gho_user"])
+
+    def test_code_goes_to_github_with_the_secret(self):
+        self.act()
+        exchange = self.gh.oauth_exchanges[0]
+        self.assertEqual(exchange, {"client_id": "Iv1.c", "client_secret": "CS", "code": "code1",
+                                    "redirect_uri": "https://ops.example.test/github/authorize"})
+
+    def test_someone_elses_account_creates_nothing(self):
+        self.gh.user_login = "mallory"
+        with self.assertRaisesRegex(githubops.NothingChanged, "as mallory"):
+            self.act()
+        self.assertEqual([c for c in self.gh.calls if c[1] == "/user/repos"], [])
+        self.assertEqual(self.gh.user_tokens_revoked, ["gho_user"])
+
+    def test_refused_code_is_nothing_changed(self):
+        self.gh.oauth_error = "bad_verification_code"
+        with self.assertRaisesRegex(githubops.NothingChanged, "bad_verification_code"):
+            self.act()
+
+    def test_creation_outcomes(self):
+        self.gh.fail[("POST", "/user/repos")] = githubops.GitHubError(502, "bad gateway")
+        with self.assertRaises(githubops.GitHubError) as cm:  # may have been created: not NothingChanged
+            self.act()
+        self.assertTrue(cm.exception.transient)
+        self.assertEqual(self.gh.user_tokens_revoked, ["gho_user"])
+
+    def test_only_listed_actions(self):
+        for verb, github in [("github-protect-branch", {"repo": "web"}), ("github-create-repo", {"repo": "a/b"}),
+                             ("github-create-repo", None)]:
+            with self.subTest(verb=verb, github=github):
+                with self.assertRaises(githubops.NothingChanged):
+                    self.minter.user_action(verb, "code1", github)
+        self.assertEqual(self.gh.oauth_exchanges, [])
+
+    def test_needs_the_oauth_client(self):
+        with mock.patch.object(minter, "created_oauth", None):
+            with self.assertRaisesRegex(githubops.NothingChanged, "OAuth client"):
+                self.act()
+
+
+class TestOAuthSetup(MinterBase):
+    def setUp(self):
+        super().setUp()
+        write_key(self.key_dir)
+
+    def test_checks_the_secret_with_github_then_stores_it(self):
+        with mock.patch.object(minter, "store_secret") as store:
+            self.assertEqual(self.minter.oauth_setup("CS"), {"client_id": "Iv1.c"})
+            store.assert_called_once_with({"client-id": "Iv1.c", "client-secret": "CS"}, minter.OAUTH_SECRET)
+            with self.assertRaises(githubops.GitHubError) as cm:
+                self.minter.oauth_setup("CS")
+            self.assertEqual(cm.exception.code, 409)
+
+    def test_wrong_secret_stores_nothing(self):
+        with mock.patch.object(minter, "store_secret") as store:
+            with self.assertRaises(githubops.GitHubError) as cm:
+                self.minter.oauth_setup("wrong")
+        self.assertEqual(cm.exception.code, 400)
+        store.assert_not_called()
+        self.assertIsNone(self.minter.oauth())
 
 
 if __name__ == "__main__":

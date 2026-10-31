@@ -13,12 +13,18 @@ with a third App (the "ops" App) whose key only the token minter holds:
                             standard rule (PRs only; admins may still merge).
   github-rerun-workflow     Re-run the failed jobs of one finished run.
   github-dispatch-workflow  Run a workflow_dispatch workflow on the default branch.
+  github-create-repo        Create a repo under the owner's account (USER_VERBS).
 
 Every call uses an installation token for one repo with only the permissions
 that step needs, asked of the minter sidecar (minter.py) by verb and step and
 revoked as soon as the step is done. Checks and the approval page use
 read-only tokens; only an approved run gets write. This process never sees
 the App's key.
+
+USER_VERBS are actions GitHub only takes with a user's token. Approving one
+sends you through GitHub's OAuth flow for the ops App; the broker relays the
+code GitHub returns to the minter, which takes the action with your token and
+revokes it. This process never sees that token either.
 """
 import base64
 import difflib
@@ -33,7 +39,10 @@ import urllib.request
 GITHUB_API = "https://api.github.com"
 
 # The verbs this module runs. Their tokens' permissions are minter.TOKENS.
-VERBS = ("github-commit-workflows", "github-protect-branch", "github-rerun-workflow", "github-dispatch-workflow")
+VERBS = ("github-commit-workflows", "github-protect-branch", "github-rerun-workflow", "github-dispatch-workflow",
+         "github-create-repo")
+# Run by the minter with the owner's own token (minter.USER_ACTIONS).
+USER_VERBS = ("github-create-repo",)
 # The one rule github-protect-branch applies: changes reach the branch only
 # through a PR with an approval; enforce_admins off, so you can still merge your
 # own and the bot's PRs. The same rule as in claude-remote's docs/design.md.
@@ -104,12 +113,27 @@ class Minter:
         except (OSError, ValueError) as e:
             raise GitHubError(503, f"the token minter didn't answer: {e!r}") from None
         if "error" in reply:
-            raise GitHubError(reply["error"]["code"], reply["error"]["message"])
+            err = reply["error"]
+            if err.get("nothing_changed"):
+                raise NothingChanged(f"{err['code']}: {err['message']}")
+            raise GitHubError(err["code"], err["message"])
         return reply
 
     def status(self):
         """{app_id, slug} of the ops App, or None until it's set up."""
         return self.call("status")["app"]
+
+    def oauth(self):
+        """{client_id} of the App's OAuth client, or None until it's set up."""
+        return self.call("status")["oauth"]
+
+    def oauth_setup(self, client_secret):
+        return self.call("oauth-setup", client_secret=client_secret)["oauth"]
+
+    def user_action(self, verb, code, github):
+        """Have the minter trade GitHub's OAuth code for your token and take
+        the action. NothingChanged if it failed before the action."""
+        return self.call("user-action", verb=verb, code=code, github=github)["message"]
 
     def manifest(self):
         return self.call("manifest")["manifest"]
@@ -159,6 +183,8 @@ def describe(owner, spec):
         where += f" run {g.get('runID')}"
     elif verb == "github-dispatch-workflow":
         where += f" {g.get('workflow')}"
+    elif verb == "github-create-repo":
+        where += " (private)" if g.get("private", True) else " (public)"
     return f"{verb} {where}"
 
 
@@ -168,9 +194,24 @@ def check(minter, spec):
     g = spec["github"]
     if not REPO_NAME.fullmatch(g.get("repo", "")) or g["repo"] in (".", ".."):
         return f"{g.get('repo')!r} isn't a repo name"
+    if spec["verb"] == "github-create-repo":
+        if minter.oauth() is None:
+            return "creating a repo needs the App's OAuth client, which isn't set up; see /github"
+        return None if existing(minter, g) is None else f"{minter.owner}/{g['repo']} already exists"
     with minter.token(g["repo"], spec["verb"], "check") as tok:
         repo = tok("GET")
         return CHECKS[spec["verb"]](tok, repo, g)
+
+
+def existing(minter, g):
+    """The repo the request would create, if it already exists, or None."""
+    with minter.token(g["repo"], "github-create-repo", "check") as tok:
+        try:
+            return tok("GET")
+        except GitHubError as e:
+            if e.code == 404:
+                return None
+            raise
 
 
 def check_commit(tok, repo, g):
@@ -244,11 +285,16 @@ def protection(tok, branch):
         raise
 
 
-def act(minter, spec):
+def act(minter, spec, code=None):
     """Run an approved request; returns a message for the status. Raises
     GitHubError when GitHub refused it (transient: it may have taken effect)
-    and NothingChanged when it failed before changing anything."""
+    and NothingChanged when it failed before changing anything. code: GitHub's
+    OAuth code, for USER_VERBS."""
     g = spec["github"]
+    if spec["verb"] in USER_VERBS:
+        if not code:
+            raise NothingChanged("needs you to sign in to GitHub; approve it from the page")
+        return minter.user_action(spec["verb"], code, g)
     try:
         tok = minter.token(g["repo"], spec["verb"], "run")
     except GitHubError as e:
@@ -323,6 +369,17 @@ def details(minter, spec):
     Raises when it can't be shown; the page then offers no Approve."""
     g = spec["github"]
     web = f"https://github.com/{minter.owner}/{g['repo']}"
+    if spec["verb"] == "github-create-repo":
+        if minter.oauth() is None:
+            raise GitHubError(404, "the App's OAuth client isn't set up; see /github")
+        if existing(minter, g) is not None:
+            raise GitHubError(409, f"{web} already exists")
+        return (f"<p>Creates <b>{'a private' if g.get('private', True) else 'a public'}</b> repo "
+                f"<code>{e(minter.owner)}/{e(g['repo'])}</code>"
+                + (f", described as <q>{e(g['description'])}</q>" if g.get("description") else "")
+                + ", with a README as its first commit. Approving sends you to GitHub to sign in as "
+                f"<code>{e(minter.owner)}</code>: the repo is made with your token, which is used for this "
+                "one call and revoked.</p>")
     with minter.token(g["repo"], spec["verb"], "check") as tok:
         repo = tok("GET")
         if spec["verb"] == "github-commit-workflows":

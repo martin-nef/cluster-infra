@@ -153,16 +153,36 @@ class FakeGitHub:
                          "head_branch": "work", "head_sha": BASE},
                      8: {"status": "completed", "conclusion": "success"}}
         self.workflows = {"image.yml": {"state": "active", "name": "Image", "path": ".github/workflows/image.yml"}}
+        self.user_login = "Owner"
+        self.oauth_error = None
+        self.oauth_exchanges = []
+        self.user_tokens_revoked = []
 
-    def __call__(self, method, path, token=None, body=None):
+    def __call__(self, method, path, token=None, body=None, basic=None, base=None):
         self.calls.append((method, path, body))
         if (method, path) in self.fail:
             raise self.fail.pop((method, path))
         route = path.split("?")[0]
+        if route == "/login/oauth/access_token":
+            self.oauth_exchanges.append(body)
+            return {"error": self.oauth_error} if self.oauth_error else {"access_token": "gho_user"}
+        if route == "/user":
+            return {"login": self.user_login}
+        if route == "/user/repos" and method == "POST":
+            return {"full_name": f"owner/{body['name']}", "private": body["private"]}
+        if route == "/app":
+            return {"client_id": "Iv1.c"}
+        if route == "/applications/Iv1.c/token" and method == "DELETE":
+            if basic != ("Iv1.c", "CS"):
+                raise broker.githubops.GitHubError(401, "Bad credentials")
+            if body["access_token"] != "gho_user":
+                raise broker.githubops.GitHubError(404, "Not Found")
+            self.user_tokens_revoked.append(body["access_token"])
+            return {}
         if route == "/users/owner/installation":
             return {"id": 9}
         if route == "/app/installations/9/access_tokens":
-            self.tokens.append((body["repositories"], body["permissions"]))
+            self.tokens.append((body.get("repositories"), body["permissions"]))
             return {"token": f"tok{len(self.tokens)}"}
         if route == "/installation/token" and method == "DELETE":
             self.revoked.append(token)
@@ -209,10 +229,10 @@ class FakeGitHub:
         return [(m, p, b) for m, p, b in self.calls
                 if m != "GET" and p not in ("/installation/token",) and "access_tokens" not in p]
 
-    def for_minter(self, method, path, token=None, body=None):
+    def for_minter(self, method, path, token=None, body=None, basic=None, base=None):
         """The same API as minter.api() sees it: its own GitHubError."""
         try:
-            return self(method, path, token, body)
+            return self(method, path, token, body, basic, base)
         except broker.githubops.GitHubError as e:
             raise minter.GitHubError(e.code, str(e).partition(": ")[2]) from None
 
@@ -245,6 +265,8 @@ class MinterBase(unittest.TestCase):
                   mock.patch.object(minter, "GITHUB_OWNER", "owner"),
                   mock.patch.object(minter, "PUBLIC_URL", broker.PUBLIC_URL),
                   mock.patch.object(minter, "created", None),
+                  mock.patch.object(minter, "created_oauth", None),
+                  mock.patch.object(minter, "OAUTH_DIR", os.path.join(d, "oauth")),
                   mock.patch.object(minter, "audit", mock.Mock())):
             p.start()
             self.addCleanup(p.stop)
@@ -748,7 +770,8 @@ class TestGitHubHTTP(Served, GitHubBase):
         self.assertFalse(manifest["public"])
 
         creds = {"app-id": "5", "slug": "martin-nef-ops", "private-key.pem": "KEY"}
-        with mock.patch.object(minter, "convert", return_value=creds) as convert, \
+        client = {"client-id": "Iv1.c", "client-secret": "CS"}
+        with mock.patch.object(minter, "convert", return_value=(creds, client)) as convert, \
                 mock.patch.object(minter, "store_secret") as store:
             self.assertEqual(self.request("GET", "/github/callback?code=c&state=forged")[0], 400)
             self.assertEqual(self.request("GET", f"/github/callback?code=c&state={state}",
@@ -758,7 +781,7 @@ class TestGitHubHTTP(Served, GitHubBase):
             self.assertIn("installations/new", body)
             # The minter got the code and stored the key; the broker never saw it.
             convert.assert_called_once_with("c", "owner")
-            store.assert_called_once_with(creds)
+            self.assertEqual(store.call_args_list, [mock.call(creds), mock.call(client, minter.OAUTH_SECRET)])
             self.assertNotIn("KEY", body)
             # The state is single use.
             self.assertEqual(self.request("GET", f"/github/callback?code=c&state={state}")[0], 400)
@@ -782,6 +805,102 @@ class TestGitHubHTTP(Served, GitHubBase):
         broker.decide("r1", "approve", st["specHash"], APPROVER)
         self.request("GET", "/github")
         self.assertEqual([c for c in self.api.calls if "/secrets" in c[1]], [])
+
+
+class TestCreateRepo(Served, GitHubBase):
+    """github-create-repo: approved through GitHub's sign-in, run with the owner's token."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(minter, "created_oauth", ("Iv1.c", "CS"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def pending(self):
+        st = self.admit_github("r1", "github-create-repo", repo="new", description="<b>x</b>")
+        self.assertEqual(st["phase"], "Pending", st.get("message"))
+        return st
+
+    def sign_in(self, st):
+        """Press Approve; returns the state in the GitHub link."""
+        status, page = self.request("POST", "/r/r1", form={"decision": "approve", "hash": st["specHash"],
+                                                             "signin": "github"})
+        self.assertEqual(status, 200, page)
+        url = urllib.parse.urlsplit(html.unescape(page.split('href="')[1].split('"')[0]))
+        self.assertEqual(url.netloc + url.path, "github.com/login/oauth/authorize")
+        query = urllib.parse.parse_qs(url.query)
+        self.assertEqual(query["client_id"], ["Iv1.c"])
+        self.assertEqual(query["redirect_uri"], ["https://ops.example.test/github/authorize"])
+        return query["state"][0]
+
+    def test_check_uses_an_unscoped_metadata_token(self):
+        self.pending()
+        self.assertEqual(self.gh.tokens, [(None, {"metadata": "read"})])
+        st = self.admit_github("r2", "github-create-repo", repo="web")
+        self.assertIn("already exists", st["message"])
+        self.assertEqual(st["phase"], "Rejected")
+
+    def test_not_set_up_is_rejected(self):
+        with mock.patch.object(minter, "created_oauth", None):
+            st = self.admit_github("r1", "github-create-repo", repo="new")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("OAuth client", st["message"])
+
+    def test_approve_goes_through_github(self):
+        st = self.pending()
+        status, page = self.request("GET", "/r/r1")
+        self.assertIn("a private</b> repo <code>owner/new</code>", page)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
+        self.assertIn("name=signin value=github", page)
+        state = self.sign_in(st)
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")  # nothing claimed until GitHub returns
+        self.assertEqual(self.request("GET", f"/github/authorize?code=c&state={state}", email="x@evil.test")[0], 403)
+        status, page = self.request("GET", f"/github/authorize?code=c&state={state}")
+        self.assertEqual(status, 200, page)
+        st = self.api.status("r1")
+        self.assertEqual((st["phase"], st["message"], st["decidedBy"]), ("Succeeded", "created owner/new (private)", APPROVER))
+        self.assertEqual(self.gh.user_tokens_revoked, ["gho_user"])
+        # Single use.
+        self.assertEqual(self.request("GET", f"/github/authorize?code=c&state={state}")[0], 400)
+
+    def test_forged_state_runs_nothing(self):
+        self.sign_in(self.pending())
+        self.assertEqual(self.request("GET", "/github/authorize?code=c&state=forged")[0], 400)
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")
+        self.assertEqual(self.gh.oauth_exchanges, [])
+
+    def test_no_approval_without_a_code(self):
+        st = self.pending()
+        code, message = broker.decide("r1", "approve", st["specHash"], APPROVER)
+        self.assertEqual(code, 400)
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")
+        # The plain approve form doesn't run it either.
+        status, _ = self.request("POST", "/r/r1", form={"decision": "approve", "hash": st["specHash"]})
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")
+
+    def test_wrong_account_fails_without_creating(self):
+        state = self.sign_in(self.pending())
+        self.gh.user_login = "mallory"
+        self.request("GET", f"/github/authorize?code=c&state={state}")
+        self.assertEqual(self.api.status("r1")["phase"], "Failed")
+        self.assertEqual([c for c in self.gh.calls if c[1] == "/user/repos"], [])
+
+    def test_ambiguous_creation_is_unknown(self):
+        state = self.sign_in(self.pending())
+        self.gh.fail[("POST", "/user/repos")] = broker.githubops.GitHubError(502, "bad gateway")
+        self.request("GET", f"/github/authorize?code=c&state={state}")
+        self.assertEqual(self.api.status("r1")["phase"], "Unknown")
+
+    def test_oauth_setup_page(self):
+        with mock.patch.object(minter, "created_oauth", None), mock.patch.object(minter, "store_secret") as store:
+            self.assertIn("client_secret", self.request("GET", "/github")[1])
+            self.assertEqual(self.request("POST", "/github/oauth", form={"client_secret": "CS"},
+                                          origin="https://evil.test")[0], 403)
+            self.assertEqual(self.request("POST", "/github/oauth", form={"client_secret": "nope"})[0], 400)
+            status, page = self.request("POST", "/github/oauth", form={"client_secret": "CS"})
+            self.assertEqual(status, 200, page)
+            store.assert_called_once()
+        self.assertNotIn("CS", self.request("GET", "/github")[1])
 
 
 class TestNotify(unittest.TestCase):

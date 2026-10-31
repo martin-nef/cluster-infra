@@ -68,6 +68,9 @@ spec:
             - name: github-app
               mountPath: /etc/github-app
               readOnly: true
+            - name: github-oauth
+              mountPath: /etc/github-oauth
+              readOnly: true
             - name: minter-socket
               mountPath: /run/minter
       containers:
@@ -123,6 +126,12 @@ spec:
         - name: github-app
           secret:
             secretName: ops-broker-github-app
+            optional: true
+            defaultMode: 0440
+        # The App's OAuth client, for approvals that act with your GitHub token.
+        - name: github-oauth
+          secret:
+            secretName: ops-broker-github-oauth
             optional: true
             defaultMode: 0440
         - name: minter-socket
