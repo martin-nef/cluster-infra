@@ -1,5 +1,5 @@
-# Break-glass v1: a fixed set of imperative actions the agent can request and
-# you approve from your phone. See README.md for the design and trade-offs.
+# Break-glass: a fixed set of imperative actions, in the cluster and on GitHub,
+# that the agent can request and you approve from your phone. See README.md for the design and trade-offs.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -21,3 +21,4 @@ configMapGenerator:
     namespace: ops-broker
     files:
       - broker/broker.py
+      - broker/githubops.py
