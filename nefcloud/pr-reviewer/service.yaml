@@ -1,0 +1,33 @@
+# Here rather than in the app repo, so a change there can't point another
+# hostname at the receiver or the receiver's hostname elsewhere. Only the
+# webhook path is public; /healthz stays inside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: receiver
+  namespace: pr-reviewer
+spec:
+  selector:
+    app.kubernetes.io/name: receiver
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: receiver
+  namespace: pr-reviewer
+spec:
+  rules:
+    - host: pr-reviewer.nefcloud.top
+      http:
+        paths:
+          - path: /webhook
+            pathType: Exact
+            backend:
+              service:
+                name: receiver
+                port:
+                  name: http
