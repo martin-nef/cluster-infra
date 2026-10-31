@@ -9,6 +9,12 @@ CRD's schema already limits it to a fixed verb list:
   flux-suspend      (same kinds)
   flux-resume       (same kinds)
 
+and, through a separate GitHub App whose key only the broker holds, the GitHub
+actions the agent's own App may not take (githubops.py):
+
+  github-commit-workflows, github-protect-branch,
+  github-rerun-workflow, github-dispatch-workflow
+
 The broker checks the target exists, marks the request Pending, and sends an
 ntfy notification linking to PUBLIC_URL/r/<name>. That page is behind Traefik's
 oauth2-proxy (Google) login; the broker runs the action only when someone in
@@ -30,12 +36,15 @@ It is never run late or retried.
 
 Stdlib only, so it runs on a stock python image from a ConfigMap.
 """
+import base64
 import hashlib
 import html
 import json
 import os
 import re
+import secrets
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -44,6 +53,10 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# -I leaves the script's directory off sys.path; githubops.py sits beside it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import githubops  # noqa: E402
+
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
 ALLOWED_APPROVERS = {e.strip().lower() for e in os.environ["ALLOWED_APPROVERS"].split(",") if e.strip()}
 REQUEST_TTL = int(os.environ.get("REQUEST_TTL", "900"))
@@ -51,11 +64,18 @@ MAX_PENDING = int(os.environ.get("MAX_PENDING", "3"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose repos the GitHub verbs touch
+GITHUB_APP_NAME = os.environ.get("GITHUB_APP_NAME", "martin-nef-ops")
 
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 K8S_API = "https://kubernetes.default.svc"
 NAMESPACE = "ops-broker"
 REQUESTS = f"/apis/ops.nefcloud.top/v1alpha1/namespaces/{NAMESPACE}/opsrequests"
+# The GitHub App's id, slug and key. Created by the broker itself from the setup
+# page (/github), so the key never leaves the cluster; not in git.
+GITHUB_SECRET = "ops-broker-github-app"
+SECRETS = f"/api/v1/namespaces/{NAMESPACE}/secrets"
+SETUP_TTL = 600  # seconds a started App setup may take on GitHub
 POLL = 5  # seconds between scans of the queue
 # An Approved request older than this was left by a broker that stopped mid-run
 # (running takes seconds); younger ones may still be running in another pod.
@@ -82,6 +102,7 @@ VERBS = {
     "flux-suspend": FLUX_KINDS,
     "flux-resume": FLUX_KINDS,
 }
+GITHUB_VERBS = set(githubops.VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
 POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
 FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected"}
@@ -151,6 +172,8 @@ def phase(req):
 
 def describe(req):
     s = req["spec"]
+    if s["verb"] in GITHUB_VERBS:
+        return githubops.describe(GITHUB_OWNER, s)
     t = s["target"]
     return f"{s['verb']} {t['kind']} {t['namespace']}/{t['name']}"
 
@@ -178,6 +201,8 @@ def check(req):
     """Look the target up. Returns (why it can't be run or None, the target's
     UID). Raises on transient API errors, so the next scan tries again."""
     spec = req.get("spec", {})
+    if spec.get("verb") in GITHUB_VERBS:
+        return check_github(spec), None
     target = spec.get("target", {})
     if target.get("kind") not in VERBS.get(spec.get("verb"), ()):
         return f"verb {spec.get('verb')!r} can't target kind {target.get('kind')!r}", None
@@ -195,12 +220,38 @@ def check(req):
     return None, obj["metadata"].get("uid")
 
 
+def github_app():
+    """The ops GitHub App from its Secret, or None until it's set up."""
+    try:
+        data = k8s("GET", f"{SECRETS}/{GITHUB_SECRET}")["data"]
+    except K8sError as e:
+        if e.code == 404:
+            return None
+        raise
+    d = {k: base64.b64decode(v).decode() for k, v in data.items()}
+    return githubops.App(d["app-id"], d["slug"], d["private-key.pem"], GITHUB_OWNER)
+
+
+def check_github(spec):
+    if not isinstance(spec.get("github"), dict) or "target" in spec:
+        return "GitHub verbs take spec.github, not spec.target"
+    app = github_app()
+    if app is None:
+        return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
+    try:
+        return githubops.check(app, spec)
+    except githubops.GitHubError as e:
+        if e.transient:
+            raise
+        return f"GitHub: {e}"
+
+
 def run(req):
     """Run the action. Returns a message for the status. Raises K8sError when
     the API server refused it, Unknown when it may have taken effect."""
     try:
         return act(req["spec"], req["status"].get("targetUID"))
-    except K8sError as e:
+    except (K8sError, githubops.GitHubError) as e:
         if e.transient:
             raise Unknown(str(e)) from None
         raise
@@ -209,6 +260,14 @@ def run(req):
 
 
 def act(spec, uid):
+    if spec["verb"] in GITHUB_VERBS:
+        try:
+            app = github_app()
+        except (K8sError, OSError) as e:
+            raise githubops.NothingChanged(f"reading the App's Secret: {e}") from None
+        if app is None:
+            raise githubops.NothingChanged("the ops App isn't set up")
+        return githubops.act(app, spec)
     verb, path = spec["verb"], target_path(spec)
     if verb == "delete-pod":
         # Only the pod that was checked: a StatefulSet's replacement has the same name.
@@ -388,6 +447,8 @@ code{{font-size:1.05em}} table{{border-collapse:collapse;width:100%}} td{{paddin
 .reason{{white-space:pre-wrap;border-left:3px solid #888;padding-left:.6rem}}
 form{{display:inline}} button{{font-size:1.1rem;padding:.7rem 1.4rem;margin:.6rem .6rem 0 0;border:0;border-radius:.4rem;color:#fff}}
 .approve{{background:#1a7f37}} .deny{{background:#b42318}}
+pre{{overflow-x:auto;font-size:.85rem;background:#8881;padding:.5rem}} .add{{color:#1a7f37}} .del{{color:#b42318}} .hunk{{color:#888}}
+.warn{{border-left:3px solid #b42318;padding-left:.6rem}}
 </style></head><body>{body}</body></html>"""
 
 
@@ -397,9 +458,14 @@ def e(s):
 
 def request_page(req):
     s, st = req["spec"], req.get("status", {})
-    t = s["target"]
+    github = s["verb"] in GITHUB_VERBS
+    if github:
+        target = f"<code>{e(GITHUB_OWNER)}/{e(s['github']['repo'])}</code>"
+    else:
+        t = s["target"]
+        target = f"<code>{e(t['kind'])} {e(t['namespace'])}/{e(t['name'])}</code>"
     rows = [("Verb", f"<code>{e(s['verb'])}</code>"),
-            ("Target", f"<code>{e(t['kind'])} {e(t['namespace'])}/{e(t['name'])}</code>"),
+            ("Target", target),
             ("Phase", e(st.get("phase", "new"))),
             ("Status", e(st.get("message", ""))),
             ("Created", e(req["metadata"]["creationTimestamp"]))]
@@ -409,12 +475,23 @@ def request_page(req):
             + "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
             + "</table><p>The requester's reason (their claim, not checked):</p>"
             + f"<p class=reason>{e(s['reason'])}</p>")
+    can_approve = True
+    if github and st.get("phase") == "Pending":
+        # What approving does, read live, so the page shows what will run: for a
+        # commit, the diff against the exact commit it will sit on. Decided
+        # requests skip it; their status says what happened.
+        try:
+            body += "<h2>What it does</h2>" + githubops.details(github_app(), s)
+        except Exception as err:
+            body += (f"<p class=warn>Couldn't show what this does ({e(err)}), so it can't be approved "
+                     "from here. Reload, or deny it.</p>")
+            can_approve = False
     if st.get("phase") == "Pending":
         h = e(st.get("specHash", ""))
         body += "".join(
             f'<form method=post><input type=hidden name=hash value="{h}">'
             f'<button class={d} name=decision value={d}>{d.capitalize()}</button></form>'
-            for d in ("approve", "deny"))
+            for d in ("approve", "deny") if d == "deny" or can_approve)
     return body + '<p><a href="/">All requests</a></p>'
 
 
@@ -426,7 +503,72 @@ def index_page(items):
         f'<tr><td><a href="/r/{e(r["metadata"]["name"])}">{e(r["metadata"]["name"])}</a></td>'
         f"<td><code>{e(describe(r))}</code></td><td>{e(phase(r) or 'new')}</td></tr>"
         for r in items)
-    return f"<h1>Ops requests</h1><table>{rows or '<tr><td>None yet.</td></tr>'}</table>"
+    return (f"<h1>Ops requests</h1><table>{rows or '<tr><td>None yet.</td></tr>'}</table>"
+            '<p><a href="/github">GitHub App</a></p>')
+
+
+# Started App setups: state -> (approver, deadline). In memory: the broker is
+# the only replica, and a setup lost to a restart is simply started again.
+setups = {}
+
+
+def github_page():
+    """The App's state, and a button that creates it if there is none."""
+    try:
+        app = github_app()
+    except K8sError as err:
+        return f"<p>Can't read the App's Secret: {e(err)}</p>", False
+    if app is not None:
+        return (f"<h1>GitHub App</h1><p>Set up: <code>{e(app.slug)}</code> (id {e(app.app_id)}), key in the "
+                f"<code>{GITHUB_SECRET}</code> Secret. "
+                f"{githubops.link(f'https://github.com/apps/{app.slug}/installations/new', 'Install or change repos')}. "
+                "To replace it, delete the App on GitHub and the Secret in Headlamp, then reload.</p>"
+                '<p><a href="/">All requests</a></p>'), False
+    return ("<h1>GitHub App</h1><p>The GitHub verbs need an App only this broker holds the key of. "
+            f"The button asks GitHub to create <code>{e(GITHUB_APP_NAME)}</code>, private to "
+            f"<code>{e(GITHUB_OWNER)}</code>, with: <code>{e(json.dumps(githubops.PERMISSIONS))}</code>. "
+            "GitHub hands the key straight back to this broker, which keeps it in a Secret in its own "
+            "namespace: it never reaches git, a PC or the agent.</p>"
+            '<form method=post action="/github"><button class=approve>Create the App on GitHub</button></form>'
+            '<p><a href="/">All requests</a></p>'), True
+
+
+def start_setup(approver):
+    """A page that posts the App manifest to GitHub straight away."""
+    now_ = time.time()
+    for state in [s for s, (_, deadline) in setups.items() if deadline < now_]:
+        del setups[state]
+    state = secrets.token_urlsafe(24)
+    setups[state] = (approver, now_ + SETUP_TTL)
+    target = f"https://github.com/settings/apps/new?state={urllib.parse.quote(state)}"
+    manifest = json.dumps(githubops.manifest(GITHUB_APP_NAME, PUBLIC_URL))
+    return (f'<form method=post action="{e(target)}"><input type=hidden name=manifest value="{e(manifest)}">'
+            "<p>GitHub will ask you to confirm the App's name, then send you back here.</p>"
+            "<button class=approve>Continue to GitHub</button></form>")
+
+
+def finish_setup(approver, code, state):
+    """Trade GitHub's code for the key and store it. Returns (http status, page)."""
+    started = setups.pop(state, None)
+    if started is None or started[0] != approver or started[1] < time.time():
+        return 400, "<p>This setup wasn't started from this page by you, or took too long. <a href=\"/github\">Start again</a>.</p>"
+    try:
+        creds = githubops.convert(code, GITHUB_OWNER)
+    except (githubops.GitHubError, OSError, ValueError, KeyError) as err:
+        return 502, f"<p>Not set up: {e(err)}</p>"
+    try:
+        k8s("POST", SECRETS, {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                              "metadata": {"name": GITHUB_SECRET, "namespace": NAMESPACE,
+                                           "labels": {"app": "ops-broker"}},
+                              "stringData": creds}, content_type="application/json")
+    except K8sError as err:
+        return 502, (f"<p>GitHub created {e(creds['slug'])}, but storing its key failed ({e(err)}). Delete the "
+                     "App on GitHub and start again.</p>")
+    print(json.dumps({"time": stamp(), "event": "github-app-created", "slug": creds["slug"],
+                      "id": creds["app-id"], "by": approver}), flush=True)
+    install = githubops.link(f"https://github.com/apps/{creds['slug']}/installations/new", "install it")
+    return 200, (f"<p>Created <code>{e(creds['slug'])}</code>. Now {install} on {e(GITHUB_OWNER)}. All "
+                 "repositories is fine: every token it mints is scoped to one repo and one step.</p>")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -441,9 +583,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, "ok")
         if not self.approver():
             return self.reply(403, "not an approver")
+        url = urllib.parse.urlsplit(self.path)
         try:
             if self.path == "/":
                 return self.reply(200, index_page(list_requests()), html_page=True)
+            if self.path == "/github":
+                return self.reply(200, github_page()[0], html_page=True)
+            if url.path == "/github/callback":
+                query = urllib.parse.parse_qs(url.query)
+                status, page = finish_setup(self.approver(), query.get("code", [""])[0],
+                                            query.get("state", [""])[0])
+                return self.reply(status, page, html_page=True)
             if self.path.startswith("/r/"):
                 return self.reply(200, request_page(k8s("GET", f"{REQUESTS}/{self.request_name()}")), html_page=True)
         except K8sError as err:
@@ -457,6 +607,12 @@ class Handler(BaseHTTPRequestHandler):
         # Blocks cross-site form posts; the SameSite=lax cookie mostly does too.
         if self.headers.get("Origin") != PUBLIC_URL:
             return self.reply(403, "bad origin")
+        if self.path == "/github":
+            if not github_page()[1]:
+                return self.reply(409, "the App is already set up")
+            # Only this page may post the manifest on to GitHub.
+            return self.reply(200, start_setup(approver), html_page=True,
+                              form_action="'self' https://github.com")
         if not self.path.startswith("/r/"):
             return self.reply(404, "not found")
         try:
@@ -483,14 +639,14 @@ class Handler(BaseHTTPRequestHandler):
             raise K8sError(404, "not a request name")
         return name
 
-    def reply(self, status, content, html_page=False):
+    def reply(self, status, content, html_page=False, form_action="'self'"):
         data = (PAGE.format(body=content) if html_page else content + "\n").encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8" if html_page else "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+        self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}")
         self.end_headers()
         self.wfile.write(data)
 

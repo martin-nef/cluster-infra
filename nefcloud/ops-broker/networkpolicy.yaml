@@ -69,7 +69,7 @@ spec:
       ports:
         - {protocol: TCP, port: 6443}
 ---
-# ntfy (public HTTPS). Same exceptions as the agent's internet policy.
+# ntfy and the GitHub API (public HTTPS). Same exceptions as the agent's internet policy.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

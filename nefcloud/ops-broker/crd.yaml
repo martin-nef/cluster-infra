@@ -1,7 +1,8 @@
 # An OpsRequest asks the ops broker to run one break-glass action. The schema
 # is the verb list: the API server refuses anything else before the broker
 # sees it. spec is immutable, so what you approve is what runs; status is a
-# subresource that only the broker can write.
+# subresource that only the broker can write. Cluster verbs take spec.target,
+# GitHub verbs spec.github.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -26,6 +27,7 @@ spec:
         - {name: Kind, type: string, jsonPath: .spec.target.kind}
         - {name: Namespace, type: string, jsonPath: .spec.target.namespace}
         - {name: Target, type: string, jsonPath: .spec.target.name}
+        - {name: Repo, type: string, jsonPath: .spec.github.repo}
         - {name: Phase, type: string, jsonPath: .status.phase}
         - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
       schema:
@@ -35,22 +37,33 @@ spec:
           properties:
             spec:
               type: object
-              required: [verb, target, reason]
+              required: [verb, reason]
               x-kubernetes-validations:
                 - rule: self == oldSelf
                   message: spec is immutable; create a new OpsRequest
-                - rule: self.verb != 'delete-pod' || self.target.kind == 'Pod'
+                - rule: "self.verb.startsWith('github-') ? (has(self.github) && !has(self.target)) : (has(self.target) && !has(self.github))"
+                  message: GitHub verbs take spec.github, the others spec.target
+                - rule: >-
+                    !has(self.github) || self.verb != 'github-commit-workflows' || (has(self.github.branch) && has(self.github.baseSHA) &&
+                    has(self.github.message) && has(self.github.files))
+                  message: github-commit-workflows needs github.branch, baseSHA, message and files
+                - rule: "!has(self.github) || self.verb != 'github-rerun-workflow' || has(self.github.runID)"
+                  message: github-rerun-workflow needs github.runID
+                - rule: "!has(self.github) || self.verb != 'github-dispatch-workflow' || has(self.github.workflow)"
+                  message: github-dispatch-workflow needs github.workflow
+                - rule: "!has(self.target) || self.verb != 'delete-pod' || self.target.kind == 'Pod'"
                   message: delete-pod targets a Pod
-                - rule: self.verb != 'rollout-restart' || self.target.kind in ['Deployment', 'StatefulSet', 'DaemonSet']
+                - rule: "!has(self.target) || self.verb != 'rollout-restart' || self.target.kind in ['Deployment', 'StatefulSet', 'DaemonSet']"
                   message: rollout-restart targets a Deployment, StatefulSet or DaemonSet
                 - rule: >-
-                    !(self.verb in ['flux-reconcile', 'flux-suspend', 'flux-resume']) ||
+                    !has(self.target) || !(self.verb in ['flux-reconcile', 'flux-suspend', 'flux-resume']) ||
                     self.target.kind in ['Kustomization', 'HelmRelease', 'GitRepository', 'HelmRepository']
                   message: flux verbs target a Kustomization, HelmRelease, GitRepository or HelmRepository
               properties:
                 verb:
                   type: string
-                  enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume]
+                  enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume,
+                         github-commit-workflows, github-protect-branch, github-rerun-workflow, github-dispatch-workflow]
                 target:
                   type: object
                   required: [kind, namespace, name]
@@ -66,6 +79,74 @@ spec:
                       type: string
                       maxLength: 253
                       pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                github:
+                  description: The repo (under the broker's GITHUB_OWNER) and what to do there.
+                  type: object
+                  required: [repo]
+                  properties:
+                    repo:
+                      type: string
+                      maxLength: 100
+                      pattern: ^[A-Za-z0-9_.-]+$
+                      x-kubernetes-validations:
+                        - rule: self != '.' && self != '..'
+                          message: not a repo name
+                    branch:
+                      description: github-commit-workflows; a work branch, never the default branch.
+                      type: string
+                      maxLength: 255
+                      pattern: ^[A-Za-z0-9._/-]+$
+                      x-kubernetes-validations:
+                        - rule: "!self.contains('..') && !self.startsWith('/') && !self.endsWith('/') && !self.contains('//')"
+                          message: not a branch name
+                    baseSHA:
+                      description: github-commit-workflows; the branch's head now. The commit goes on top of exactly this.
+                      type: string
+                      pattern: ^[0-9a-f]{40}$
+                    message:
+                      description: github-commit-workflows; the commit message.
+                      type: string
+                      minLength: 1
+                      maxLength: 2000
+                    files:
+                      description: github-commit-workflows; each file's new content, or delete.
+                      type: array
+                      minItems: 1
+                      maxItems: 10
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [path]
+                      items:
+                        type: object
+                        required: [path]
+                        x-kubernetes-validations:
+                          - rule: "has(self.content) != (has(self.delete) && self.delete)"
+                            message: "give either content or delete: true"
+                        properties:
+                          path:
+                            type: string
+                            maxLength: 200
+                            pattern: ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$
+                          content:
+                            type: string
+                            maxLength: 65536
+                          delete:
+                            type: boolean
+                    runID:
+                      description: github-rerun-workflow; the run whose failed jobs to re-run.
+                      type: integer
+                      minimum: 1
+                    workflow:
+                      description: github-dispatch-workflow; the workflow's file name, e.g. image.yml.
+                      type: string
+                      maxLength: 200
+                      pattern: ^[A-Za-z0-9._-]+\.ya?ml$
+                    inputs:
+                      description: github-dispatch-workflow; its workflow_dispatch inputs.
+                      type: object
+                      maxProperties: 10
+                      additionalProperties:
+                        type: string
+                        maxLength: 1000
                 reason:
                   description: Why, in a sentence or two. Shown to the approver as the requester's claim.
                   type: string
