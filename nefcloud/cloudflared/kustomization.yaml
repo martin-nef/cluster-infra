@@ -6,6 +6,7 @@ resources:
   - namespace.yaml
   - secret.yaml
   - deployment.yaml
+  - autoupdate.yaml
 
 configMapGenerator:
   - name: cloudflared-config

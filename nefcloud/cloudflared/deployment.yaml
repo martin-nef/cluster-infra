@@ -23,6 +23,7 @@ spec:
       containers:
         - name: cloudflared
           image: cloudflare/cloudflared:latest
+          imagePullPolicy: Always
           args: ["tunnel", "--config", "/etc/cloudflared/config.yaml", "run"]
           volumeMounts:
             - name: config
