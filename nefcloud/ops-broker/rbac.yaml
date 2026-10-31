@@ -42,6 +42,7 @@ subjects:
     namespace: ops-broker
 ---
 # Its own queue: read requests, write their status, delete old ones.
+# The pod's two containers (broker and minter) share this ServiceAccount.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -54,16 +55,13 @@ rules:
   - apiGroups: [ops.nefcloud.top]
     resources: [opsrequests/status]
     verbs: [get, patch]
-  # The GitHub App's key: the broker creates it from the setup page (create
-  # can't be limited to a name, so any Secret in this namespace) and reads only
-  # that one. Not the ntfy Secret, which Flux gives the pod as an env var.
+  # The GitHub App's key: the minter sidecar stores it from the setup page
+  # (create can't be limited to a name, so any Secret in this namespace). No
+  # get: only the minter reads it, through its Secret volume, which the kubelet
+  # fills in. Not the ntfy Secret, which Flux gives the pod as an env var.
   - apiGroups: [""]
     resources: [secrets]
     verbs: [create]
-  - apiGroups: [""]
-    resources: [secrets]
-    resourceNames: [ops-broker-github-app]
-    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
