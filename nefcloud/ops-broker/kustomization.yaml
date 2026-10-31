@@ -1,0 +1,23 @@
+# Break-glass v1: a fixed set of imperative actions the agent can request and
+# you approve from your phone. See README.md for the design and trade-offs.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - crd.yaml
+  - admission.yaml
+  - rbac.yaml
+  - networkpolicy.yaml
+  - secrets.yaml
+  - deployment.yaml
+  - ingress.yaml
+configMapGenerator:
+  # Hashed: an edit to either rolls the pod.
+  - name: ops-broker-config
+    namespace: ops-broker
+    envs:
+      - config.env
+  - name: ops-broker-code
+    namespace: ops-broker
+    files:
+      - broker/broker.py

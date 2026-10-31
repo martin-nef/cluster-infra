@@ -1,0 +1,85 @@
+# An OpsRequest asks the ops broker to run one break-glass action. The schema
+# is the verb list: the API server refuses anything else before the broker
+# sees it. spec is immutable, so what you approve is what runs; status is a
+# subresource that only the broker can write.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: opsrequests.ops.nefcloud.top
+spec:
+  group: ops.nefcloud.top
+  scope: Namespaced
+  names:
+    kind: OpsRequest
+    listKind: OpsRequestList
+    plural: opsrequests
+    singular: opsrequest
+    shortNames: [opsreq]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Verb, type: string, jsonPath: .spec.verb}
+        - {name: Kind, type: string, jsonPath: .spec.target.kind}
+        - {name: Namespace, type: string, jsonPath: .spec.target.namespace}
+        - {name: Target, type: string, jsonPath: .spec.target.name}
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [verb, target, reason]
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: spec is immutable; create a new OpsRequest
+                - rule: self.verb != 'delete-pod' || self.target.kind == 'Pod'
+                  message: delete-pod targets a Pod
+                - rule: self.verb != 'rollout-restart' || self.target.kind in ['Deployment', 'StatefulSet', 'DaemonSet']
+                  message: rollout-restart targets a Deployment, StatefulSet or DaemonSet
+                - rule: >-
+                    !(self.verb in ['flux-reconcile', 'flux-suspend', 'flux-resume']) ||
+                    self.target.kind in ['Kustomization', 'HelmRelease', 'GitRepository', 'HelmRepository']
+                  message: flux verbs target a Kustomization, HelmRelease, GitRepository or HelmRepository
+              properties:
+                verb:
+                  type: string
+                  enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume]
+                target:
+                  type: object
+                  required: [kind, namespace, name]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [Pod, Deployment, StatefulSet, DaemonSet, Kustomization, HelmRelease, GitRepository, HelmRepository]
+                    namespace:
+                      type: string
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    name:
+                      type: string
+                      maxLength: 253
+                      pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                reason:
+                  description: Why, in a sentence or two. Shown to the approver as the requester's claim.
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected]
+                message: {type: string}
+                specHash: {type: string}
+                targetUID: {type: string}
+                decidedBy: {type: string}
+                decidedAt: {type: string, format: date-time}
+                finishedAt: {type: string, format: date-time}

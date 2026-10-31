@@ -1,0 +1,92 @@
+# Default deny, then one policy per exception, as in claude-remote/.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ops-broker
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# The approval page trusts X-Auth-Request-Email, which is only set by Traefik's
+# oauth2-proxy forwardAuth. Anything that reached the pod another way could
+# forge it, so only Traefik may connect. The agent's own egress policy already
+# refuses 10.0.0.0/8; this is the broker's side of the same rule.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-traefik
+  namespace: ops-broker
+spec:
+  podSelector:
+    matchLabels:
+      app: ops-broker
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: ops-broker
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# The apiserver: endpoints are the k3s servers' tailnet IPs (see the comment in
+# claude-remote/networkpolicy.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apiserver
+  namespace: ops-broker
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: {cidr: 100.64.0.0/10}
+      ports:
+        - {protocol: TCP, port: 6443}
+---
+# ntfy (public HTTPS). Same exceptions as the agent's internet policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-internet-https
+  namespace: ops-broker
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - {protocol: TCP, port: 443}
