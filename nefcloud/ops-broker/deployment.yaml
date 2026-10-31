@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ops-broker
+  namespace: ops-broker
+spec:
+  replicas: 1
+  # One broker at a time: its lock is what makes approve-then-run happen once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ops-broker
+  template:
+    metadata:
+      labels:
+        app: ops-broker
+    spec:
+      serviceAccountName: ops-broker
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: broker
+          # Multi-arch index digest, the same one cv-current's webhook runs.
+          image: python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+          command: [python, -I, /app/broker.py]
+          envFrom:
+            - configMapRef:
+                name: ops-broker-config
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            # Optional: without it, requests wait on the page unannounced.
+            - name: NTFY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ops-broker-ntfy
+                  key: url
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: ops-broker-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ops-broker
+  namespace: ops-broker
+spec:
+  selector:
+    app: ops-broker
+  ports:
+    - port: 80
+      targetPort: 8080

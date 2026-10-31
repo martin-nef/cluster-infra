@@ -10,3 +10,4 @@ resources:
   - traefik
   - headlamp
   - claude-remote
+  - ops-broker

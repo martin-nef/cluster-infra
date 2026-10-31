@@ -111,3 +111,31 @@ subjects:
   - kind: ServiceAccount
     name: claude-remote-deployer
     namespace: flux-system
+---
+# Break-glass v1: the agent may ask the ops broker (nefcloud/ops-broker/) for
+# one of its fixed actions. It can file and read requests, not change, delete
+# or approve them: status is a subresource it has no access to, and approval
+# happens on a page behind your Google login.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: claude-remote-ops-requests
+  namespace: ops-broker
+rules:
+  - apiGroups: [ops.nefcloud.top]
+    resources: [opsrequests]
+    verbs: [create, get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: claude-remote-ops-requests
+  namespace: ops-broker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: claude-remote-ops-requests
+subjects:
+  - kind: ServiceAccount
+    name: claude-remote
+    namespace: claude-remote

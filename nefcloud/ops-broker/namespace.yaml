@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ops-broker
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+# The pending cap in the broker keeps notifications down; this keeps the
+# number of stored requests bounded even if the broker is down.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: opsrequests
+  namespace: ops-broker
+spec:
+  hard:
+    count/opsrequests.ops.nefcloud.top: "200"
