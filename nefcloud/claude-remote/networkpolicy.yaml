@@ -48,8 +48,8 @@ spec:
       ports:
         - {protocol: TCP, port: 6443}
 ---
-# The internet over HTTP(S). Public addresses only: not the pod/service
-# network, the LAN, the tailnet or OCI's instance metadata.
+# The internet over HTTP(S): public addresses only. Between them, the three
+# RFC 1918 blocks cover the home LAN, whichever range its router uses.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -63,11 +63,11 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
-              - 100.64.0.0/10
-              - 169.254.0.0/16
+              - 10.0.0.0/8      # RFC 1918: k3s pods (10.42.0.0/16) and Services (10.43.0.0/16), and any 10.x LAN or OCI VCN
+              - 172.16.0.0/12   # RFC 1918: other private networks, e.g. Docker bridges on the nodes (172.17.0.0/16)
+              - 192.168.0.0/16  # RFC 1918: home LAN (router, NAS, other devices next to shitbox)
+              - 100.64.0.0/10   # CGNAT range Tailscale uses: every node's tailnet IP and all your other devices
+              - 169.254.0.0/16  # link-local: cloud instance metadata (OCI's 169.254.169.254 serves instance credentials)
       ports:
         - {protocol: TCP, port: 443}
         - {protocol: TCP, port: 80}
