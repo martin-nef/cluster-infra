@@ -1,0 +1,113 @@
+# The agent: read-only access to the cluster, never Secrets.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claude-remote
+  namespace: claude-remote
+---
+# Built-in view: namespaced resources read-only, minus Secrets, exec and
+# port-forward. Flux's CRDs aggregate into it (flux-view-flux-system).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: claude-remote-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: claude-remote
+    namespace: claude-remote
+---
+# What view leaves out that debugging the cluster needs: cluster-scoped
+# objects, metrics, RBAC and the CRDs of Traefik, Tailscale and k3s.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: claude-remote-read
+rules:
+  - apiGroups: [""]
+    resources: [nodes, persistentvolumes]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses, volumeattachments, csidrivers, csinodes]
+    verbs: [get, list, watch]
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+  - apiGroups: [apiregistration.k8s.io]
+    resources: [apiservices]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [nodes, pods]
+    verbs: [get, list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings, clusterroles, clusterrolebindings]
+    verbs: [get, list, watch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingwebhookconfigurations, mutatingwebhookconfigurations]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingressclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [traefik.io, tailscale.com, helm.cattle.io]
+    resources: ["*"]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: claude-remote-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: claude-remote-read
+subjects:
+  - kind: ServiceAccount
+    name: claude-remote
+    namespace: claude-remote
+---
+# The account Flux impersonates to apply the app repo (spec.serviceAccountName
+# of nefcloud/apps/claude-remote.yaml; it must be in the Kustomization's
+# namespace). Workload kinds only: no RBAC, NetworkPolicies, Services, quotas
+# or namespaces, so a change to the app repo can't widen the agent's access.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claude-remote-deployer
+  namespace: flux-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: claude-remote-deployer
+  namespace: claude-remote
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, secrets, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Health checks of what it applied.
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: claude-remote-deployer
+  namespace: claude-remote
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: claude-remote-deployer
+subjects:
+  - kind: ServiceAccount
+    name: claude-remote-deployer
+    namespace: flux-system

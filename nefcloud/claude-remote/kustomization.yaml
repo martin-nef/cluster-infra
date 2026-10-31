@@ -1,0 +1,12 @@
+# The sandbox of the always-on Claude Code agent (martin-nef/claude-remote).
+# It lives here, not in the app repo, because the agent can open PRs to its own
+# repo: whatever limits it must not be changeable from there. The app repo's
+# deploy/ is applied as claude-remote-deployer (see rbac.yaml), which can only
+# manage the workload inside the namespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - networkpolicy.yaml
+  - quota.yaml

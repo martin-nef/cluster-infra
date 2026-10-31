@@ -7,3 +7,4 @@ resources:
   - runescape.yaml
   - project-zomboid.yaml
   - cv-current.yaml
+  - claude-remote.yaml

@@ -9,3 +9,4 @@ resources:
   - cloudflared
   - traefik
   - headlamp
+  - claude-remote
