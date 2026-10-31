@@ -24,3 +24,35 @@ spec:
   sourceRef:
     kind: GitRepository
     name: claude-remote
+  decryption:
+    provider: sops
+    secretRef:
+      name: claude-remote-sops-age
+  # The agent can open PRs to its own repo, so Flux applies it as an account
+  # that can only manage its workload in its namespace; the sandbox itself
+  # (RBAC, NetworkPolicy, quota) is nefcloud/claude-remote/ in this repo.
+  serviceAccountName: claude-remote-deployer
+  targetNamespace: claude-remote
+  patches:
+    # local-path pins the PVC (and the claude.ai login on it) to the first
+    # node the pod lands on: keep that off shitbox and its game servers.
+    - target:
+        kind: Deployment
+        name: claude-remote
+      patch: |
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: claude-remote
+        spec:
+          template:
+            spec:
+              affinity:
+                nodeAffinity:
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                    - weight: 100
+                      preference:
+                        matchExpressions:
+                          - key: kubernetes.io/hostname
+                            operator: NotIn
+                            values: [shitbox]

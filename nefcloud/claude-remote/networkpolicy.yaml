@@ -1,0 +1,44 @@
+# Egress allow-list for every pod in the namespace; no ingress at all (Remote
+# Control only makes outbound HTTPS calls). Policies are additive, which is why
+# the app repo's deployer can't create them.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-egress
+  namespace: claude-remote
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # The apiserver, for read-only kubectl: the endpoints of the kubernetes
+    # Service (`kubectl get endpointslices -l kubernetes.io/service-name=kubernetes`),
+    # i.e. the control-plane nodes' tailnet IPs. Update them with the nodes.
+    - to:
+        - ipBlock: {cidr: 100.102.128.57/32}  # shitbox
+        - ipBlock: {cidr: 100.109.118.21/32}  # oci-big-1
+      ports:
+        - {protocol: TCP, port: 6443}
+    # The internet over HTTP(S), but not the pod/service network, the LAN, the
+    # tailnet (100.64.0.0/10, the nodes included) or OCI's instance metadata.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 80}

@@ -1,0 +1,37 @@
+# Caps what the app repo can ask for, whatever its manifests say: live game
+# servers share these nodes.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: agent
+  namespace: claude-remote
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "3"
+    limits.memory: 6Gi
+    requests.storage: 50Gi
+    persistentvolumeclaims: "2"
+    pods: "4"
+    services: "0"
+---
+# Defaults for containers without resources (the quota rejects pods whose
+# containers lack limits), and a per-container ceiling.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: agent
+  namespace: claude-remote
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      default:
+        cpu: 500m
+        memory: 512Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
