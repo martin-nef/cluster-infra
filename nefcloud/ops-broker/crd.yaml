@@ -189,7 +189,7 @@ spec:
                   maxLength: 253
                 ttlSeconds:
                   description: >-
-                    How long it may wait for a decision. Default the broker's REQUEST_TTL (15 min);
+                    How long it may wait for a decision. Default the broker's REQUEST_TTL (4 h);
                     capped at its MAX_TTL (12 h). An agent that runs at night asks for long enough to
                     reach the morning.
                   type: integer
