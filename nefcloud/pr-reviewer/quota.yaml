@@ -1,0 +1,37 @@
+# Caps what the receiver and the app repo can ask for, whatever their manifests
+# say: live game servers share these nodes. A Job pod's effective request is
+# its largest step (the agent), so this fits the receiver and two reviews.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: reviewer
+  namespace: pr-reviewer
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "5"
+    limits.memory: 5Gi
+    pods: "4"
+    # Running, queued and finished (kept a day): a receiver bug can't flood etcd.
+    count/jobs.batch: "60"
+    persistentvolumeclaims: "0"
+    services: "1"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: reviewer
+  namespace: pr-reviewer
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      default:
+        cpu: 500m
+        memory: 512Mi
+      max:
+        cpu: "2"
+        memory: 2Gi

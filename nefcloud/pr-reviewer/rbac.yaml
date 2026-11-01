@@ -1,0 +1,77 @@
+# The receiver manages the review Jobs in this namespace (create, list to see
+# what runs, patch to resume or fold into a queued one, delete when a PR
+# closes) and nothing else. The Jobs run as the namespace's default
+# ServiceAccount with no token mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: receiver
+  namespace: pr-reviewer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: receiver
+  namespace: pr-reviewer
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, list, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: receiver
+  namespace: pr-reviewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: receiver
+subjects:
+  - kind: ServiceAccount
+    name: receiver
+    namespace: pr-reviewer
+---
+# The account Flux impersonates to apply the app repo (spec.serviceAccountName
+# of nefcloud/apps/pr-reviewer.yaml). Workload kinds only: no RBAC,
+# NetworkPolicies, Services, Ingresses, Jobs, quotas or namespaces, so a change
+# to the app repo can't widen the reviewer's access or claim another hostname.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pr-reviewer-deployer
+  namespace: flux-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pr-reviewer-deployer
+  namespace: pr-reviewer
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, secrets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Health checks of what it applied.
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pr-reviewer-deployer
+  namespace: pr-reviewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pr-reviewer-deployer
+subjects:
+  - kind: ServiceAccount
+    name: pr-reviewer-deployer
+    namespace: flux-system

@@ -11,3 +11,4 @@ resources:
   - headlamp
   - claude-remote
   - ops-broker
+  - pr-reviewer
