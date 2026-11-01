@@ -1,6 +1,10 @@
 # Caps what the receiver and the app repo can ask for, whatever their manifests
 # say: live game servers share these nodes. A Job pod's effective request is
 # its largest step (the agent), so this fits the receiver and two reviews.
+# Ephemeral storage is the emptyDirs, logs and writable layers: unbounded, a
+# trusted review running tests could fill a node's disk and get game servers
+# evicted. pr-reviewer sets it on every container (receiver 256Mi, a review
+# pod 6Gi); anything that doesn't gets the LimitRange's 512Mi default.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -12,6 +16,8 @@ spec:
     requests.memory: 2Gi
     limits.cpu: "5"
     limits.memory: 5Gi
+    requests.ephemeral-storage: 3Gi
+    limits.ephemeral-storage: 13Gi
     pods: "4"
     # Running, queued and finished (kept a day): a receiver bug can't flood etcd.
     count/jobs.batch: "60"
@@ -29,9 +35,12 @@ spec:
       defaultRequest:
         cpu: 50m
         memory: 64Mi
+        ephemeral-storage: 64Mi
       default:
         cpu: 500m
         memory: 512Mi
+        ephemeral-storage: 512Mi
       max:
         cpu: "2"
         memory: 2Gi
+        ephemeral-storage: 6Gi
