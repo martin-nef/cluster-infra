@@ -104,10 +104,13 @@ SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose repos the GitHub verbs touch
 # Every repo the ops App is installed on gets human-review statuses and the
-# ruleset that requires them, but these. The reviewer's flags there aren't
-# filed either (an agent's own still are).
+# ruleset that requires them, but these, which are fully automatic: no
+# reviewer's flags filed, and an agent's own github-human-review is rejected.
 HUMAN_REVIEW_EXCLUDE = {r.strip() for r in os.environ.get("HUMAN_REVIEW_EXCLUDE", "").split(",") if r.strip()}
 REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  # its needs_human flags count
+# GitHub logins whose Approve of a flagged PR's head signs it off, like approving
+# its request on the ops page. Yours; never an agent's.
+HUMAN_REVIEWERS = {r.strip() for r in os.environ.get("HUMAN_REVIEWERS", GITHUB_OWNER).split(",") if r.strip()}
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
 # Every this many passes, the sync also looks for repos without the ruleset.
 RULESET_EVERY = 10
@@ -349,11 +352,14 @@ def check_github(spec):
     try:
         if MINTER.status() is None:
             return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
-        if spec.get("verb") == "github-require-human-review":
-            repo = spec["github"].get("repo")
-            if repo in HUMAN_REVIEW_EXCLUDE:
-                # Its PRs get no status, so a required check would hold them all.
-                return f"{repo} is in HUMAN_REVIEW_EXCLUDE: the broker sets no human-review status there"
+        repo = spec["github"].get("repo")
+        if spec.get("verb") == "github-require-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
+            # Its PRs get no status, so a required check would hold them all.
+            return f"{repo} is in HUMAN_REVIEW_EXCLUDE: the broker sets no human-review status there"
+        if spec.get("verb") == "github-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
+            # Fully automatic: nothing would hold the PR while you looked, so
+            # you're not asked, and the agent learns that at once.
+            return f"{repo} is in HUMAN_REVIEW_EXCLUDE: its PRs merge without human review, so nobody is asked"
         return githubops.check(MINTER, spec)
     except githubops.GitHubError as e:
         if e.transient:
@@ -453,6 +459,23 @@ def file_human_review(repo, pr, head, reason):
                       "reason": reason}), flush=True)
 
 
+def signed_off_on_github(repo, pr, head, login):
+    """You approved a flagged PR's head on GitHub: its waiting request is
+    signed off too, so the agent that asked sees Succeeded, as if you'd
+    approved it on the ops page."""
+    with lock:
+        for req in human_review_requests(list_requests(), repo).get(pr, []):
+            if req["spec"]["github"].get("headSHA") != head or phase(req) not in ("", "Pending"):
+                continue
+            try:
+                set_status(req, phase="Succeeded", decidedBy=f"{login} (GitHub review)", decidedAt=stamp(),
+                           finishedAt=stamp(), message=f"signed off by approving the PR on GitHub as {login}")
+            except K8sError as e:
+                print(f"recording {req['metadata']['name']} as signed off on GitHub: {e}", flush=True)
+                continue
+            audit("succeeded", req, by=f"{login} (GitHub review)")
+
+
 def file_require(repo):
     k8s("POST", REQUESTS, {
         "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
@@ -485,10 +508,13 @@ def sync_human_review(rulesets=False):
         def recheck(pr, head, repo=repo):
             return human_review_state(head, human_review_requests(list_requests(), repo).get(pr, []))
         try:
-            to_file, OPEN_PRS[repo] = githubops.sync(
-                MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck)
+            to_file, OPEN_PRS[repo], approved = githubops.sync(
+                MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck,
+                HUMAN_REVIEWERS)
             for pr, head, reason in to_file:
                 file_human_review(repo, pr, head, reason)
+            for pr, head, login in approved:
+                signed_off_on_github(repo, pr, head, login)
         except (githubops.GitHubError, K8sError, OSError) as e:
             clean = False
             print(f"human-review sync {repo}: {e}", flush=True)

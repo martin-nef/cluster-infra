@@ -455,6 +455,23 @@ def reviewer_flag(reviews, reviewer, head):
     return reason.strip()[:500], state.get("ready", True) is not False
 
 
+def human_approval(reviews, humans, head):
+    """The login of a human in humans whose latest decisive review (Approve or
+    Request changes, not a comment) approves exactly head; else None. That's
+    a sign-off made on GitHub instead of the ops page. Only reviews the API
+    says are theirs count, and a push makes it stale (another commit_id)."""
+    humans = {h.lower() for h in humans}
+    latest = {}
+    for r in sorted(reviews, key=lambda r: r.get("submitted_at") or ""):
+        login = (r.get("user") or {}).get("login", "")
+        if login.lower() in humans and r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest[login] = r
+    for login, r in sorted(latest.items()):
+        if r["state"] == "APPROVED" and r.get("commit_id") == head:
+            return login
+    return None
+
+
 def pages(tok, path, key=None):
     """Every item of a list, page by page: a PR past the 100th still gets its
     status, and a review past the 100th still counts. key: the list is under
@@ -495,16 +512,18 @@ class Lazy:
         return self.tok(*args)
 
 
-def sync(minter, repo, desired, reviewer, recheck=None):
+def sync(minter, repo, desired, reviewer, recheck=None, humans=()):
     """Set the human-review status on every open PR head in repo to what
-    desired(pr number, head sha) says. Returns (the reviewer's flags that have
-    no request yet: [(pr number, head sha, reason)], the open PR numbers).
+    desired(pr number, head sha) says, or success where one of humans approved
+    the head on GitHub. Returns (the reviewer's flags that have no request yet:
+    [(pr number, head sha, reason)], the open PR numbers, the GitHub approvals:
+    [(pr number, head sha, login)]).
     desired returns (state, description, flagged), flagged meaning a request
     covers this head. recheck(pr number, head sha) is asked again, from fresh
     requests, before a success is turned pending: a sign-off may have landed
     since desired's were read. Reads with a read-only token; one that can write
     statuses is minted only if a status has to change."""
-    to_file, numbers = [], set()
+    to_file, numbers, approved = [], set(), []
     with minter.token(repo, "github-human-review", "sync") as tok, \
             Lazy(lambda: minter.token(repo, "github-human-review", "write")) as write:
         for pr in pages(tok, "/pulls?state=open"):
@@ -512,23 +531,33 @@ def sync(minter, repo, desired, reviewer, recheck=None):
             numbers.add(number)
             state, description, flagged = desired(number, head)
             reason = None
+            # Already signed off, or nothing to look at: no reviews read.
+            reviews = pages(tok, f"/pulls/{number}/reviews") if state == "pending" or not flagged else []
+            login = human_approval(reviews, humans, head)
             if not flagged:
-                flag = reviewer_flag(pages(tok, f"/pulls/{number}/reviews"), reviewer, head)
+                flag = reviewer_flag(reviews, reviewer, head)
                 if flag:
                     reason, ready = flag
                     if ready:
-                        to_file.append((number, head, reason))
+                        if not login:  # you've already looked: nothing to file
+                            to_file.append((number, head, reason))
                         state, description = "pending", f"human review required: {reason}"
                     else:
                         # Held, but nobody is pinged until the author has done what's required.
                         state, description = "pending", f"human review after the required changes: {reason}"
+            if state == "pending" and login:
+                # Worded as human_review_state words the request it signs off,
+                # so the next pass writes nothing.
+                state, description = "success", f"signed off by {login} (GitHub review)"
+                if flagged:
+                    approved.append((number, head, login))
             current = tok("GET", f"/commits/{head}/status")
             mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
             if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
                 state, description, _ = recheck(number, head)
             if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
                 write("POST", f"/statuses/{head}", status_body(state, description))
-    return to_file, numbers
+    return to_file, numbers, approved
 
 
 # --- the approval page ---------------------------------------------------------
