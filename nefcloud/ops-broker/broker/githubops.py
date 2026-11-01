@@ -357,7 +357,10 @@ def act(minter, spec, code=None):
     with tok:
         if spec["verb"] == "github-require-human-review":
             return act_require(tok, minter.status()["app_id"])
-        return ACTS[spec["verb"]](tok, g)
+        done = ACTS[spec["verb"]](tok, g)
+    if spec["verb"] == "github-human-review":
+        done += approve_pr(minter, g)
+    return done
 
 
 def act_commit(tok, g):
@@ -414,6 +417,22 @@ def act_require(tok, app_id):
         raise NothingChanged(f"a {HUMAN_REVIEW} ruleset appeared since the request; left it alone")
     made = tok("POST", "/rulesets", ruleset(app_id))
     return f"added the {HUMAN_REVIEW} ruleset (id {made.get('id')})"
+
+
+def approve_pr(minter, g):
+    """After a sign-off, approve the PR on GitHub as the ops App, so the one
+    approval GitHub requires is there too: a PR the reviewer flagged gets a
+    comment from it, not an Approve, and its author can't approve its own.
+    A separate token and step: the sign-off (the status) stands even if this
+    fails, e.g. before the App has pull_requests: write. Returns a note."""
+    try:
+        with minter.token(g["repo"], "github-human-review", "approve") as tok:
+            tok("POST", f"/pulls/{int(g['pr'])}/reviews",
+                {"commit_id": g["headSHA"], "event": "APPROVE",
+                 "body": "Human review signed off on the ops page, for exactly this commit."})
+    except GitHubError as e:
+        return f"; not approved on GitHub: {e}"
+    return "; approved on GitHub"
 
 
 def status_body(state, description):

@@ -253,6 +253,9 @@ class FakeGitHub:
                 return page(found) if isinstance(found, list) else copy.deepcopy(found)
         if sub.startswith("/commits/") and sub.endswith("/status"):
             return {"statuses": copy.deepcopy(self.statuses.get(sub.split("/")[2], []))}
+        if sub.startswith("/pulls/") and sub.endswith("/reviews") and method == "POST":
+            self.reviews[int(sub.split("/")[2])].append({**body, "user": {"login": "ops[bot]"}, "state": "APPROVED"})
+            return {}
         if sub.startswith("/statuses/") and method == "POST":
             self.statuses.setdefault(sub.split("/")[2], []).insert(0, dict(body))
             return {}
@@ -1185,6 +1188,26 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual((code, self.api.status("hr1")["phase"]), (200, "Succeeded"))
         self.assertEqual(self.status(), "success")  # set by the approval itself
         broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_the_sign_off_approves_the_pr_on_github(self):
+        self.flag()
+        broker.scan()
+        code, msg = broker.decide("hr1", "approve", self.api.status("hr1")["specHash"], APPROVER)
+        self.assertEqual(code, 200)
+        self.assertIn("approved on GitHub", self.api.status("hr1")["message"])
+        approve = [b for m, p, b in self.gh.writes() if p.endswith("/pulls/5/reviews")]
+        self.assertEqual([(b["commit_id"], b["event"]) for b in approve], [(HEAD, "APPROVE")])
+        # With its own token, pull_requests: write and nothing else.
+        self.assertIn((["web"], {"pull_requests": "write"}), self.gh.tokens)
+
+    def test_a_failed_approve_leaves_the_sign_off(self):
+        self.flag()
+        broker.scan()
+        self.gh.fail[("POST", f"{REPO}/pulls/5/reviews")] = broker.githubops.GitHubError(403, "Resource not accessible")
+        code, _ = broker.decide("hr1", "approve", self.api.status("hr1")["specHash"], APPROVER)
+        self.assertEqual((code, self.api.status("hr1")["phase"]), (200, "Succeeded"))
+        self.assertIn("not approved on GitHub", self.api.status("hr1")["message"])
         self.assertEqual(self.status(), "success")
 
     def test_tokens(self):
