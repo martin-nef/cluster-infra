@@ -121,7 +121,7 @@ Agents merge their own PRs once the PR reviewer approves (roadmap: *Autonomous m
 
 ### Every repo, with exceptions
 
-There's no list of repos to keep up to date. Any agent can flag a PR on any repo, so the default is everything the ops App is installed on: a status on every open PR, the reviewer's flags filed (ntfy), and the ruleset, which the broker asks you to add. The one exception is `HUMAN_REVIEW_EXCLUDE` in `config.env`: no status, no reviewer flags filed (an agent's own request still is), and no ruleset (a request to add one is rejected).
+There's no list of repos to keep up to date. Any agent can flag a PR on any repo, so the default is everything the ops App is installed on: a status on every open PR, the reviewer's flags filed (ntfy), and the ruleset, which the broker asks you to add. The one exception is `HUMAN_REVIEW_EXCLUDE` in `config.env`, for repos that are **fully automatic**. They get no status and no ruleset, the reviewer's flags aren't filed, and an agent's own `github-human-review` request is rejected at once ("its PRs merge without human review"), so it never pings you. The agent learns straight away that nobody will look, instead of waiting on a review that holds nothing. A request to add the ruleset there is rejected too. Considered: letting agents still ask on an excluded repo. But nothing would hold the PR while you looked, so one agent could wait on you while another merged.
 
 Archived repos are skipped. So are repos with no open issues or PRs (`open_issues_count` is 0): nothing to set, and no calls spent on them.
 
