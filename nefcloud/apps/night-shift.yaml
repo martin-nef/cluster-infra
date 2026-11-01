@@ -28,6 +28,9 @@ spec:
   # in its namespace; the sandbox (RBAC, NetworkPolicy, quota, PVC) is
   # nefcloud/night-shift/. Written by hand, not by flux.sh, for these two
   # fields; flux.sh still makes the deploy key and night-shift-auth.
-  # The decryption block comes with the app's SOPS key (CLAUDE.md, SOPS).
+  decryption:
+    provider: sops
+    secretRef:
+      name: night-shift-sops-age
   serviceAccountName: night-shift-deployer
   targetNamespace: night-shift
