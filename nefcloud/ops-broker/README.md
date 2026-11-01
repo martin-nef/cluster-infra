@@ -50,7 +50,7 @@ GitHub requests take `spec.github` instead of `spec.target`. `repo` is a repo na
 | `github-dispatch-workflow` | `repo`, `workflow` (file name), `inputs` | Runs a `workflow_dispatch` workflow on the default branch. |
 | `github-create-repo` | `repo`, `private` (default `true`), `description` | Creates `GITHUB_OWNER/<repo>` with a README as its first commit, so it has a default branch to protect. Rejected if the name is taken. |
 | `github-human-review` | `repo`, `pr`, `headSHA` | Signs off a PR an agent flagged as needing a human: its `human-review` status on exactly `headSHA` turns success. Rejected at approval if the PR has moved on. See [Human review required](#human-review-required). |
-| `github-require-human-review` | `repo` | Adds the standard `human-review` ruleset, which makes that check required on the default branch. Rejected if the repo has a ruleset of that name, or is in `HUMAN_REVIEW_EXCLUDE` or `HUMAN_REVIEW_ADVISORY`. The broker files these itself; see [Human review required](#human-review-required). |
+| `github-require-human-review` | `repo` | Adds the standard `human-review` ruleset, which makes that check required on the default branch. Rejected if the repo has a ruleset of that name, or is in `HUMAN_REVIEW_EXCLUDE`. The broker files these itself; see [Human review required](#human-review-required). |
 
 The page shows what approving would do, read live from GitHub: for a commit, the diff against `baseSHA`; for a run, which run it is and how it ended; for protection, the exact rule. If it can't load that, it offers only Deny.
 
@@ -116,21 +116,15 @@ Agents merge their own PRs once the PR reviewer approves (roadmap: *Autonomous m
 
 ### Every repo, with exceptions
 
-There's no list of repos to keep up to date. Any agent can flag a PR on any repo, so the default is everything the ops App is installed on. Two lists in `config.env` set the exceptions:
-
-| | Status on its PRs | Reviewer's flags filed (ntfy) | Ruleset (a flag blocks the merge) |
-|---|---|---|---|
-| default | yes | yes | yes, the broker asks you to add it |
-| `HUMAN_REVIEW_ADVISORY` | yes | yes | no: you're told, but the PR can still merge |
-| `HUMAN_REVIEW_EXCLUDE` | no | no (an agent's own request still is) | no, and a request to add one is rejected |
+There's no list of repos to keep up to date. Any agent can flag a PR on any repo, so the default is everything the ops App is installed on: a status on every open PR, the reviewer's flags filed (ntfy), and the ruleset, which the broker asks you to add. The one exception is `HUMAN_REVIEW_EXCLUDE` in `config.env`: no status, no reviewer flags filed (an agent's own request still is), and no ruleset (a request to add one is rejected).
 
 Archived repos are skipped. So are repos with no open issues or PRs (`open_issues_count` is 0): nothing to set, and no calls spent on them.
 
-**The ruleset, the same everywhere.** Every 10th sync pass (`RULESET_EVERY`, about every 10 minutes), the broker lists each covered repo's rulesets. For each repo, not advisory, with no ruleset named `human-review` and no `github-require-human-review` request yet, it files one. You approve it from the ntfy link like anything else, and the page shows the exact ruleset. That's both the rollout and how a new repo gets covered. Some limits:
+**The ruleset, the same everywhere.** Every 10th sync pass (`RULESET_EVERY`, about every 10 minutes), the broker lists each covered repo's rulesets. For each repo with no ruleset named `human-review` and no `github-require-human-review` request yet, it files one. You approve it from the ntfy link like anything else, and the page shows the exact ruleset. That's both the rollout and how a new repo gets covered. Some limits:
 
 - At most `RULESET_BATCH` (5) of them wait at once, so the broker's 10 pending slots stay free for flags. The rest come in the next round.
-- A repo with any such request already, in any phase, isn't asked about again until retention deletes it. A **Denied** one means "not here" for 90 days, Expired or Rejected for 7. To say no for good, add the repo to `HUMAN_REVIEW_ADVISORY` or `HUMAN_REVIEW_EXCLUDE`.
-- It files only after a pass that set every status it had to. If the App can't write statuses (permission not accepted), a required check would hold every PR, so nothing is filed.
+- A repo with any such request already, in any phase, isn't asked about again until retention deletes it. A **Denied** one means "not here" for 90 days, Expired or Rejected for 7. To say no for good, add the repo to `HUMAN_REVIEW_EXCLUDE`.
+- It files only after a pass that set every status it had to. It also first mints (and revokes) a status-write token for that repo, which fails if the App can't write statuses there. Without that permission, a required check would hold every PR, so nothing is filed.
 - Only the name is compared. A `human-review` ruleset you've edited by hand is left alone, and a fix to the definition reaches only repos that don't have it yet. To roll a change out, delete the old rulesets and let the broker ask again.
 
 ### Rollout
@@ -156,14 +150,14 @@ Archived repos are skipped. So are repos with no open issues or PRs (`open_issue
    gh api repos/martin-nef/<repo>/rulesets -q '.[].name'    # human-review
    ```
 
-To exempt a repo, add it to `HUMAN_REVIEW_ADVISORY` or `HUMAN_REVIEW_EXCLUDE` before step 3, or delete its ruleset on GitHub afterwards (*Settings → Rules → Rulesets*).
+To exempt a repo, add it to `HUMAN_REVIEW_EXCLUDE` before step 3, or delete its ruleset on GitHub afterwards (*Settings → Rules → Rulesets*).
 
 Considered and rejected:
 
 - **A `needs-human` label.** Anyone with `issues: write` can remove a label, the agents included.
 - **The reviewer's Request changes.** The author agent has `pull_requests: write`, and can dismiss it.
 - **GitHub auto-merge as the gate.** It can merge before a non-Actions check has started, and it only waits for required checks, which are hard to keep right when checks are conditional. Here there's exactly one required check, the same on every repo and never conditional.
-- **A list of repos to cover (`HUMAN_REVIEW_REPOS`, until #43).** It was empty after the merge of #39, so the reviewer's flags were never filed and you got no ntfy. Opting in per repo made the safe default "off". Now the default is "on" wherever the App is installed, and the lists are only for exceptions.
+- **A list of repos to cover (`HUMAN_REVIEW_REPOS`, until #43).** It was empty after the merge of #39, so the reviewer's flags were never filed and you got no ntfy. Opting in per repo made the safe default "off". Now the default is "on" wherever the App is installed, and `HUMAN_REVIEW_EXCLUDE` is only for exceptions.
 - **One ruleset for every repo at once.** GitHub only has rulesets across repos for organizations and enterprises. These repos are under a personal account, which has per-repo rulesets only. Moving them to the `nefcloud` org would allow one org ruleset, with exceptions by name or custom property. But it would mean re-pointing Flux, both Apps' installations and every clone, for what the broker's one definition already gives. If the repos ever move to the org, make this an org ruleset and drop `github-require-human-review`.
 - **The broker adding rulesets by itself, without asking.** It changes a repo's settings, and every write the ops App makes is one you approved. One tap per repo, once, keeps that rule.
 - **Adding the ruleset in `github-protect-branch`.** New repos would get it in the same approval, but repos that are already protected wouldn't, and that verb only ever acts where there's no rule. The broker asking for missing rulesets covers both.
@@ -171,8 +165,8 @@ Considered and rejected:
 
 Trade-offs:
 
-- **One sync per minute** costs one token, one call to list the installed repos, one per repo with open issues or PRs, and about two per open PR, plus one more per PR without a flag (its reviews). The ruleset round adds one call per repo every 10 minutes. That's fine at this scale, and the App's 5,000 calls an hour are the limit.
-- **The sync's token covers every repo** (`pull_requests: read`, `statuses: write`, `metadata: read`), not one at a time. A per-repo token would cost a mint and a revoke per repo per minute, about half the hourly budget with 15 repos. It's still revoked at the end of each pass, and the minter refuses that step for a single repo, so no other code path gets it.
+- **Tokens are minted as they're needed**, each for one repo, and revoked when the step is done. The only token for every repo is the one that lists them (`metadata: read`), which can't read or change anything inside a repo. A repo with open issues or PRs gets a read-only token (`pull_requests: read`, `statuses: read`). A token that can write statuses is minted only when a status has to change, which is rare: when a PR opens, gets a new head, or is flagged or signed off. Repos with nothing open get no token at all.
+- **One sync per minute** costs about 3 calls for the list token, 3 per repo with open issues or PRs (mint, PRs, revoke), and about 2 per open PR (its status, and its reviews if it isn't flagged). A status change adds a mint, a write and a revoke. The ruleset round adds a few calls per repo every 10 minutes. With a handful of active repos that's well under the App's 5,000 calls an hour.
 - **A flag outlives its retention while its PR is open.** Retention deletes finished requests after 7 or 90 days, and a deleted flag would make the PR read as never flagged, so a `github-human-review` request is kept until the sync has seen its PR closed. A repo that's excluded or uninstalled keeps its flags. They're few, and deleting them is a decision for you, not a timer. (From the PR reviewer's review of #39.)
 - **Every page** of open PRs and of a PR's reviews is read. A sign-off that lands during a sync pass isn't overwritten: the requests are read again before a `success` would turn `pending`.
 - **The broker can create requests now**, for the reviewer's flags. That's notifications only: every request still needs you to approve it, and it has its own `PENDING_CAPS` slots (10).

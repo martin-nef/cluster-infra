@@ -1146,7 +1146,6 @@ class TestHumanReview(Served, GitHubBase):
     def setUp(self):
         super().setUp()
         for p in (mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", set()),
-                  mock.patch.object(broker, "HUMAN_REVIEW_ADVISORY", set()),
                   mock.patch.object(broker, "REVIEWER_LOGIN", REVIEWER)):
             p.start()
             self.addCleanup(p.stop)
@@ -1186,7 +1185,8 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         perms = [p for _, p in self.gh.tokens]
         self.assertIn({"pull_requests": "read"}, perms)  # the scan's check
-        self.assertIn({"pull_requests": "read", "statuses": "write"}, perms)  # sync
+        self.assertIn({"pull_requests": "read", "statuses": "read"}, perms)  # sync
+        self.assertIn({"statuses": "write"}, perms)  # sync, to set the status
         self.assertTrue(all("contents" not in p and "administration" not in p for p in perms))
 
     def test_states(self):
@@ -1338,17 +1338,24 @@ class TestHumanReview(Served, GitHubBase):
         touched = {p.split("/")[3] for _, p, _ in self.gh.calls if p.startswith("/repos/")}
         self.assertEqual(touched, {"web"})
 
-    def test_one_token_for_every_repo_per_pass(self):
+    def test_tokens_are_per_repo_and_write_only_when_a_status_changes(self):
         broker.sync_human_review()
-        self.assertEqual(self.gh.tokens, [(None, {"pull_requests": "read", "statuses": "write"})])
-        self.assertEqual(len(self.gh.revoked), 1)
+        self.assertEqual(self.gh.tokens, [(None, {"metadata": "read"}),
+                                          (["web"], {"pull_requests": "read", "statuses": "read"}),
+                                          (["web"], {"statuses": "write"})])
+        self.assertEqual(len(self.gh.revoked), 3)
+        self.gh.tokens.clear()
+        broker.sync_human_review()  # nothing changed: no write token
+        self.assertEqual([p for _, p in self.gh.tokens], [{"metadata": "read"},
+                                                          {"pull_requests": "read", "statuses": "read"}])
 
-    def test_the_sync_token_is_only_for_every_repo(self):
+    def test_only_the_list_token_is_for_every_repo(self):
         with self.assertRaises(broker.githubops.GitHubError) as cm:
-            self.minter.token("web", "github-human-review", "sync")
+            self.minter.token("web", "github-human-review", "list")
         self.assertEqual(cm.exception.code, 400)
-        with self.assertRaises(broker.githubops.GitHubError):
-            self.minter.token(None, "github-human-review", "run")
+        for step in ("sync", "write", "run"):
+            with self.assertRaises(broker.githubops.GitHubError):
+                self.minter.token(None, "github-human-review", step)
 
     def test_off_until_the_app_is_set_up(self):
         with mock.patch.object(broker.MINTER, "status", lambda: None):
@@ -1361,7 +1368,6 @@ class TestRequireHumanReview(Served, GitHubBase):
         super().setUp()
         self.gh.installed.append({"name": "cv", "open_issues_count": 0})
         for p in (mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", set()),
-                  mock.patch.object(broker, "HUMAN_REVIEW_ADVISORY", set()),
                   mock.patch.object(broker, "REVIEWER_LOGIN", REVIEWER)):
             p.start()
             self.addCleanup(p.stop)
@@ -1387,14 +1393,13 @@ class TestRequireHumanReview(Served, GitHubBase):
             broker.sync_human_review()
         self.assertEqual(self.filed(), [])
 
-    def test_a_repo_with_one_advisory_or_excluded_isnt_asked_about(self):
+    def test_a_repo_with_one_or_excluded_isnt_asked_about(self):
         self.gh.rulesets.append({"name": "human-review", "id": 1})  # the fake shares rulesets across repos
         with self.capture():
             broker.sync_human_review(rulesets=True)
         self.assertEqual(self.filed(), [])
         self.gh.rulesets.clear()
-        with self.capture(), mock.patch.object(broker, "HUMAN_REVIEW_ADVISORY", {"web"}), \
-                mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"cv"}):
+        with self.capture(), mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"web", "cv"}):
             broker.sync_human_review(rulesets=True)
         self.assertEqual(self.filed(), [])
 
@@ -1411,6 +1416,19 @@ class TestRequireHumanReview(Served, GitHubBase):
         with self.capture():
             broker.sync_human_review(rulesets=True)
         self.assertEqual(len(self.filed()), broker.RULESET_BATCH)
+
+    def test_nothing_filed_where_the_app_cant_set_statuses(self):
+        self.gh.installed = [{"name": "cv", "open_issues_count": 0}]  # no status to write this pass
+        real = self.gh.__call__
+
+        def no_statuses(method, path, token=None, body=None, **kw):
+            if "access_tokens" in path and body["permissions"] == {"statuses": "write"}:
+                raise broker.githubops.GitHubError(422, "permissions not granted")
+            return real(method, path, token, body, **kw)
+        with self.capture(), mock.patch.object(broker.githubops, "api", no_statuses), \
+                mock.patch.object(minter, "api", no_statuses):
+            broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.filed(), [])
 
     def test_nothing_filed_after_a_pass_that_couldnt_set_statuses(self):
         # A required check nobody can set would hold every PR.
@@ -1446,8 +1464,6 @@ class TestRequireHumanReview(Served, GitHubBase):
         self.gh.rulesets.clear()
         with mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"web"}):
             self.assertIn("EXCLUDE", self.admit_github("r2", "github-require-human-review", repo="web")["message"])
-        with mock.patch.object(broker, "HUMAN_REVIEW_ADVISORY", {"web"}):
-            self.assertIn("ADVISORY", self.admit_github("r3", "github-require-human-review", repo="web")["message"])
 
     def test_one_made_since_the_check_is_left_alone(self):
         st = self.admit_github("r1", "github-require-human-review", repo="web")

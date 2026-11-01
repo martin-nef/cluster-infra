@@ -91,17 +91,20 @@ TOKENS = {
     # Checks the name is free: metadata on every repo the App is installed on,
     # since the repo it names doesn't exist yet. Runs as a user action instead.
     "github-create-repo": {"check": {"metadata": "read"}},
-    # sync: every open PR's head and reviews, and its human-review status, on
-    # every repo the App is installed on (and their rulesets, by metadata).
+    # The broker's own pass: list the repos the App is installed on (every
+    # repo, metadata only), read one repo's open PRs, reviews and statuses
+    # (sync), and set a status there only when one has to change (write).
     "github-human-review": {"check": {"pull_requests": "read"}, "run": {"statuses": "write"},
-                            "sync": {"pull_requests": "read", "statuses": "write"}},
+                            "list": {"metadata": "read"},
+                            "sync": {"pull_requests": "read", "statuses": "read"},
+                            "write": {"statuses": "write"}},
     "github-require-human-review": {"check": {"administration": "read"}, "run": {"administration": "write"}},
 }
 # Verbs whose check token isn't scoped to the request's repo (it doesn't exist).
 ACCOUNT_CHECKS = {"github-create-repo"}
-# Steps whose token covers every repo, asked for with no repo: the sync covers
-# them all each pass, and one token per pass costs one mint, not one per repo.
-ACCOUNT_STEPS = {("github-human-review", "sync")}
+# Steps whose token covers every repo, asked for with no repo. Only listing
+# them: metadata can't read or change anything in a repo.
+ACCOUNT_STEPS = {("github-human-review", "list")}
 REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
 

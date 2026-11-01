@@ -24,7 +24,7 @@ with a third App (the "ops" App) whose key only the token minter holds:
                             required there. The broker files these itself.
 
 Every call uses an installation token for one repo with only the permissions
-that step needs (the sync's, for every repo: it covers them all each pass), asked of the minter sidecar (minter.py) by verb and step and
+that step needs (listing the installed repos: metadata on every repo), asked of the minter sidecar (minter.py) by verb and step and
 revoked as soon as the step is done. Checks and the approval page use
 read-only tokens; only an approved run gets write. This process never sees
 the App's key.
@@ -303,10 +303,10 @@ def check_require(tok, repo, g):
     return None
 
 
-def has_ruleset(tok, prefix=""):
+def has_ruleset(tok):
     """Whether the repo has a ruleset named human-review. Only the name is
     compared: one you've edited by hand is yours, and isn't replaced."""
-    return any(r.get("name") == HUMAN_REVIEW for r in pages(tok, f"{prefix}/rulesets?includes_parents=false"))
+    return any(r.get("name") == HUMAN_REVIEW for r in pages(tok, "/rulesets?includes_parents=false"))
 
 
 CHECKS = {
@@ -471,42 +471,63 @@ def pages(tok, path, key=None):
 
 def installed(tok):
     """[(name, its open issues and PRs)] of every unarchived repo the App is
-    installed on. tok: a token for every repo."""
+    installed on. tok: a metadata token for every repo."""
     return [(r["name"], r.get("open_issues_count", 1))
             for r in pages(tok, "/installation/repositories", "repositories") if not r.get("archived")]
 
 
-def sync(tok, owner, repo, desired, reviewer, recheck=None):
+class Lazy:
+    """A token minted on its first call, if any, and revoked with the block."""
+
+    def __init__(self, mint):
+        self.mint, self.tok = mint, None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.tok is not None:
+            self.tok.__exit__(*exc)
+
+    def __call__(self, *args):
+        if self.tok is None:
+            self.tok = self.mint()
+        return self.tok(*args)
+
+
+def sync(minter, repo, desired, reviewer, recheck=None):
     """Set the human-review status on every open PR head in repo to what
     desired(pr number, head sha) says. Returns (the reviewer's flags that have
     no request yet: [(pr number, head sha, reason)], the open PR numbers).
     desired returns (state, description, flagged), flagged meaning a request
     covers this head. recheck(pr number, head sha) is asked again, from fresh
     requests, before a success is turned pending: a sign-off may have landed
-    since desired's were read. tok: the pass's token for every repo."""
+    since desired's were read. Reads with a read-only token; one that can write
+    statuses is minted only if a status has to change."""
     to_file, numbers = [], set()
-    base = f"/repos/{q(owner)}/{q(repo)}"
-    for pr in pages(tok, f"{base}/pulls?state=open"):
-        number, head = pr["number"], pr["head"]["sha"]
-        numbers.add(number)
-        state, description, flagged = desired(number, head)
-        reason = None
-        if not flagged:
-            flag = reviewer_flag(pages(tok, f"{base}/pulls/{number}/reviews"), reviewer, head)
-            if flag:
-                reason, ready = flag
-                if ready:
-                    to_file.append((number, head, reason))
-                    state, description = "pending", f"human review required: {reason}"
-                else:
-                    # Held, but nobody is pinged until the author has done what's required.
-                    state, description = "pending", f"human review after the required changes: {reason}"
-        current = tok("GET", f"{base}/commits/{head}/status")
-        mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
-        if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
-            state, description, _ = recheck(number, head)
-        if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
-            tok("POST", f"{base}/statuses/{head}", status_body(state, description))
+    with minter.token(repo, "github-human-review", "sync") as tok, \
+            Lazy(lambda: minter.token(repo, "github-human-review", "write")) as write:
+        for pr in pages(tok, "/pulls?state=open"):
+            number, head = pr["number"], pr["head"]["sha"]
+            numbers.add(number)
+            state, description, flagged = desired(number, head)
+            reason = None
+            if not flagged:
+                flag = reviewer_flag(pages(tok, f"/pulls/{number}/reviews"), reviewer, head)
+                if flag:
+                    reason, ready = flag
+                    if ready:
+                        to_file.append((number, head, reason))
+                        state, description = "pending", f"human review required: {reason}"
+                    else:
+                        # Held, but nobody is pinged until the author has done what's required.
+                        state, description = "pending", f"human review after the required changes: {reason}"
+            current = tok("GET", f"/commits/{head}/status")
+            mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
+            if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
+                state, description, _ = recheck(number, head)
+            if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
+                write("POST", f"/statuses/{head}", status_body(state, description))
     return to_file, numbers
 
 
