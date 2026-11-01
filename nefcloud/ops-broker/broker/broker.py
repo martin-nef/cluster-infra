@@ -25,7 +25,12 @@ One verb isn't an action but a sign-off (README, "Human review required"):
 
   github-human-review   An agent flags a PR; nobody merges it until you
                         approve. The broker keeps a human-review status on
-                        every open PR head of HUMAN_REVIEW_REPOS (sync_loop).
+                        every open PR head of every repo the ops App is
+                        installed on, but HUMAN_REVIEW_EXCLUDE (sync_loop).
+  github-require-human-review
+                        Makes that check required on a repo, with the one
+                        standard ruleset. The broker files it for each
+                        covered repo that lacks one.
 
 The broker checks the target exists, marks the request Pending, and sends an
 ntfy notification linking to PUBLIC_URL/r/<name>. That page is behind Traefik's
@@ -62,6 +67,7 @@ Stdlib only, so it runs on a stock python image from a ConfigMap.
 """
 import hashlib
 import html
+import itertools
 import json
 import os
 import re
@@ -95,10 +101,17 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose repos the GitHub verbs touch
-# Repos whose open PRs get a human-review status (and should require it); empty: off.
-HUMAN_REVIEW_REPOS = [r.strip() for r in os.environ.get("HUMAN_REVIEW_REPOS", "").split(",") if r.strip()]
+# Every repo the ops App is installed on gets human-review statuses and the
+# ruleset that requires them, but these. The reviewer's flags there aren't
+# filed either (an agent's own still are).
+HUMAN_REVIEW_EXCLUDE = {r.strip() for r in os.environ.get("HUMAN_REVIEW_EXCLUDE", "").split(",") if r.strip()}
 REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  # its needs_human flags count
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
+# Every this many passes, the sync also looks for repos without the ruleset.
+RULESET_EVERY = 10
+# At most this many github-require-human-review requests wait at once, so the
+# broker's pending slots stay free for flags.
+RULESET_BATCH = 5
 # repo -> its open PR numbers, as the last sync saw them. tidy keeps a
 # github-human-review request while its PR may still be open: deleting it
 # would make the PR read as never flagged.
@@ -323,6 +336,11 @@ def check_github(spec):
     try:
         if MINTER.status() is None:
             return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
+        if spec.get("verb") == "github-require-human-review":
+            repo = spec["github"].get("repo")
+            if repo in HUMAN_REVIEW_EXCLUDE:
+                # Its PRs get no status, so a required check would hold them all.
+                return f"{repo} is in HUMAN_REVIEW_EXCLUDE: the broker sets no human-review status there"
         return githubops.check(MINTER, spec)
     except githubops.GitHubError as e:
         if e.transient:
@@ -420,13 +438,33 @@ def file_human_review(repo, pr, head, reason):
                       "reason": reason}), flush=True)
 
 
-def sync_human_review():
-    """One pass: every open PR head of HUMAN_REVIEW_REPOS gets its human-review
-    status, and reviewer flags with no request yet get one."""
-    if not HUMAN_REVIEW_REPOS or MINTER.status() is None:
+def file_require(repo):
+    k8s("POST", REQUESTS, {
+        "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
+        "metadata": {"generateName": "github-require-human-review-", "namespace": NAMESPACE},
+        "spec": {"verb": "github-require-human-review", "github": {"repo": repo},
+                 "reason": (f"{repo} has no human-review ruleset, so a PR an agent flags there can still be "
+                            "merged. Approving adds the standard one."), "ttlSeconds": MAX_TTL},
+    }, content_type="application/json")
+    print(json.dumps({"time": stamp(), "event": "filed",
+                      "action": f"github-require-human-review {GITHUB_OWNER}/{repo}"}), flush=True)
+
+
+def sync_human_review(rulesets=False):
+    """One pass over every repo the ops App is installed on, but
+    HUMAN_REVIEW_EXCLUDE: every open PR head gets its human-review status, and
+    reviewer flags with no request yet get one. rulesets: also file a
+    github-require-human-review request for repos without the ruleset."""
+    if MINTER.status() is None:
         return
     items = list_requests()
-    for repo in HUMAN_REVIEW_REPOS:
+    clean = True
+    with MINTER.token(None, "github-human-review", "list") as tok:
+        repos = [(r, n) for r, n in githubops.installed(tok) if r not in HUMAN_REVIEW_EXCLUDE]
+    for repo, open_count in repos:
+        if not open_count:
+            OPEN_PRS[repo] = set()  # no open issues or PRs: nothing to set, and no token minted for it
+            continue
         reqs = human_review_requests(items, repo)
 
         def recheck(pr, head, repo=repo):
@@ -437,13 +475,44 @@ def sync_human_review():
             for pr, head, reason in to_file:
                 file_human_review(repo, pr, head, reason)
         except (githubops.GitHubError, K8sError, OSError) as e:
+            clean = False
             print(f"human-review sync {repo}: {e}", flush=True)
+    # Only after a pass that set every status it had to: a required check the
+    # broker can't set (a missing permission) would hold every PR.
+    if rulesets and clean:
+        file_rulesets([r for r, _ in repos], items)
+
+
+def file_rulesets(repos, items):
+    """File github-require-human-review for repos without the ruleset, up to
+    RULESET_BATCH waiting at once. A repo with any such request already, in
+    any phase, isn't asked again until retention deletes it: a Denied one
+    means no for RETENTION_DAYS (HUMAN_REVIEW_EXCLUDE says it for good)."""
+    asked = {(r["spec"].get("github") or {}).get("repo"): phase(r) for r in items
+             if r["spec"].get("verb") == "github-require-human-review"}
+    room = RULESET_BATCH - sum(1 for p in asked.values() if p in ("", "Pending"))
+    for repo in repos:
+        if room <= 0:
+            return
+        if repo in asked:
+            continue
+        try:
+            # Proof the App can set the check there: the mint fails without statuses: write.
+            with MINTER.token(repo, "github-human-review", "write"):
+                pass
+            with MINTER.token(repo, "github-require-human-review", "check") as tok:
+                if githubops.has_ruleset(tok):
+                    continue
+            file_require(repo)
+            room -= 1
+        except (githubops.GitHubError, K8sError, OSError) as e:
+            print(f"human-review ruleset {repo}: {e}", flush=True)
 
 
 def sync_loop():
-    while True:
+    for n in itertools.count():
         try:
-            sync_human_review()
+            sync_human_review(rulesets=n % RULESET_EVERY == 0)
         except Exception as e:
             print(f"human-review sync: {e!r}", flush=True)
         time.sleep(SYNC_EVERY)
@@ -518,7 +587,7 @@ def tidy(req):
 
 def pr_closed(req):
     """Whether the last sync saw this flag's repo, and its PR wasn't open. Not
-    synced (yet, or the repo left HUMAN_REVIEW_REPOS): kept, to be safe."""
+    synced (yet, or the repo was excluded or uninstalled): kept, to be safe."""
     g = req["spec"].get("github") or {}
     seen = OPEN_PRS.get(g.get("repo"))
     return seen is not None and int(g.get("pr") or 0) not in seen

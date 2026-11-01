@@ -50,6 +50,7 @@ GitHub requests take `spec.github` instead of `spec.target`. `repo` is a repo na
 | `github-dispatch-workflow` | `repo`, `workflow` (file name), `inputs` | Runs a `workflow_dispatch` workflow on the default branch. |
 | `github-create-repo` | `repo`, `private` (default `true`), `description` | Creates `GITHUB_OWNER/<repo>` with a README as its first commit, so it has a default branch to protect. Rejected if the name is taken. |
 | `github-human-review` | `repo`, `pr`, `headSHA` | Signs off a PR an agent flagged as needing a human: its `human-review` status on exactly `headSHA` turns success. Rejected at approval if the PR has moved on. See [Human review required](#human-review-required). |
+| `github-require-human-review` | `repo` | Adds the standard `human-review` ruleset, which makes that check required on the default branch. Rejected if the repo has a ruleset of that name, or is in `HUMAN_REVIEW_EXCLUDE`. The broker files these itself; see [Human review required](#human-review-required). |
 
 The page shows what approving would do, read live from GitHub: for a commit, the diff against `baseSHA`; for a run, which run it is and how it ended; for protection, the exact rule. If it can't load that, it offers only Deny.
 
@@ -108,43 +109,65 @@ Can't be tested without a cluster: the mutating policy itself. After the merge, 
 Agents merge their own PRs once the PR reviewer approves (roadmap: *Autonomous merge*). This is how any of them pulls you in instead, and how a flagged PR stays unmerged until you've looked.
 
 - **Flag:** a `github-human-review` request with the PR's current head and a one-sentence reason. The interactive agent and the night shift file it like any request. The PR reviewer can't (its Jobs have no API access), so it puts `needs_human` in its review's state marker, and the broker files the request for it, as itself. Only reviews the API says are `REVIEWER_LOGIN`'s count, and only its latest one, of the current head. **You're asked once, when the PR is ready:** while the marker says `"ready": false` (the author still has required changes, or CI is red), the check is held `pending` ("human review after the required changes") but nothing is filed, so you get no ntfy. The broker files the request from the first review that says ready. A marker without `ready` (an older reviewer) files straight away.
-- **The status:** every `HUMAN_REVIEW_SYNC_SECONDS` (60), the broker sets a `human-review` commit status on every open PR head of `HUMAN_REVIEW_REPOS`. It's `success` when the PR was never flagged, or when its newest flag was signed off for exactly this head. Otherwise it's `pending`, with why: waiting for you, denied, new commits since the sign-off, or the flag expired or was rejected unanswered. A status is only written when it changes.
+- **The status:** every `HUMAN_REVIEW_SYNC_SECONDS` (60), the broker sets a `human-review` commit status on every open PR head of **every repo the ops App is installed on**, except `HUMAN_REVIEW_EXCLUDE`. It's `success` when the PR was never flagged, or when its newest flag was signed off for exactly this head. Otherwise it's `pending`, with why: waiting for you, denied, new commits since the sign-off, or the flag expired or was rejected unanswered. A status is only written when it changes.
 - **Sign-off:** approving on the page sets `success` on that head straight away. Approving re-checks the PR first: if it has moved on, nothing is signed off and the request ends `Rejected`. Deny keeps it `pending`.
 - **Once flagged, always your call.** A push after your sign-off goes back to `pending`, and only a new flag and a new sign-off clear it. An expired flag is filed again if the reviewer's flag still stands. A rejected one isn't, so a full queue can't loop.
-- **The guard is GitHub's.** Make `human-review` a required check on each repo, pinned to the ops App (`martin-nef-ops`) as its only source, so no other App or user can set it. Then no agent can merge a flagged PR, whatever it does. Admins stay exempt, so you can always merge.
+- **The guard is GitHub's.** One `human-review` ruleset makes the check required on the default branch, pinned to the ops App (`martin-nef-ops`) as its only source, so no other App or user can set it. Then no agent can merge a flagged PR, whatever it does. Repo admins bypass it, so you can always merge. The broker holds the ruleset's one definition (`githubops.ruleset`) and asks you to add it where it's missing (below).
 
-Rollout, in this order, or every PR on a repo waits for a status that never comes:
+### Every repo, with exceptions
 
-1. In the ops App's settings on GitHub, add **Pull requests: Read** and **Commit statuses: Read and write**, and accept them on the installation. Until then the sync logs a 403, and nothing else changes.
-2. List the repos in `HUMAN_REVIEW_REPOS` (`config.env`) and merge. Check that open PRs there show `human-review: success`.
-3. Make it required on each of them with a ruleset beside the branch rule, pinned to the ops App. Its id is on the App's settings page. Admins bypass it, so you can still merge:
+There's no list of repos to keep up to date. Any agent can flag a PR on any repo, so the default is everything the ops App is installed on: a status on every open PR, the reviewer's flags filed (ntfy), and the ruleset, which the broker asks you to add. The one exception is `HUMAN_REVIEW_EXCLUDE` in `config.env`: no status, no reviewer flags filed (an agent's own request still is), and no ruleset (a request to add one is rejected).
+
+Archived repos are skipped. So are repos with no open issues or PRs (`open_issues_count` is 0): nothing to set, and no calls spent on them.
+
+**The ruleset, the same everywhere.** Every 10th sync pass (`RULESET_EVERY`, about every 10 minutes), the broker lists each covered repo's rulesets. For each repo with no ruleset named `human-review` and no `github-require-human-review` request yet, it files one. You approve it from the ntfy link like anything else, and the page shows the exact ruleset. That's both the rollout and how a new repo gets covered. Some limits:
+
+- At most `RULESET_BATCH` (5) of them wait at once, so the broker's 10 pending slots stay free for flags. The rest come in the next round.
+- A repo with any such request already, in any phase, isn't asked about again until retention deletes it. A **Denied** one means "not here" for 90 days, Expired or Rejected for 7. To say no for good, add the repo to `HUMAN_REVIEW_EXCLUDE`.
+- It files only after a pass that set every status it had to. It also first mints (and revokes) a status-write token for that repo, which fails if the App can't write statuses there. Without that permission, a required check would hold every PR, so nothing is filed.
+- Only the name is compared. A `human-review` ruleset you've edited by hand is left alone, and a fix to the definition reaches only repos that don't have it yet. To roll a change out, delete the old rulesets and let the broker ask again.
+
+### Rollout
+
+1. **Install the ops App on all repos, and accept its permissions.** Open <https://github.com/settings/installations>, click **Configure** next to `martin-nef-ops`. Under *Repository access*, choose **All repositories** and **Save**. If a yellow banner asks you to review new permissions (*Pull requests: Read*, *Commit statuses: Read and write*), accept them. Without this the sync logs a 403 for each repo, and no statuses are set, so nothing is held.
+2. **Merge the PR that adds this.** Flux deploys it within a few minutes. A minute later, every open PR on every repo shows `human-review: success`. Check one:
 
    ```bash
-   APP_ID=<the ops App's id>
-   for r in <repos>; do
-     gh api -X POST repos/martin-nef/$r/rulesets --input - <<EOF
-   {"name": "human-review", "target": "branch", "enforcement": "active",
-    "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
-    "rules": [{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": false,
-      "required_status_checks": [{"context": "human-review", "integration_id": $APP_ID}]}}],
-    "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
-   EOF
-   done
+   gh pr checks <pr> -R martin-nef/<repo>    # human-review  pass  not flagged
    ```
 
-   A ruleset rather than the branch rule's own required checks: it adds one check without rewriting the rule, and it works the same on every repo.
+   And the broker's log:
+
+   ```bash
+   kubectl -n ops-broker logs deploy/ops-broker -c broker --since=10m | grep -i human-review
+   ```
+
+   No `403` lines. `filed ... github-require-human-review` lines are the next step starting.
+3. **Approve the rulesets.** You get an ntfy per repo, up to 5 at a time and more as you approve. During quiet hours they arrive as one digest at 07:00. Each page shows the ruleset. Approve each one. To see what's waiting: <https://ops.nefcloud.top/>.
+4. **Check a repo:**
+
+   ```bash
+   gh api repos/martin-nef/<repo>/rulesets -q '.[].name'    # human-review
+   ```
+
+To exempt a repo, add it to `HUMAN_REVIEW_EXCLUDE` before step 3, or delete its ruleset on GitHub afterwards (*Settings → Rules → Rulesets*).
 
 Considered and rejected:
 
 - **A `needs-human` label.** Anyone with `issues: write` can remove a label, the agents included.
 - **The reviewer's Request changes.** The author agent has `pull_requests: write`, and can dismiss it.
 - **GitHub auto-merge as the gate.** It can merge before a non-Actions check has started, and it only waits for required checks, which are hard to keep right when checks are conditional. Here there's exactly one required check, the same on every repo and never conditional.
+- **A list of repos to cover (`HUMAN_REVIEW_REPOS`, until #43).** It was empty after the merge of #39, so the reviewer's flags were never filed and you got no ntfy. Opting in per repo made the safe default "off". Now the default is "on" wherever the App is installed, and `HUMAN_REVIEW_EXCLUDE` is only for exceptions.
+- **One ruleset for every repo at once.** GitHub only has rulesets across repos for organizations and enterprises. These repos are under a personal account, which has per-repo rulesets only. Moving them to the `nefcloud` org would allow one org ruleset, with exceptions by name or custom property. But it would mean re-pointing Flux, both Apps' installations and every clone, for what the broker's one definition already gives. If the repos ever move to the org, make this an org ruleset and drop `github-require-human-review`.
+- **The broker adding rulesets by itself, without asking.** It changes a repo's settings, and every write the ops App makes is one you approved. One tap per repo, once, keeps that rule.
+- **Adding the ruleset in `github-protect-branch`.** New repos would get it in the same approval, but repos that are already protected wouldn't, and that verb only ever acts where there's no rule. The broker asking for missing rulesets covers both.
 - **A webhook instead of the sync.** It would be quicker, but it needs a public endpoint past the Google login and a webhook secret. A minute's lag is fine: a flagged PR is never approved by the reviewer, so it can't merge in the meantime.
 
 Trade-offs:
 
-- **One sync per minute** costs about two API calls per open PR, plus one more per PR without a flag (its reviews). That's fine at this scale, and the App's 5,000 calls an hour are the limit.
-- **A flag outlives its retention while its PR is open.** Retention deletes finished requests after 7 or 90 days, and a deleted flag would make the PR read as never flagged, so a `github-human-review` request is kept until the sync has seen its PR closed. A repo that leaves `HUMAN_REVIEW_REPOS` keeps its flags. They're few, and deleting them is a decision for you, not a timer. (From the PR reviewer's review of #39.)
+- **Tokens are minted as they're needed**, each for one repo, and revoked when the step is done. The only token for every repo is the one that lists them (`metadata: read`), which can't read or change anything inside a repo. A repo with open issues or PRs gets a read-only token (`pull_requests: read`, `statuses: read`). A token that can write statuses is minted only when a status has to change, which is rare: when a PR opens, gets a new head, or is flagged or signed off. Repos with nothing open get no token at all.
+- **One sync per minute** costs about 3 calls for the list token, 3 per repo with open issues or PRs (mint, PRs, revoke), and about 2 per open PR (its status, and its reviews if it isn't flagged). A status change adds a mint, a write and a revoke. The ruleset round adds a few calls per repo every 10 minutes. With a handful of active repos that's well under the App's 5,000 calls an hour.
+- **A flag outlives its retention while its PR is open.** Retention deletes finished requests after 7 or 90 days, and a deleted flag would make the PR read as never flagged, so a `github-human-review` request is kept until the sync has seen its PR closed. A repo that's excluded or uninstalled keeps its flags. They're few, and deleting them is a decision for you, not a timer. (From the PR reviewer's review of #39.)
 - **Every page** of open PRs and of a PR's reviews is read. A sign-off that lands during a sync pass isn't overwritten: the requests are read again before a `success` would turn `pending`.
 - **The broker can create requests now**, for the reviewer's flags. That's notifications only: every request still needs you to approve it, and it has its own `PENDING_CAPS` slots (10).
 
@@ -236,7 +259,7 @@ Decided against, for now:
 
 ## Later
 
-- **Make `human-review` part of the standard rule** (`github-protect-branch`) once every repo has it, so new repos start with it. Today it's opt-in per repo (`HUMAN_REVIEW_REPOS`).
+- **An org ruleset**, if the repos move to the `nefcloud` org (see *Considered and rejected* under *Human review required*).
 
 - More user actions (e.g. adding a repo to the agent App's installation, if it ever moves off *All repositories*): one entry in `minter.USER_ACTIONS` each.
 - **Repo secrets and variables** (`secrets: write`): useful for CI that needs a token. The value must not travel through the request, which the agent can read. It needs a page where you paste it, or one the broker generates.

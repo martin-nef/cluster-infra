@@ -69,7 +69,7 @@ spec:
                   type: string
                   enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume,
                          github-commit-workflows, github-protect-branch, github-rerun-workflow, github-dispatch-workflow,
-                         github-create-repo, github-human-review]
+                         github-create-repo, github-human-review, github-require-human-review]
                 target:
                   type: object
                   required: [kind, namespace, name]
