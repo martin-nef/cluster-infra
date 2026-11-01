@@ -106,6 +106,9 @@ GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose
 # filed either (an agent's own still are).
 HUMAN_REVIEW_EXCLUDE = {r.strip() for r in os.environ.get("HUMAN_REVIEW_EXCLUDE", "").split(",") if r.strip()}
 REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  # its needs_human flags count
+# GitHub logins whose Approve of a flagged PR's head signs it off, like approving
+# its request on the ops page. Yours; never an agent's.
+HUMAN_REVIEWERS = {r.strip() for r in os.environ.get("HUMAN_REVIEWERS", GITHUB_OWNER).split(",") if r.strip()}
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
 # Every this many passes, the sync also looks for repos without the ruleset.
 RULESET_EVERY = 10
@@ -438,6 +441,23 @@ def file_human_review(repo, pr, head, reason):
                       "reason": reason}), flush=True)
 
 
+def signed_off_on_github(repo, pr, head, login):
+    """You approved a flagged PR's head on GitHub: its waiting request is
+    signed off too, so the agent that asked sees Succeeded, as if you'd
+    approved it on the ops page."""
+    with lock:
+        for req in human_review_requests(list_requests(), repo).get(pr, []):
+            if req["spec"]["github"].get("headSHA") != head or phase(req) not in ("", "Pending"):
+                continue
+            try:
+                set_status(req, phase="Succeeded", decidedBy=f"{login} (GitHub review)", decidedAt=stamp(),
+                           finishedAt=stamp(), message=f"signed off by approving the PR on GitHub as {login}")
+            except K8sError as e:
+                print(f"recording {req['metadata']['name']} as signed off on GitHub: {e}", flush=True)
+                continue
+            audit("succeeded", req, by=f"{login} (GitHub review)")
+
+
 def file_require(repo):
     k8s("POST", REQUESTS, {
         "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
@@ -470,10 +490,13 @@ def sync_human_review(rulesets=False):
         def recheck(pr, head, repo=repo):
             return human_review_state(head, human_review_requests(list_requests(), repo).get(pr, []))
         try:
-            to_file, OPEN_PRS[repo] = githubops.sync(
-                MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck)
+            to_file, OPEN_PRS[repo], approved = githubops.sync(
+                MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck,
+                HUMAN_REVIEWERS)
             for pr, head, reason in to_file:
                 file_human_review(repo, pr, head, reason)
+            for pr, head, login in approved:
+                signed_off_on_github(repo, pr, head, login)
         except (githubops.GitHubError, K8sError, OSError) as e:
             clean = False
             print(f"human-review sync {repo}: {e}", flush=True)
