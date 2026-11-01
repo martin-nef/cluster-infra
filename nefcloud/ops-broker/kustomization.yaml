@@ -22,6 +22,7 @@ configMapGenerator:
     files:
       - broker/broker.py
       - broker/githubops.py
+      - broker/agekey.py
   # Its own ConfigMap, so the minter container mounts only its own code.
   - name: ops-broker-minter
     namespace: ops-broker

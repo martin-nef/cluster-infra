@@ -83,3 +83,32 @@ subjects:
   - kind: ServiceAccount
     name: ops-broker
     namespace: ops-broker
+---
+# create-sops-age-key: a new Flux app's SOPS key, made in the broker so its
+# private half never leaves the cluster. Create only: no get or list, so the
+# broker can't read the other apps' keys, and an existing one can't be
+# replaced (the create fails). admission.yaml limits it to *-sops-age names
+# holding a single age.agekey.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ops-broker-sops-keys
+  namespace: flux-system
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ops-broker-sops-keys
+  namespace: flux-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ops-broker-sops-keys
+subjects:
+  - kind: ServiceAccount
+    name: ops-broker
+    namespace: ops-broker

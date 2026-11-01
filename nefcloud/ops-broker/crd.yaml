@@ -64,10 +64,17 @@ spec:
                     !has(self.target) || !(self.verb in ['flux-reconcile', 'flux-suspend', 'flux-resume']) ||
                     self.target.kind in ['Kustomization', 'HelmRelease', 'GitRepository', 'HelmRepository']
                   message: flux verbs target a Kustomization, HelmRelease, GitRepository or HelmRepository
+                - rule: >-
+                    !has(self.target) || (self.verb == 'create-sops-age-key') == (self.target.kind == 'Secret')
+                  message: create-sops-age-key, and only it, targets a Secret
+                - rule: >-
+                    !has(self.target) || self.verb != 'create-sops-age-key' ||
+                    (self.target.namespace == 'flux-system' && self.target.name.endsWith('-sops-age'))
+                  message: create-sops-age-key makes flux-system/<app>-sops-age only
               properties:
                 verb:
                   type: string
-                  enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume,
+                  enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume, create-sops-age-key,
                          github-commit-workflows, github-protect-branch, github-rerun-workflow, github-dispatch-workflow,
                          github-create-repo, github-human-review, github-require-human-review]
                 target:
@@ -76,7 +83,8 @@ spec:
                   properties:
                     kind:
                       type: string
-                      enum: [Pod, Deployment, StatefulSet, DaemonSet, Kustomization, HelmRelease, GitRepository, HelmRepository]
+                      enum: [Pod, Deployment, StatefulSet, DaemonSet, Kustomization, HelmRelease, GitRepository, HelmRepository,
+                             Secret]
                     namespace:
                       type: string
                       maxLength: 63

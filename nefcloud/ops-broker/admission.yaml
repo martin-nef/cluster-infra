@@ -64,3 +64,40 @@ metadata:
   name: opsrequests-requester
 spec:
   policyName: opsrequests-requester
+---
+# RBAC can't limit create to a name, so this does: in flux-system, the broker
+# may only create <app>-sops-age Secrets holding one key, age.agekey
+# (create-sops-age-key). Anyone else's Secrets there aren't matched.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ops-broker-sops-keys-only
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: flux-system
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [secrets]
+  matchConditions:
+    - name: from-the-broker
+      expression: request.userInfo.username == 'system:serviceaccount:ops-broker:ops-broker'
+  validations:
+    - expression: object.metadata.name.endsWith('-sops-age') && object.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?-sops-age$')
+      message: the ops broker may only create flux-system/<app>-sops-age
+    - expression: has(object.data) && object.data.size() == 1 && 'age.agekey' in object.data && !has(object.stringData)
+      message: an <app>-sops-age Secret holds one key, age.agekey
+    - expression: request.operation == 'CREATE'
+      message: the ops broker never changes an existing SOPS key
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: ops-broker-sops-keys-only
+spec:
+  policyName: ops-broker-sops-keys-only
+  validationActions: [Deny]

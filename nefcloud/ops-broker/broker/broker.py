@@ -65,6 +65,7 @@ It is never run late or retried.
 
 Stdlib only, so it runs on a stock python image from a ConfigMap.
 """
+import base64
 import hashlib
 import html
 import itertools
@@ -85,6 +86,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # -I leaves the script's directory off sys.path; githubops.py sits beside it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import agekey  # noqa: E402
 import githubops  # noqa: E402
 
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
@@ -141,6 +143,7 @@ KINDS = {
     "HelmRelease": "/apis/helm.toolkit.fluxcd.io/v2/namespaces/{ns}/helmreleases/{name}",
     "GitRepository": "/apis/source.toolkit.fluxcd.io/v1/namespaces/{ns}/gitrepositories/{name}",
     "HelmRepository": "/apis/source.toolkit.fluxcd.io/v1/namespaces/{ns}/helmrepositories/{name}",
+    "Secret": "/api/v1/namespaces/{ns}/secrets/{name}",
 }
 FLUX_KINDS = {"Kustomization", "HelmRelease", "GitRepository", "HelmRepository"}
 # The CRD enforces the same; checked again here so a looser CRD can't widen it.
@@ -150,7 +153,11 @@ VERBS = {
     "flux-reconcile": FLUX_KINDS,
     "flux-suspend": FLUX_KINDS,
     "flux-resume": FLUX_KINDS,
+    # A new Flux app's SOPS key, made here so its private half never leaves the
+    # cluster (README, "SOPS keys"). Create only: the broker can't read Secrets.
+    "create-sops-age-key": {"Secret"},
 }
+SOPS_KEY = re.compile(r"[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?-sops-age")
 GITHUB_VERBS = set(githubops.VERBS)
 USER_VERBS = set(githubops.USER_VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
@@ -316,6 +323,12 @@ def check(req):
     target = spec.get("target", {})
     if target.get("kind") not in VERBS.get(spec.get("verb"), ()):
         return f"verb {spec.get('verb')!r} can't target kind {target.get('kind')!r}", None
+    if spec["verb"] == "create-sops-age-key":
+        # Nothing to look up: the broker may create Secrets there, not read them.
+        # One that already exists makes the create fail, changing nothing.
+        if target.get("namespace") != "flux-system" or not SOPS_KEY.fullmatch(target.get("name", "")):
+            return "create-sops-age-key makes flux-system/<app>-sops-age only", None
+        return None, None
     try:
         obj = k8s("GET", target_path(spec))
     except K8sError as e:
@@ -365,6 +378,8 @@ def act(spec, uid, code=None):
     if spec["verb"] in GITHUB_VERBS:
         return githubops.act(MINTER, spec, code)
     verb, path = spec["verb"], target_path(spec)
+    if verb == "create-sops-age-key":
+        return create_sops_age_key(spec["target"]["name"])
     if verb == "delete-pod":
         # Only the pod that was checked: a StatefulSet's replacement has the same name.
         try:
@@ -516,6 +531,26 @@ def sync_loop():
         except Exception as e:
             print(f"human-review sync: {e!r}", flush=True)
         time.sleep(SYNC_EVERY)
+
+
+def create_sops_age_key(name):
+    """Make an age key and store it as flux-system/<name>, the way cluster-infra's
+    CLAUDE.md says to (key age.agekey). Returns a message with the public key,
+    which goes in the app's .sops.yaml. The private half is never logged,
+    returned or kept: it exists here only until the Secret is created."""
+    key_file, public = agekey.generate()
+    body = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+            "metadata": {"name": name, "namespace": "flux-system",
+                         "labels": {"app.kubernetes.io/managed-by": "ops-broker"}},
+            "data": {"age.agekey": base64.b64encode(key_file.encode()).decode()}}
+    del key_file
+    try:
+        k8s("POST", "/api/v1/namespaces/flux-system/secrets", body, content_type="application/json")
+    except K8sError as e:
+        if e.code == 409:
+            raise K8sError(409, f"flux-system/{name} already exists; nothing changed") from None
+        raise
+    return f"created flux-system/{name}; its public key, for the app's .sops.yaml: {public}"
 
 
 def notify(req):
