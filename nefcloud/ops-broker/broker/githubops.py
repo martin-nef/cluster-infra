@@ -408,26 +408,45 @@ def reviewer_flag(reviews, reviewer, head):
     return reason.strip()[:500] if isinstance(reason, str) and reason.strip() else None
 
 
-def sync(minter, repo, desired, reviewer):
+def pages(tok, path):
+    """Every item of a list, page by page: a PR past the 100th still gets its
+    status, and a review past the 100th still counts."""
+    out, page = [], 1
+    while True:
+        items = tok("GET", f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")
+        out += items
+        if len(items) < 100:
+            return out
+        page += 1
+
+
+def sync(minter, repo, desired, reviewer, recheck=None):
     """Set the human-review status on every open PR head in repo to what
-    desired(pr number, head sha) says, and return the reviewer's flags that
-    have no request yet: [(pr number, head sha, reason)]. desired returns
-    (state, description, flagged), flagged meaning a request covers this head."""
-    to_file = []
+    desired(pr number, head sha) says. Returns (the reviewer's flags that have
+    no request yet: [(pr number, head sha, reason)], the open PR numbers).
+    desired returns (state, description, flagged), flagged meaning a request
+    covers this head. recheck(pr number, head sha) is asked again, from fresh
+    requests, before a success is turned pending: a sign-off may have landed
+    since desired's were read."""
+    to_file, numbers = [], set()
     with minter.token(repo, "github-human-review", "sync") as tok:
-        for pr in tok("GET", "/pulls?state=open&per_page=100"):
+        for pr in pages(tok, "/pulls?state=open"):
             number, head = pr["number"], pr["head"]["sha"]
+            numbers.add(number)
             state, description, flagged = desired(number, head)
+            reason = None
             if not flagged:
-                reason = reviewer_flag(tok("GET", f"/pulls/{number}/reviews?per_page=100"), reviewer, head)
+                reason = reviewer_flag(pages(tok, f"/pulls/{number}/reviews"), reviewer, head)
                 if reason:
                     to_file.append((number, head, reason))
                     state, description = "pending", f"human review required: {reason}"
             current = tok("GET", f"/commits/{head}/status")
             mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
+            if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
+                state, description, _ = recheck(number, head)
             if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
                 tok("POST", f"/statuses/{head}", status_body(state, description))
-    return to_file
+    return to_file, numbers
 
 
 # --- the approval page ---------------------------------------------------------

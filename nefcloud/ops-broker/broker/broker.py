@@ -99,6 +99,10 @@ GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose
 HUMAN_REVIEW_REPOS = [r.strip() for r in os.environ.get("HUMAN_REVIEW_REPOS", "").split(",") if r.strip()]
 REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  # its needs_human flags count
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
+# repo -> its open PR numbers, as the last sync saw them. tidy keeps a
+# github-human-review request while its PR may still be open: deleting it
+# would make the PR read as never flagged.
+OPEN_PRS = {}
 
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 K8S_API = "https://kubernetes.default.svc"
@@ -424,9 +428,12 @@ def sync_human_review():
     items = list_requests()
     for repo in HUMAN_REVIEW_REPOS:
         reqs = human_review_requests(items, repo)
+
+        def recheck(pr, head, repo=repo):
+            return human_review_state(head, human_review_requests(list_requests(), repo).get(pr, []))
         try:
-            to_file = githubops.sync(MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])),
-                                     REVIEWER_LOGIN)
+            to_file, OPEN_PRS[repo] = githubops.sync(
+                MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck)
             for pr, head, reason in to_file:
                 file_human_review(repo, pr, head, reason)
         except (githubops.GitHubError, K8sError, OSError) as e:
@@ -504,7 +511,17 @@ def tidy(req):
                    message="the broker stopped while running it; check the target before requesting it again")
         audit("unknown", req, error="broker stopped mid-run")
     elif p in FINISHED and age(req) > 86400 * (SHORT_RETENTION_DAYS if p in SHORT_LIVED else RETENTION_DAYS):
+        if req["spec"].get("verb") == "github-human-review" and not pr_closed(req):
+            return  # the flag is the record that the PR needs you; it goes when the PR does
         k8s("DELETE", f"{REQUESTS}/{req['metadata']['name']}")
+
+
+def pr_closed(req):
+    """Whether the last sync saw this flag's repo, and its PR wasn't open. Not
+    synced (yet, or the repo left HUMAN_REVIEW_REPOS): kept, to be safe."""
+    g = req["spec"].get("github") or {}
+    seen = OPEN_PRS.get(g.get("repo"))
+    return seen is not None and int(g.get("pr") or 0) not in seen
 
 
 def admit(req, pending):

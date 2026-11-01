@@ -144,7 +144,8 @@ Considered and rejected:
 Trade-offs:
 
 - **One sync per minute** costs about two API calls per open PR, plus one more per PR without a flag (its reviews). That's fine at this scale, and the App's 5,000 calls an hour are the limit.
-- **Old requests are deleted** after their retention (90 days, or 7 for `Rejected` and `Expired`). A PR flagged that long ago with nothing newer counts as unflagged. Open PRs that old are rare. If one matters, flag it again.
+- **A flag outlives its retention while its PR is open.** Retention deletes finished requests after 7 or 90 days, and a deleted flag would make the PR read as never flagged, so a `github-human-review` request is kept until the sync has seen its PR closed. A repo that leaves `HUMAN_REVIEW_REPOS` keeps its flags. They're few, and deleting them is a decision for you, not a timer. (From the PR reviewer's review of #39.)
+- **Every page** of open PRs and of a PR's reviews is read. A sign-off that lands during a sync pass isn't overwritten: the requests are read again before a `success` would turn `pending`.
 - **The broker can create requests now**, for the reviewer's flags. That's notifications only: every request still needs you to approve it, and it has its own `PENDING_CAPS` slots (10).
 
 ## Design decisions

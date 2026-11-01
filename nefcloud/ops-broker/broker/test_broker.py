@@ -220,12 +220,18 @@ class FakeGitHub:
         if sub == "/git/refs/heads/work" and method == "PATCH":
             self.branches["work"]["commit"]["sha"] = body["sha"]
             return {}
+        query = dict(urllib.parse.parse_qsl(path.partition("?")[2]))
+
+        def page(items):
+            n, size = int(query.get("page", 1)), int(query.get("per_page", 30))
+            return copy.deepcopy(items[(n - 1) * size:n * size])
         if sub == "/pulls" and method == "GET":
-            return [copy.deepcopy(p) for p in self.pulls.values() if p["state"] == "open"]
+            return page([p for p in self.pulls.values() if p["state"] == "open"])
         if sub.startswith("/pulls/") and method == "GET":
             number, _, rest = sub[len("/pulls/"):].partition("/")
             if int(number) in self.pulls:
-                return copy.deepcopy({"": self.pulls, "reviews": self.reviews, "files": self.pr_files}[rest][int(number)])
+                found = {"": self.pulls, "reviews": self.reviews, "files": self.pr_files}[rest][int(number)]
+                return page(found) if isinstance(found, list) else copy.deepcopy(found)
         if sub.startswith("/commits/") and sub.endswith("/status"):
             return {"statuses": copy.deepcopy(self.statuses.get(sub.split("/")[2], []))}
         if sub.startswith("/statuses/") and method == "POST":
@@ -1230,6 +1236,47 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(broker.githubops.reviewer_flag([flagged], REVIEWER, HEAD), "x")
         broken = {**flagged, "body": "Review.\n\n<!-- pr-reviewer-state {not json -->"}
         self.assertIsNone(broker.githubops.reviewer_flag([broken], REVIEWER, HEAD))
+
+    def test_an_aged_out_flag_stays_while_its_pr_is_open(self):
+        # Expired a long time ago: retention would delete it, and the PR would read as never flagged.
+        self.add_github("old", "github-human-review", age=86400 * 30, repo="web", pr=5, headSHA=HEAD)
+        self.api.requests["old"]["status"] = {"phase": "Expired"}
+        with mock.patch.object(broker, "OPEN_PRS", {}):
+            broker.scan()
+            self.assertIn("old", self.api.requests)  # not synced yet: kept
+            broker.sync_human_review()
+            broker.scan()
+            self.assertIn("old", self.api.requests)  # its PR is open: kept
+            self.assertEqual(self.status(), "pending")
+            self.gh.pulls[5]["state"] = "closed"
+            broker.sync_human_review()
+            broker.scan()
+            self.assertNotIn("old", self.api.requests)  # closed: retention applies again
+
+    def test_every_page_of_prs_and_reviews_is_read(self):
+        for n in range(6, 160):
+            self.gh.pulls[n] = {**copy.deepcopy(self.gh.pulls[5]), "number": n, "head": {"sha": f"{n:040d}"}}
+            self.gh.reviews[n] = []
+        flagged = f"{150:040d}"
+        self.gh.reviews[150] = [review("x", flagged, at=f"2026-10-01T00:{i // 60:02d}:{i % 60:02d}Z")
+                                for i in range(120)] + [review(REVIEWER, flagged, {"needs_human": "late"})]
+        created = []
+        with mock.patch.object(broker, "file_human_review", lambda *a: created.append(a)):
+            broker.sync_human_review()
+        self.assertEqual(self.status(f"{159:040d}"), "success")  # past the first 100 PRs
+        self.assertEqual(created, [("web", 150, flagged, "late")])  # past the first 100 reviews
+
+    def test_a_fresh_sign_off_isnt_overwritten_by_a_stale_read(self):
+        self.flag()
+        broker.scan()
+        self.gh.statuses[HEAD] = [{"context": "human-review", "state": "success", "description": "signed off"}]
+        stale = copy.deepcopy(list(self.api.requests.values()))  # read before the sign-off landed
+        self.api.requests["hr1"]["status"].update(phase="Succeeded", decidedBy=APPROVER)
+        real = broker.list_requests
+        calls = iter([stale])
+        with mock.patch.object(broker, "list_requests", lambda: next(calls, None) or real()):
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
 
     def test_off_without_repos(self):
         with mock.patch.object(broker, "HUMAN_REVIEW_REPOS", []):
