@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: night-shift
+  labels:
+    # No privileged, hostPath or host-network pods, from the app repo or from
+    # the Jobs the runner creates.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
