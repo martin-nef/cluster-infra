@@ -74,9 +74,11 @@ PERMISSIONS = {
     "administration": "write",
     "contents": "write",
     "metadata": "read",
-    # github-human-review: read PRs and their reviews, set the human-review status.
+    # github-human-review: read PRs and their reviews, set the human-review status,
+    # approve a PR you signed off.
     # An App created before these needs them added on GitHub (README).
-    "pull_requests": "read",
+    # Write: approving a PR when you sign it off (approve).
+    "pull_requests": "write",
     "statuses": "write",
     "workflows": "write",
 }
@@ -94,7 +96,10 @@ TOKENS = {
     # The broker's own pass: list the repos the App is installed on (every
     # repo, metadata only), read one repo's open PRs, reviews and statuses
     # (sync), and set a status there only when one has to change (write).
+    # approve: on your sign-off, an Approve of the PR, so GitHub's required
+    # approval is there too.
     "github-human-review": {"check": {"pull_requests": "read"}, "run": {"statuses": "write"},
+                            "approve": {"pull_requests": "write"},
                             "list": {"metadata": "read"},
                             "sync": {"pull_requests": "read", "statuses": "read"},
                             "write": {"statuses": "write"}},
