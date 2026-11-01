@@ -32,6 +32,7 @@ v3 covers what GitHub only lets *you* do, not an App: creating a repo. Approving
 | `rollout-restart` | Deployment, StatefulSet, DaemonSet | What `kubectl rollout restart` does: bumps `restartedAt` in the pod template. |
 | `flux-reconcile` | Kustomization, HelmRelease, GitRepository, HelmRepository | What `flux reconcile` does: bumps `reconcile.fluxcd.io/requestedAt`. No `--with-source`; request the source separately. |
 | `flux-suspend` / `flux-resume` | same | Sets `spec.suspend`. |
+| `create-sops-age-key` | Secret `flux-system/<app>-sops-age` | Makes a new Flux app's age key in the broker and stores it there, as cluster-infra's CLAUDE.md (SOPS) says. The request's status gives the public key, for the app's `.sops.yaml`. See [SOPS keys](#sops-keys). |
 | `github-*` | a repo | See [GitHub verbs](#github-verbs-v2). |
 
 A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired`, or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 15 minutes unless they ask for longer (`spec.ttlSeconds`, up to 12 hours). Each requester named in `PENDING_CAPS` has its own pending slots (the interactive agent: 3), and everyone else shares 3. Finished ones are kept 90 days, or 7 for `Rejected` and `Expired`, which decided nothing (`config.env`). Approving checks the target again first. If it has gone, been replaced, or moved on (a branch that has new commits, a rule someone already set), the request ends `Rejected` and nothing runs.
@@ -103,6 +104,23 @@ Decided against:
 - **Refusing a TTL above the cap.** Refusing would make an agent's request fail at 2am over a config value it can't see. Clamping, with `expiresAt` in the status, tells it the outcome instead.
 
 Can't be tested without a cluster: the mutating policy itself. After the merge, create a request and check `kubectl -n ops-broker get opsrequest <name> -o jsonpath='{.spec.requester}'` is `system:serviceaccount:claude-remote:claude-remote`. Also check that a request with a `requester` of something else still comes back with yours. If the policy fails, every create is refused (`failurePolicy: Fail`), and Headlamp is the fallback until it's fixed.
+
+## SOPS keys
+
+A new Flux app needs its own age key: the private half in `flux-system/<app>-sops-age` for Flux, the public half in the app's `.sops.yaml`. Making it on someone's machine means the private key passed through that machine. Making it in an agent's container would let the agent decrypt the app's secrets. `create-sops-age-key` makes it here instead:
+
+```yaml
+spec:
+  verb: create-sops-age-key
+  target: {kind: Secret, namespace: flux-system, name: <app>-sops-age}
+  reason: <app>'s secrets
+```
+
+On approval, the broker generates the key (`agekey.py`: X25519 and bech32 in pure Python, checked against `age-keygen` and RFC 7748), creates the Secret, and ends the request `Succeeded` with the public key in `status.message`. The private half is never logged, returned or kept. Encrypting with `sops -e` only needs the public key, so nobody needs the private one, except to decrypt a file locally later. Then `kubectl -n flux-system get secret <app>-sops-age` restores it, as before.
+
+- **Create only.** The broker's Role in `flux-system` is `create` on Secrets, with no `get` or `list`, so it can't read the other apps' keys. An existing key is never replaced: the create fails, and the request ends `Failed` with nothing changed.
+- **Pinned by admission.** RBAC can't limit `create` to a name, so `ops-broker-sops-keys-only` (`admission.yaml`) does: from the broker, only `<app>-sops-age`, with exactly one key, `age.agekey`, never an update. The CRD and the broker check the same.
+- **Trade-off:** the broker can now add Secrets to `flux-system`, if they look like SOPS keys. A compromised broker could plant a key for an app that has none yet, and Flux would then decrypt that app's files with an attacker's key. That only matters for files encrypted to that key's public half, which you'd see in the app's `.sops.yaml` on a PR.
 
 ## Human review required
 
@@ -263,7 +281,6 @@ Decided against, for now:
 
 - More user actions (e.g. adding a repo to the agent App's installation, if it ever moves off *All repositories*): one entry in `minter.USER_ACTIONS` each.
 - **Repo secrets and variables** (`secrets: write`): useful for CI that needs a token. The value must not travel through the request, which the agent can read. It needs a page where you paste it, or one the broker generates.
-- **New apps' SOPS keys.** `kubectl create secret <name>-sops-age` is the last imperative step in adding an app (`CLAUDE.md`). A verb could generate the age key in the broker, store it in `flux-system` and return only the public key, so the private key is never outside the cluster. That needs X25519 in pure Python, or an image with `age`.
 - **Discord** instead of, or beside, ntfy. It's planned as its own project: a generic, secure integration for the whole cluster. When it exists, `notify()` becomes one more sender. The approval stays on this page either way, for the same reason as with ntfy.
 - An admission policy limiting the broker's patches (above), and its Secret creation to the one name.
 - The minter checking approvals itself before it hands out a `run` token (above), so a compromised broker gets only read tokens.

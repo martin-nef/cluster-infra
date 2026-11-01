@@ -1,6 +1,6 @@
 Manages the nodes (ansible/) and the k3s cluster (nefcloud/, reconciled by Flux from `main`). See README.md for the general layout.
 
-Important! Do not `kubectl apply`. Everything under nefcloud/ is managed through Flux: commit + push to `main`, then `flux reconcile kustomization <name> --with-source` if you don't want to wait. The one exception is an app's `<name>-sops-age` secret, which is created with kubectl (see SOPS below).
+Important! Do not `kubectl apply`. Everything under nefcloud/ is managed through Flux: commit + push to `main`, then `flux reconcile kustomization <name> --with-source` if you don't want to wait. The one exception is an app's `<name>-sops-age` secret: the ops broker makes it (`create-sops-age-key`), or you create it with kubectl (see SOPS below).
 
 ## Adding a new Flux app
 
@@ -62,7 +62,7 @@ Do this after the Flux PR is merged and step 6 is done. Each app has its own age
        age: <public key>
    ```
 
-3. Give Flux the private key. The data key must end in `.agekey`:
+3. Give Flux the private key. The data key must end in `.agekey`. Or skip steps 1 and 3: an agent files a `create-sops-age-key` OpsRequest for `flux-system/<name>-sops-age` (`nefcloud/ops-broker/README.md`, SOPS keys), and its status gives the public key for step 2. The private key then never leaves the cluster.
 
    ```bash
    kubectl -n flux-system create secret generic <name>-sops-age --from-file=age.agekey=age.agekey

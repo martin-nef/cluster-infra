@@ -15,6 +15,7 @@ import http.client
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -57,6 +58,7 @@ class FakeAPI:
         self.calls = []
         self.versions = itertools.count(1)
         self.fail = {}  # (method, path) -> exception to raise once
+        self.secrets = {}  # flux-system Secrets the broker created
 
     def put(self, kind, ns, name, uid=None, **meta):
         self.objects[broker.KINDS[kind].format(ns=ns, name=name)] = {
@@ -92,6 +94,12 @@ class FakeAPI:
             if method == "DELETE":
                 del self.requests[name]
                 return {}
+        if method == "POST" and path == "/api/v1/namespaces/flux-system/secrets":
+            name = body["metadata"]["name"]
+            if name in self.secrets:
+                raise broker.K8sError(409, f'secrets "{name}" already exists')
+            self.secrets[name] = copy.deepcopy(body)
+            return body
         if path in self.objects:
             if method == "GET":
                 return copy.deepcopy(self.objects[path])
@@ -1471,6 +1479,60 @@ class TestRequireHumanReview(Served, GitHubBase):
         broker.decide("r1", "approve", st["specHash"], APPROVER)
         self.assertEqual(len(self.gh.rulesets), 1)
         self.assertNotEqual(self.api.status("r1")["phase"], "Succeeded")
+
+
+class TestSopsKey(Base):
+    def add(self, name="k1", ns="flux-system", secret="night-shift-sops-age"):
+        self.api.add(name, "create-sops-age-key", "Secret", ns, secret)
+        broker.scan()
+        return self.api.status(name)
+
+    def test_only_an_app_key_in_flux_system(self):
+        self.assertEqual(self.add()["phase"], "Pending")
+        for name, ns, secret in (("k2", "ops-broker", "night-shift-sops-age"), ("k3", "flux-system", "flux-system"),
+                                 ("k4", "flux-system", "night-shift-auth")):
+            with self.subTest(secret=f"{ns}/{secret}"):
+                self.assertEqual(self.add(name, ns, secret)["phase"], "Rejected")
+
+    def test_approving_creates_it_and_only_the_public_key_comes_back(self):
+        st = self.add()
+        with mock.patch("builtins.print") as printed:
+            code, msg = broker.decide("k1", "approve", st["specHash"], APPROVER)
+        self.assertEqual((code, self.api.status("k1")["phase"]), (200, "Succeeded"))
+        secret = self.api.secrets["night-shift-sops-age"]
+        self.assertEqual(list(secret["data"]), ["age.agekey"])
+        key_file = base64.b64decode(secret["data"]["age.agekey"]).decode()
+        private = re.search(r"AGE-SECRET-KEY-1[0-9A-Z]+", key_file).group(0)
+        public = re.search(r"public key: (age1[0-9a-z]+)", key_file).group(1)
+        self.assertIn(public, self.api.status("k1")["message"])
+        logged = " ".join(str(c) for c in printed.call_args_list)
+        for where in (msg, self.api.status("k1")["message"], logged):
+            self.assertNotIn(private, where)  # the private half is never logged or returned
+        self.assertEqual(broker.agekey.recipient(_bech32_bytes(private)), public)
+
+    def test_an_existing_key_is_never_replaced(self):
+        self.api.secrets["night-shift-sops-age"] = {"data": {"age.agekey": "b2xk"}}
+        st = self.add()
+        code, msg = broker.decide("k1", "approve", st["specHash"], APPROVER)
+        self.assertEqual(self.api.status("k1")["phase"], "Failed")
+        self.assertIn("already exists; nothing changed", msg)
+        self.assertEqual(self.api.secrets["night-shift-sops-age"], {"data": {"age.agekey": "b2xk"}})
+
+    def test_the_broker_never_reads_a_secret_for_it(self):
+        st = self.add()
+        broker.decide("k1", "approve", st["specHash"], APPROVER)
+        self.assertFalse([c for c in self.api.calls if c[0] == "GET" and "/secrets" in c[1]])
+
+
+def _bech32_bytes(s):
+    values = [broker.agekey.CHARSET.index(c) for c in s.lower().rpartition("1")[2][:-6]]
+    acc, bits, out = 0, 0, []
+    for v in values:
+        acc, bits = (acc << 5) | v, bits + 5
+        if bits >= 8:
+            bits -= 8
+            out.append((acc >> bits) & 255)
+    return bytes(out)
 
 
 if __name__ == "__main__":
