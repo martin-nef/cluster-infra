@@ -14,6 +14,10 @@ with a third App (the "ops" App) whose key only the token minter holds:
   github-rerun-workflow     Re-run the failed jobs of one finished run.
   github-dispatch-workflow  Run a workflow_dispatch workflow on the default branch.
   github-create-repo        Create a repo under the owner's account (USER_VERBS).
+  github-human-review       Sign off a PR that an agent flagged as needing a
+                            human: the human-review status on its head turns
+                            success. Until then sync() keeps it pending, and a
+                            required human-review check keeps the PR unmerged.
 
 Every call uses an installation token for one repo with only the permissions
 that step needs, asked of the minter sidecar (minter.py) by verb and step and
@@ -40,7 +44,7 @@ GITHUB_API = "https://api.github.com"
 
 # The verbs this module runs. Their tokens' permissions are minter.TOKENS.
 VERBS = ("github-commit-workflows", "github-protect-branch", "github-rerun-workflow", "github-dispatch-workflow",
-         "github-create-repo")
+         "github-create-repo", "github-human-review")
 # Run by the minter with the owner's own token (minter.USER_ACTIONS).
 USER_VERBS = ("github-create-repo",)
 # The one rule github-protect-branch applies: changes reach the branch only
@@ -56,6 +60,11 @@ WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
 BRANCH = re.compile(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*")
 REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 RERUNNABLE = {"failure", "cancelled", "timed_out", "startup_failure"}
+# The commit status sync() keeps on every open PR head of HUMAN_REVIEW_REPOS,
+# made a required check there, pinned to the ops App: only this broker sets it.
+HUMAN_REVIEW = "human-review"
+# The marker the PR reviewer ends each review with (pr-reviewer job.py STATE_MARK).
+REVIEW_MARK = "<!-- pr-reviewer-state "
 
 
 class GitHubError(Exception):
@@ -185,6 +194,8 @@ def describe(owner, spec):
         where += f" {g.get('workflow')}"
     elif verb == "github-create-repo":
         where += " (private)" if g.get("private", True) else " (public)"
+    elif verb == "github-human-review":
+        where += f"#{g.get('pr')}"
     return f"{verb} {where}"
 
 
@@ -256,7 +267,18 @@ def check_dispatch(tok, repo, g):
     return None
 
 
+def check_human_review(tok, repo, g):
+    pr = tok("GET", f"/pulls/{int(g['pr'])}")
+    if pr["state"] != "open":
+        return f"#{g['pr']} is {pr['state']}"
+    if pr["head"]["sha"] != g["headSHA"]:
+        # Approving signs off exactly what the page showed; a newer head needs a new flag.
+        return f"#{g['pr']} is at {pr['head']['sha'][:12]} now, not headSHA {g['headSHA'][:12]}; flag it again"
+    return None
+
+
 CHECKS = {
+    "github-human-review": check_human_review,
     "github-commit-workflows": check_commit,
     "github-protect-branch": check_protect,
     "github-rerun-workflow": check_rerun,
@@ -346,12 +368,66 @@ def act_dispatch(tok, g):
     return f"dispatched {g['workflow']} on {branch}"
 
 
+def act_human_review(tok, g):
+    tok("POST", f"/statuses/{g['headSHA']}", status_body("success", "signed off by a human on the ops page"))
+    return f"signed off #{g['pr']} at {g['headSHA'][:12]}"
+
+
+def status_body(state, description):
+    return {"state": state, "context": HUMAN_REVIEW, "description": description[:140]}
+
+
 ACTS = {
+    "github-human-review": act_human_review,
     "github-commit-workflows": act_commit,
     "github-protect-branch": act_protect,
     "github-rerun-workflow": act_rerun,
     "github-dispatch-workflow": act_dispatch,
 }
+
+
+# --- human-review statuses ---------------------------------------------------------
+
+def reviewer_flag(reviews, reviewer, head):
+    """The reason the PR reviewer's latest review asks for a human, if that
+    review is of head and asks; else None. Only reviews the API says are the
+    reviewer's count, so nobody else can forge one."""
+    mine = [r for r in reviews if (r.get("user") or {}).get("login", "").lower() == reviewer.lower()]
+    if not mine:
+        return None
+    last = max(mine, key=lambda r: r.get("submitted_at") or "")
+    body = last.get("body") or ""
+    start = body.rfind(REVIEW_MARK)
+    if last.get("commit_id") != head or start < 0:
+        return None
+    try:
+        state = json.loads(body[start + len(REVIEW_MARK):].split(" -->", 1)[0])
+    except ValueError:
+        return None
+    reason = state.get("needs_human") if isinstance(state, dict) else None
+    return reason.strip()[:500] if isinstance(reason, str) and reason.strip() else None
+
+
+def sync(minter, repo, desired, reviewer):
+    """Set the human-review status on every open PR head in repo to what
+    desired(pr number, head sha) says, and return the reviewer's flags that
+    have no request yet: [(pr number, head sha, reason)]. desired returns
+    (state, description, flagged), flagged meaning a request covers this head."""
+    to_file = []
+    with minter.token(repo, "github-human-review", "sync") as tok:
+        for pr in tok("GET", "/pulls?state=open&per_page=100"):
+            number, head = pr["number"], pr["head"]["sha"]
+            state, description, flagged = desired(number, head)
+            if not flagged:
+                reason = reviewer_flag(tok("GET", f"/pulls/{number}/reviews?per_page=100"), reviewer, head)
+                if reason:
+                    to_file.append((number, head, reason))
+                    state, description = "pending", f"human review required: {reason}"
+            current = tok("GET", f"/commits/{head}/status")
+            mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
+            if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
+                tok("POST", f"/statuses/{head}", status_body(state, description))
+    return to_file
 
 
 # --- the approval page ---------------------------------------------------------
@@ -384,6 +460,8 @@ def details(minter, spec):
         repo = tok("GET")
         if spec["verb"] == "github-commit-workflows":
             return details_commit(tok, web, g)
+        if spec["verb"] == "github-human-review":
+            return details_human_review(tok, web, g)
         if spec["verb"] == "github-protect-branch":
             return (f"<p>Adds this rule to {link(web + '/settings/branches', repo['default_branch'])}, "
                     "which has none now: changes only through a PR with one approval. You can still "
@@ -402,6 +480,19 @@ def details(minter, spec):
         return (f"<p>Runs {link(f'{web}/blob/{branch}/{workflow['path']}', workflow['name'])} on "
                 f"<code>{e(branch)}</code>, with its secrets.</p>"
                 + (f"<table>{inputs}</table>" if inputs else "<p>No inputs.</p>"))
+
+
+def details_human_review(tok, web, g):
+    pr = tok("GET", f"/pulls/{int(g['pr'])}")
+    files = tok("GET", f"/pulls/{int(g['pr'])}/files?per_page=100")
+    rows = "".join(f"<tr><td><code>{e(f['filename'])}</code></td><td>+{int(f['additions'])} "
+                   f"−{int(f['deletions'])}</td></tr>" for f in files)
+    return (f"<p>Signs off {link(pr['html_url'], f'#{pr['number']}: ' + pr['title'])} by "
+            f"<code>{e(pr['user']['login'])}</code>, at <code>{e(g['headSHA'][:12])}</code>. Its "
+            "<code>human-review</code> check turns green, and its author may merge it once the rest passes. "
+            "A later push needs a new sign-off.</p>"
+            "<p><b>Read the PR on GitHub before approving.</b> Deny keeps it blocked.</p>"
+            f"<table>{rows}</table>")
 
 
 def details_commit(tok, web, g):

@@ -157,6 +157,12 @@ class FakeGitHub:
         self.oauth_error = None
         self.oauth_exchanges = []
         self.user_tokens_revoked = []
+        head = "h" * 40
+        self.pulls = {5: {"number": 5, "state": "open", "head": {"sha": head}, "title": "Widen <RBAC>",
+                          "html_url": "https://github.test/owner/web/pull/5", "user": {"login": "agent[bot]"}}}
+        self.reviews = {5: []}
+        self.pr_files = {5: [{"filename": "rbac.yaml", "additions": 3, "deletions": 0}]}
+        self.statuses = {}  # sha -> [status], newest first
 
     def __call__(self, method, path, token=None, body=None, basic=None, base=None):
         self.calls.append((method, path, body))
@@ -213,6 +219,17 @@ class FakeGitHub:
             return {"sha": "c" * 40}
         if sub == "/git/refs/heads/work" and method == "PATCH":
             self.branches["work"]["commit"]["sha"] = body["sha"]
+            return {}
+        if sub == "/pulls" and method == "GET":
+            return [copy.deepcopy(p) for p in self.pulls.values() if p["state"] == "open"]
+        if sub.startswith("/pulls/") and method == "GET":
+            number, _, rest = sub[len("/pulls/"):].partition("/")
+            if int(number) in self.pulls:
+                return copy.deepcopy({"": self.pulls, "reviews": self.reviews, "files": self.pr_files}[rest][int(number)])
+        if sub.startswith("/commits/") and sub.endswith("/status"):
+            return {"statuses": copy.deepcopy(self.statuses.get(sub.split("/")[2], []))}
+        if sub.startswith("/statuses/") and method == "POST":
+            self.statuses.setdefault(sub.split("/")[2], []).insert(0, dict(body))
             return {}
         if sub.startswith("/actions/runs/"):
             run_id, _, rest = sub[len("/actions/runs/"):].partition("/")
@@ -1097,6 +1114,135 @@ class TestNotify(unittest.TestCase):
         with mock.patch.object(broker, "NTFY_URL", ""), mock.patch("urllib.request.urlopen") as urlopen:
             broker.notify({})
         urlopen.assert_not_called()
+
+
+HEAD = "h" * 40
+REVIEWER = "martin-nef-reviewer[bot]"
+
+
+def review(login, commit, state=None, at="2026-11-01T01:00:00Z"):
+    mark = f"\n\n<!-- pr-reviewer-state {json.dumps(state)} -->" if state is not None else ""
+    return {"user": {"login": login}, "commit_id": commit, "submitted_at": at, "body": "Review." + mark}
+
+
+class TestHumanReview(Served, GitHubBase):
+    def setUp(self):
+        super().setUp()
+        for p in (mock.patch.object(broker, "HUMAN_REVIEW_REPOS", ["web"]),
+                  mock.patch.object(broker, "REVIEWER_LOGIN", REVIEWER)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def status(self, sha=HEAD):
+        mine = [s for s in self.gh.statuses.get(sha, []) if s["context"] == "human-review"]
+        return mine[0]["state"] if mine else None
+
+    def flag(self, name="hr1", head=HEAD, **status):
+        self.add_github(name, "github-human-review", repo="web", pr=5, headSHA=head)
+        if status:
+            self.api.requests[name]["status"] = status
+
+    def test_unflagged_prs_get_success_and_writes_are_skipped_when_unchanged(self):
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+        writes = len(self.gh.writes())
+        broker.sync_human_review()
+        self.assertEqual(len(self.gh.writes()), writes)  # same status: no second write
+
+    def test_a_flag_holds_the_pr_until_signed_off(self):
+        self.flag()
+        broker.scan()  # admitted: Pending
+        self.assertEqual(self.api.status("hr1")["phase"], "Pending")
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.assertIn("human review required: because hr1", self.gh.statuses[HEAD][0]["description"])
+        code, _ = broker.decide("hr1", "approve", self.api.status("hr1")["specHash"], APPROVER)
+        self.assertEqual((code, self.api.status("hr1")["phase"]), (200, "Succeeded"))
+        self.assertEqual(self.status(), "success")  # set by the approval itself
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_tokens(self):
+        self.flag()
+        broker.scan()
+        broker.sync_human_review()
+        perms = [p for _, p in self.gh.tokens]
+        self.assertIn({"pull_requests": "read"}, perms)  # the scan's check
+        self.assertIn({"pull_requests": "read", "statuses": "write"}, perms)  # sync
+        self.assertTrue(all("contents" not in p and "administration" not in p for p in perms))
+
+    def test_states(self):
+        def state(**status):
+            r = {"metadata": {"creationTimestamp": broker.stamp()},
+                 "spec": {"github": {"headSHA": status.pop("head", HEAD)}, "reason": "RBAC"}, "status": status}
+            return broker.human_review_state(HEAD, [r])
+        self.assertEqual(broker.human_review_state(HEAD, []), ("success", "not flagged", False))
+        self.assertEqual(state(phase="Pending")[0::2], ("pending", True))
+        self.assertEqual(state(phase="Succeeded", decidedBy="boss"), ("success", "signed off by boss", True))
+        self.assertEqual(state(phase="Succeeded", head="o" * 40)[0], "pending")  # pushed since
+        self.assertEqual(state(phase="Denied")[0], "pending")
+        self.assertEqual(state(phase="Expired")[0::2], ("pending", False))  # the reviewer's flag is filed again
+        self.assertEqual(state(phase="Rejected")[0::2], ("pending", True))  # not refiled: no loop
+
+    def test_a_push_after_the_sign_off_needs_a_new_one(self):
+        self.flag(phase="Succeeded", decidedBy=APPROVER)
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        broker.sync_human_review()
+        self.assertEqual(self.status("n" * 40), "pending")
+
+    def test_approving_a_moved_head_is_refused(self):
+        self.flag()
+        broker.scan()
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        code, msg = broker.decide("hr1", "approve", self.api.status("hr1")["specHash"], APPROVER)
+        self.assertEqual((code, self.api.status("hr1")["phase"]), (409, "Rejected"))
+        self.assertIn("flag it again", msg)
+        self.assertIsNone(self.status("n" * 40))  # nothing signed off
+
+    def test_the_reviewers_flag_is_filed_once(self):
+        self.gh.reviews[5] = [review(REVIEWER, HEAD, {"critical": {}, "needs_human": "it widens RBAC"})]
+        created = []
+
+        def k8s(method, path, body=None, content_type=None):
+            if method == "POST" and path == broker.REQUESTS:
+                created.append(body)
+                self.api.requests[f"hr{len(created)}"] = {
+                    "metadata": {"name": f"hr{len(created)}", "resourceVersion": "1",
+                                 "creationTimestamp": broker.stamp()}, "spec": body["spec"]}
+                return body
+            return self.api(method, path, body)
+        with mock.patch.object(broker, "k8s", k8s):
+            broker.sync_human_review()
+            broker.sync_human_review()
+        self.assertEqual(len(created), 1)
+        spec = created[0]["spec"]
+        self.assertEqual((spec["verb"], spec["github"]), ("github-human-review", {"repo": "web", "pr": 5, "headSHA": HEAD}))
+        self.assertEqual(spec["reason"], f"{REVIEWER}: it widens RBAC")
+        self.assertEqual(self.status(), "pending")
+
+    def test_only_the_reviewers_own_latest_review_of_this_head_counts(self):
+        forged = review("agent[bot]", HEAD, {"needs_human": "x"}, at="2026-11-01T02:00:00Z")
+        stale = review(REVIEWER, "o" * 40, {"needs_human": "x"})
+        self.assertIsNone(broker.githubops.reviewer_flag([forged, stale], REVIEWER, HEAD))
+        newer_clean = review(REVIEWER, HEAD, {"critical": {}}, at="2026-11-01T03:00:00Z")
+        flagged = review(REVIEWER, HEAD, {"needs_human": "x"})
+        self.assertIsNone(broker.githubops.reviewer_flag([flagged, newer_clean], REVIEWER, HEAD))
+        self.assertEqual(broker.githubops.reviewer_flag([flagged], REVIEWER, HEAD), "x")
+        broken = {**flagged, "body": "Review.\n\n<!-- pr-reviewer-state {not json -->"}
+        self.assertIsNone(broker.githubops.reviewer_flag([broken], REVIEWER, HEAD))
+
+    def test_off_without_repos(self):
+        with mock.patch.object(broker, "HUMAN_REVIEW_REPOS", []):
+            broker.sync_human_review()
+        self.assertEqual(self.gh.calls, [])
+
+    def test_page_shows_the_pr_escaped(self):
+        self.flag()
+        broker.scan()
+        status, body = self.request("GET", "/r/hr1")
+        self.assertEqual(status, 200)
+        self.assertIn("Widen &lt;RBAC&gt;", body)
+        self.assertIn("rbac.yaml", body)
 
 
 if __name__ == "__main__":

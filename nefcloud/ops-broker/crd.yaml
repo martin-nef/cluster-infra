@@ -54,6 +54,8 @@ spec:
                   message: github-rerun-workflow needs github.runID
                 - rule: "!has(self.github) || self.verb != 'github-dispatch-workflow' || has(self.github.workflow)"
                   message: github-dispatch-workflow needs github.workflow
+                - rule: "!has(self.github) || self.verb != 'github-human-review' || (has(self.github.pr) && has(self.github.headSHA))"
+                  message: github-human-review needs github.pr and headSHA
                 - rule: "!has(self.target) || self.verb != 'delete-pod' || self.target.kind == 'Pod'"
                   message: delete-pod targets a Pod
                 - rule: "!has(self.target) || self.verb != 'rollout-restart' || self.target.kind in ['Deployment', 'StatefulSet', 'DaemonSet']"
@@ -67,7 +69,7 @@ spec:
                   type: string
                   enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume,
                          github-commit-workflows, github-protect-branch, github-rerun-workflow, github-dispatch-workflow,
-                         github-create-repo]
+                         github-create-repo, github-human-review]
                 target:
                   type: object
                   required: [kind, namespace, name]
@@ -151,6 +153,14 @@ spec:
                       additionalProperties:
                         type: string
                         maxLength: 1000
+                    pr:
+                      description: github-human-review; the PR's number.
+                      type: integer
+                      minimum: 1
+                    headSHA:
+                      description: github-human-review; the PR's head now. The sign-off covers exactly this commit.
+                      type: string
+                      pattern: ^[0-9a-f]{40}$
                     private:
                       description: github-create-repo; default true.
                       type: boolean

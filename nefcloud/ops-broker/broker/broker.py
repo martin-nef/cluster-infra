@@ -21,6 +21,12 @@ GitHub's sign-in, and the minter acts with your token for that one call:
 
   github-create-repo
 
+One verb isn't an action but a sign-off (README, "Human review required"):
+
+  github-human-review   An agent flags a PR; nobody merges it until you
+                        approve. The broker keeps a human-review status on
+                        every open PR head of HUMAN_REVIEW_REPOS (sync_loop).
+
 The broker checks the target exists, marks the request Pending, and sends an
 ntfy notification linking to PUBLIC_URL/r/<name>. That page is behind Traefik's
 oauth2-proxy (Google) login; the broker runs the action only when someone in
@@ -89,6 +95,10 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose repos the GitHub verbs touch
+# Repos whose open PRs get a human-review status (and should require it); empty: off.
+HUMAN_REVIEW_REPOS = [r.strip() for r in os.environ.get("HUMAN_REVIEW_REPOS", "").split(",") if r.strip()]
+REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  # its needs_human flags count
+SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
 
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 K8S_API = "https://kubernetes.default.svc"
@@ -355,6 +365,81 @@ def act(spec, uid, code=None):
         k8s("PATCH", path, {"spec": {"suspend": verb == "flux-suspend"}})
         return "suspended" if verb == "flux-suspend" else "resumed"
     raise ValueError(f"unknown verb {verb!r}")
+
+
+# human review
+
+def human_review_requests(items, repo):
+    """{pr number: its github-human-review requests, oldest first}."""
+    out = {}
+    for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"]):
+        g = r["spec"].get("github") or {}
+        if r["spec"].get("verb") == "github-human-review" and g.get("repo") == repo:
+            out.setdefault(int(g["pr"]), []).append(r)
+    return out
+
+
+def human_review_state(head, reqs):
+    """(status state, description, whether a request covers this head) for a PR
+    head, from its human-review requests, oldest first. The newest decides:
+    only your sign-off of exactly this head clears it."""
+    if not reqs:
+        return "success", "not flagged", False
+    last = reqs[-1]
+    p, sha, reason = phase(last), last["spec"]["github"]["headSHA"], last["spec"]["reason"]
+    if sha != head:
+        return "pending", "new commits since it was flagged: flag it again", False
+    if p == "Succeeded":
+        return "success", f"signed off by {last['status'].get('decidedBy', 'a human')}", True
+    if p == "Denied":
+        return "pending", f"denied by {last['status'].get('decidedBy', 'a human')}: change it and flag it again", True
+    if p in ("", "Pending", "Approved"):
+        return "pending", f"human review required: {reason}", True
+    if p == "Expired":
+        # Not covered any more, so the reviewer's flag, if it still stands, is filed again.
+        return "pending", "flag expired without a sign-off: flag it again", False
+    # Rejected, Failed, Unknown: nobody signed it off. Not filed again by itself,
+    # so a request that keeps being rejected (a full queue) can't loop.
+    return "pending", f"flag {p.lower()} without a sign-off: flag it again", True
+
+
+def file_human_review(repo, pr, head, reason):
+    """File a request for the reviewer's flag. The admission policy stamps this
+    broker as the requester; the reason says whose flag it is."""
+    k8s("POST", REQUESTS, {
+        "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
+        "metadata": {"generateName": "github-human-review-", "namespace": NAMESPACE},
+        "spec": {"verb": "github-human-review", "github": {"repo": repo, "pr": pr, "headSHA": head},
+                 "reason": f"{REVIEWER_LOGIN}: {reason}"[:2000], "ttlSeconds": MAX_TTL},
+    }, content_type="application/json")
+    print(json.dumps({"time": stamp(), "event": "filed", "action": f"github-human-review {GITHUB_OWNER}/{repo}#{pr}",
+                      "reason": reason}), flush=True)
+
+
+def sync_human_review():
+    """One pass: every open PR head of HUMAN_REVIEW_REPOS gets its human-review
+    status, and reviewer flags with no request yet get one."""
+    if not HUMAN_REVIEW_REPOS or MINTER.status() is None:
+        return
+    items = list_requests()
+    for repo in HUMAN_REVIEW_REPOS:
+        reqs = human_review_requests(items, repo)
+        try:
+            to_file = githubops.sync(MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])),
+                                     REVIEWER_LOGIN)
+            for pr, head, reason in to_file:
+                file_human_review(repo, pr, head, reason)
+        except (githubops.GitHubError, K8sError, OSError) as e:
+            print(f"human-review sync {repo}: {e}", flush=True)
+
+
+def sync_loop():
+    while True:
+        try:
+            sync_human_review()
+        except Exception as e:
+            print(f"human-review sync: {e!r}", flush=True)
+        time.sleep(SYNC_EVERY)
 
 
 def notify(req):
@@ -883,6 +968,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=scan_loop, daemon=True).start()
+    threading.Thread(target=sync_loop, daemon=True).start()
     server = ThreadingHTTPServer(("", 8080), Handler)
     print(f"Listening on :8080; approvals at {PUBLIC_URL}; ntfy {'on' if NTFY_URL else 'off'}", flush=True)
     server.serve_forever()

@@ -74,10 +74,15 @@ PERMISSIONS = {
     "administration": "write",
     "contents": "write",
     "metadata": "read",
+    # github-human-review: read PRs and their reviews, set the human-review status.
+    # An App created before these needs them added on GitHub (README).
+    "pull_requests": "read",
+    "statuses": "write",
     "workflows": "write",
 }
 # verb -> step -> the token's permissions. "check" covers the scan's checks and
-# the approval page; "run" only an approved request.
+# the approval page; "run" only an approved request; "sync" the broker's own
+# pass over open PRs (github-human-review only).
 TOKENS = {
     "github-commit-workflows": {"check": {"contents": "read"}, "run": {"contents": "write", "workflows": "write"}},
     "github-protect-branch": {"check": {"administration": "read"}, "run": {"administration": "write"}},
@@ -86,6 +91,9 @@ TOKENS = {
     # Checks the name is free: metadata on every repo the App is installed on,
     # since the repo it names doesn't exist yet. Runs as a user action instead.
     "github-create-repo": {"check": {"metadata": "read"}},
+    # sync: every open PR's head and reviews, and its human-review status.
+    "github-human-review": {"check": {"pull_requests": "read"}, "run": {"statuses": "write"},
+                            "sync": {"pull_requests": "read", "statuses": "write"}},
 }
 # Verbs whose check token isn't scoped to the request's repo (it doesn't exist).
 ACCOUNT_CHECKS = {"github-create-repo"}
