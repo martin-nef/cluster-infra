@@ -1370,6 +1370,15 @@ class TestHumanReview(Served, GitHubBase):
             broker.sync_human_review()
         self.assertEqual((created, self.status()), ([], "success"))
 
+    def test_nobody_is_asked_about_an_excluded_repo(self):
+        with mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"web"}):
+            self.flag()
+            broker.scan()
+        st = self.api.status("hr1")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("without human review", st["message"])
+        self.notify.assert_not_called()
+
     def test_every_installed_repo_but_the_excluded_archived_and_quiet_ones(self):
         self.gh.installed += [{"name": "old", "open_issues_count": 3, "archived": True},
                               {"name": "quiet", "open_issues_count": 0},

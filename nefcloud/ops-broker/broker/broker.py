@@ -102,8 +102,8 @@ SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "martin-nef")  # the account whose repos the GitHub verbs touch
 # Every repo the ops App is installed on gets human-review statuses and the
-# ruleset that requires them, but these. The reviewer's flags there aren't
-# filed either (an agent's own still are).
+# ruleset that requires them, but these, which are fully automatic: no
+# reviewer's flags filed, and an agent's own github-human-review is rejected.
 HUMAN_REVIEW_EXCLUDE = {r.strip() for r in os.environ.get("HUMAN_REVIEW_EXCLUDE", "").split(",") if r.strip()}
 REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  # its needs_human flags count
 # GitHub logins whose Approve of a flagged PR's head signs it off, like approving
@@ -339,11 +339,14 @@ def check_github(spec):
     try:
         if MINTER.status() is None:
             return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
-        if spec.get("verb") == "github-require-human-review":
-            repo = spec["github"].get("repo")
-            if repo in HUMAN_REVIEW_EXCLUDE:
-                # Its PRs get no status, so a required check would hold them all.
-                return f"{repo} is in HUMAN_REVIEW_EXCLUDE: the broker sets no human-review status there"
+        repo = spec["github"].get("repo")
+        if spec.get("verb") == "github-require-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
+            # Its PRs get no status, so a required check would hold them all.
+            return f"{repo} is in HUMAN_REVIEW_EXCLUDE: the broker sets no human-review status there"
+        if spec.get("verb") == "github-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
+            # Fully automatic: nothing would hold the PR while you looked, so
+            # you're not asked, and the agent learns that at once.
+            return f"{repo} is in HUMAN_REVIEW_EXCLUDE: its PRs merge without human review, so nobody is asked"
         return githubops.check(MINTER, spec)
     except githubops.GitHubError as e:
         if e.transient:
