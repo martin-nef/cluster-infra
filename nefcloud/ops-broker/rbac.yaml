@@ -53,8 +53,9 @@ rules:
     resources: [opsrequests]
     verbs: [get, list, watch, delete]
   # Files a github-human-review request for the PR reviewer's needs_human
-  # flag (its Jobs have no API access). Admission stamps this ServiceAccount
-  # as the requester, so it's a request like any other: you still decide it.
+  # flag (its Jobs have no API access), and a github-require-human-review one
+  # for a repo without the ruleset. Admission stamps this ServiceAccount as the
+  # requester, so they're requests like any other: you still decide them.
   - apiGroups: [ops.nefcloud.top]
     resources: [opsrequests]
     verbs: [create]

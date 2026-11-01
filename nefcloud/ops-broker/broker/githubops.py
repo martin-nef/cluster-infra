@@ -18,9 +18,13 @@ with a third App (the "ops" App) whose key only the token minter holds:
                             human: the human-review status on its head turns
                             success. Until then sync() keeps it pending, and a
                             required human-review check keeps the PR unmerged.
+  github-require-human-review
+                            Add the standard human-review ruleset (RULESET) to
+                            a repo that has none, which makes the check
+                            required there. The broker files these itself.
 
 Every call uses an installation token for one repo with only the permissions
-that step needs, asked of the minter sidecar (minter.py) by verb and step and
+that step needs (the sync's, for every repo: it covers them all each pass), asked of the minter sidecar (minter.py) by verb and step and
 revoked as soon as the step is done. Checks and the approval page use
 read-only tokens; only an approved run gets write. This process never sees
 the App's key.
@@ -44,7 +48,7 @@ GITHUB_API = "https://api.github.com"
 
 # The verbs this module runs. Their tokens' permissions are minter.TOKENS.
 VERBS = ("github-commit-workflows", "github-protect-branch", "github-rerun-workflow", "github-dispatch-workflow",
-         "github-create-repo", "github-human-review")
+         "github-create-repo", "github-human-review", "github-require-human-review")
 # Run by the minter with the owner's own token (minter.USER_ACTIONS).
 USER_VERBS = ("github-create-repo",)
 # The one rule github-protect-branch applies: changes reach the branch only
@@ -60,9 +64,23 @@ WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
 BRANCH = re.compile(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*")
 REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 RERUNNABLE = {"failure", "cancelled", "timed_out", "startup_failure"}
-# The commit status sync() keeps on every open PR head of HUMAN_REVIEW_REPOS,
-# made a required check there, pinned to the ops App: only this broker sets it.
+# The commit status sync() keeps on every open PR head of every repo the ops App
+# is installed on, made a required check by RULESET, pinned to the ops App: only
+# this broker sets it.
 HUMAN_REVIEW = "human-review"
+
+
+def ruleset(app_id):
+    """The one human-review ruleset, the same on every repo: the check is
+    required on the default branch, from the ops App only, so no other App or
+    user can set it. Repo admins (you) bypass it, so you can always merge.
+    Beside the branch rule, not in it: it adds a check without rewriting it."""
+    return {"name": HUMAN_REVIEW, "target": "branch", "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [{"type": "required_status_checks", "parameters": {
+                "strict_required_status_checks_policy": False,
+                "required_status_checks": [{"context": HUMAN_REVIEW, "integration_id": int(app_id)}]}}],
+            "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
 # The marker the PR reviewer ends each review with (pr-reviewer job.py STATE_MARK).
 REVIEW_MARK = "<!-- pr-reviewer-state "
 
@@ -152,7 +170,8 @@ class Minter:
         return self.call("setup", code=code)["app"]
 
     def token(self, repo, verb, step):
-        """A Token for one repo, with what this verb's step ("check" or "run") needs."""
+        """A Token for one repo, with what this verb's step ("check" or "run") needs.
+        repo None: every repo the App is installed on (the sync's step only)."""
         return Token(self.call("token", repo=repo, verb=verb, step=step)["token"], self.owner, repo)
 
 
@@ -160,7 +179,8 @@ class Token:
     """Revoked when the with-block ends, so no write token outlives its step."""
 
     def __init__(self, token, owner, repo):
-        self.token, self.repo = token, f"/repos/{q(owner)}/{q(repo)}"
+        # No repo: a token for every repo, called with whole paths.
+        self.token, self.repo = token, f"/repos/{q(owner)}/{q(repo)}" if repo else ""
 
     def __enter__(self):
         return self
@@ -277,8 +297,21 @@ def check_human_review(tok, repo, g):
     return None
 
 
+def check_require(tok, repo, g):
+    if has_ruleset(tok):
+        return f"{g['repo']} already has a {HUMAN_REVIEW} ruleset; change it on GitHub"
+    return None
+
+
+def has_ruleset(tok, prefix=""):
+    """Whether the repo has a ruleset named human-review. Only the name is
+    compared: one you've edited by hand is yours, and isn't replaced."""
+    return any(r.get("name") == HUMAN_REVIEW for r in pages(tok, f"{prefix}/rulesets?includes_parents=false"))
+
+
 CHECKS = {
     "github-human-review": check_human_review,
+    "github-require-human-review": check_require,
     "github-commit-workflows": check_commit,
     "github-protect-branch": check_protect,
     "github-rerun-workflow": check_rerun,
@@ -322,6 +355,8 @@ def act(minter, spec, code=None):
     except GitHubError as e:
         raise NothingChanged(f"no token: {e}") from None
     with tok:
+        if spec["verb"] == "github-require-human-review":
+            return act_require(tok, minter.status()["app_id"])
         return ACTS[spec["verb"]](tok, g)
 
 
@@ -373,6 +408,14 @@ def act_human_review(tok, g):
     return f"signed off #{g['pr']} at {g['headSHA'][:12]}"
 
 
+def act_require(tok, app_id):
+    # Never a second one beside a ruleset made since the check.
+    if has_ruleset(tok):
+        raise NothingChanged(f"a {HUMAN_REVIEW} ruleset appeared since the request; left it alone")
+    made = tok("POST", "/rulesets", ruleset(app_id))
+    return f"added the {HUMAN_REVIEW} ruleset (id {made.get('id')})"
+
+
 def status_body(state, description):
     return {"state": state, "context": HUMAN_REVIEW, "description": description[:140]}
 
@@ -412,49 +455,58 @@ def reviewer_flag(reviews, reviewer, head):
     return reason.strip()[:500], state.get("ready", True) is not False
 
 
-def pages(tok, path):
+def pages(tok, path, key=None):
     """Every item of a list, page by page: a PR past the 100th still gets its
-    status, and a review past the 100th still counts."""
+    status, and a review past the 100th still counts. key: the list is under
+    this key of each page."""
     out, page = [], 1
     while True:
         items = tok("GET", f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")
+        items = items[key] if key else items
         out += items
         if len(items) < 100:
             return out
         page += 1
 
 
-def sync(minter, repo, desired, reviewer, recheck=None):
+def installed(tok):
+    """[(name, its open issues and PRs)] of every unarchived repo the App is
+    installed on. tok: a token for every repo."""
+    return [(r["name"], r.get("open_issues_count", 1))
+            for r in pages(tok, "/installation/repositories", "repositories") if not r.get("archived")]
+
+
+def sync(tok, owner, repo, desired, reviewer, recheck=None):
     """Set the human-review status on every open PR head in repo to what
     desired(pr number, head sha) says. Returns (the reviewer's flags that have
     no request yet: [(pr number, head sha, reason)], the open PR numbers).
     desired returns (state, description, flagged), flagged meaning a request
     covers this head. recheck(pr number, head sha) is asked again, from fresh
     requests, before a success is turned pending: a sign-off may have landed
-    since desired's were read."""
+    since desired's were read. tok: the pass's token for every repo."""
     to_file, numbers = [], set()
-    with minter.token(repo, "github-human-review", "sync") as tok:
-        for pr in pages(tok, "/pulls?state=open"):
-            number, head = pr["number"], pr["head"]["sha"]
-            numbers.add(number)
-            state, description, flagged = desired(number, head)
-            reason = None
-            if not flagged:
-                flag = reviewer_flag(pages(tok, f"/pulls/{number}/reviews"), reviewer, head)
-                if flag:
-                    reason, ready = flag
-                    if ready:
-                        to_file.append((number, head, reason))
-                        state, description = "pending", f"human review required: {reason}"
-                    else:
-                        # Held, but nobody is pinged until the author has done what's required.
-                        state, description = "pending", f"human review after the required changes: {reason}"
-            current = tok("GET", f"/commits/{head}/status")
-            mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
-            if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
-                state, description, _ = recheck(number, head)
-            if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
-                tok("POST", f"/statuses/{head}", status_body(state, description))
+    base = f"/repos/{q(owner)}/{q(repo)}"
+    for pr in pages(tok, f"{base}/pulls?state=open"):
+        number, head = pr["number"], pr["head"]["sha"]
+        numbers.add(number)
+        state, description, flagged = desired(number, head)
+        reason = None
+        if not flagged:
+            flag = reviewer_flag(pages(tok, f"{base}/pulls/{number}/reviews"), reviewer, head)
+            if flag:
+                reason, ready = flag
+                if ready:
+                    to_file.append((number, head, reason))
+                    state, description = "pending", f"human review required: {reason}"
+                else:
+                    # Held, but nobody is pinged until the author has done what's required.
+                    state, description = "pending", f"human review after the required changes: {reason}"
+        current = tok("GET", f"{base}/commits/{head}/status")
+        mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
+        if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
+            state, description, _ = recheck(number, head)
+        if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
+            tok("POST", f"{base}/statuses/{head}", status_body(state, description))
     return to_file, numbers
 
 
@@ -490,6 +542,14 @@ def details(minter, spec):
             return details_commit(tok, web, g)
         if spec["verb"] == "github-human-review":
             return details_human_review(tok, web, g)
+        if spec["verb"] == "github-require-human-review":
+            return (f"<p>Adds the standard <code>{HUMAN_REVIEW}</code> ruleset to "
+                    f"{link(web + '/settings/rules', g['repo'])}, which has none now. A PR into "
+                    f"<code>{e(repo['default_branch'])}</code> then needs the <code>{HUMAN_REVIEW}</code> check, "
+                    "set only by the ops App: green unless an agent flagged the PR and you haven't signed it off. "
+                    "You bypass it as the repo's admin. The broker already keeps the check on every open PR "
+                    "there, so nothing waits on a check that never comes.</p>"
+                    f"<pre>{e(json.dumps(ruleset(minter.status()['app_id']), indent=2))}</pre>")
         if spec["verb"] == "github-protect-branch":
             return (f"<p>Adds this rule to {link(web + '/settings/branches', repo['default_branch'])}, "
                     "which has none now: changes only through a PR with one approval. You can still "

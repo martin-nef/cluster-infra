@@ -91,12 +91,17 @@ TOKENS = {
     # Checks the name is free: metadata on every repo the App is installed on,
     # since the repo it names doesn't exist yet. Runs as a user action instead.
     "github-create-repo": {"check": {"metadata": "read"}},
-    # sync: every open PR's head and reviews, and its human-review status.
+    # sync: every open PR's head and reviews, and its human-review status, on
+    # every repo the App is installed on (and their rulesets, by metadata).
     "github-human-review": {"check": {"pull_requests": "read"}, "run": {"statuses": "write"},
                             "sync": {"pull_requests": "read", "statuses": "write"}},
+    "github-require-human-review": {"check": {"administration": "read"}, "run": {"administration": "write"}},
 }
 # Verbs whose check token isn't scoped to the request's repo (it doesn't exist).
 ACCOUNT_CHECKS = {"github-create-repo"}
+# Steps whose token covers every repo, asked for with no repo: the sync covers
+# them all each pass, and one token per pass costs one mint, not one per repo.
+ACCOUNT_STEPS = {("github-human-review", "sync")}
 REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
 
@@ -430,12 +435,15 @@ def handle(req):
         permissions = TOKENS.get(verb, {}).get(step) if isinstance(verb, str) and isinstance(step, str) else None
         if permissions is None:
             raise GitHubError(400, f"no token for verb {verb!r}, step {step!r}")
-        if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo) or repo in (".", ".."):
+        every = (verb, step) in ACCOUNT_STEPS
+        if every and repo is not None:
+            raise GitHubError(400, f"{verb} {step} is for every repo; ask with no repo")
+        if not every and (not isinstance(repo, str) or not REPO_NAME.fullmatch(repo) or repo in (".", "..")):
             raise GitHubError(400, f"{repo!r} isn't a repo name")
         app = load()
         if app is None:
             raise GitHubError(404, "the ops App isn't set up")
-        token = app.token(None if verb in ACCOUNT_CHECKS else repo, permissions)
+        token = app.token(None if every or verb in ACCOUNT_CHECKS else repo, permissions)
         audit("token", repo=repo, verb=verb, step=step)
         return {"token": token}
     if op == "setup":
