@@ -389,9 +389,10 @@ ACTS = {
 # --- human-review statuses ---------------------------------------------------------
 
 def reviewer_flag(reviews, reviewer, head):
-    """The reason the PR reviewer's latest review asks for a human, if that
-    review is of head and asks; else None. Only reviews the API says are the
-    reviewer's count, so nobody else can forge one."""
+    """(reason, ready) if the PR reviewer's latest review is of head and asks
+    for a human; else None. ready is False while the author still has required
+    changes to make: the PR is held, but nobody is asked yet. Only reviews the
+    API says are the reviewer's count, so nobody else can forge one."""
     mine = [r for r in reviews if (r.get("user") or {}).get("login", "").lower() == reviewer.lower()]
     if not mine:
         return None
@@ -405,7 +406,10 @@ def reviewer_flag(reviews, reviewer, head):
     except ValueError:
         return None
     reason = state.get("needs_human") if isinstance(state, dict) else None
-    return reason.strip()[:500] if isinstance(reason, str) and reason.strip() else None
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    # A reviewer from before `ready` asks straight away.
+    return reason.strip()[:500], state.get("ready", True) is not False
 
 
 def pages(tok, path):
@@ -436,10 +440,15 @@ def sync(minter, repo, desired, reviewer, recheck=None):
             state, description, flagged = desired(number, head)
             reason = None
             if not flagged:
-                reason = reviewer_flag(pages(tok, f"/pulls/{number}/reviews"), reviewer, head)
-                if reason:
-                    to_file.append((number, head, reason))
-                    state, description = "pending", f"human review required: {reason}"
+                flag = reviewer_flag(pages(tok, f"/pulls/{number}/reviews"), reviewer, head)
+                if flag:
+                    reason, ready = flag
+                    if ready:
+                        to_file.append((number, head, reason))
+                        state, description = "pending", f"human review required: {reason}"
+                    else:
+                        # Held, but nobody is pinged until the author has done what's required.
+                        state, description = "pending", f"human review after the required changes: {reason}"
             current = tok("GET", f"/commits/{head}/status")
             mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
             if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:

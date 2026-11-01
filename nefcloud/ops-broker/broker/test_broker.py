@@ -1226,6 +1226,32 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(spec["reason"], f"{REVIEWER}: it widens RBAC")
         self.assertEqual(self.status(), "pending")
 
+    def test_the_reviewers_flag_waits_until_nothing_is_required(self):
+        # Flagged with required changes: held, but you aren't pinged and then pinged again.
+        self.gh.reviews[5] = [review(REVIEWER, HEAD, {"required": {"bug": "Bug"}, "needs_human": "RBAC",
+                                                      "ready": False})]
+        created = []
+
+        def k8s(method, path, body=None, content_type=None):
+            if method == "POST" and path == broker.REQUESTS:
+                created.append(body)
+                self.api.requests["hr1"] = {"metadata": {"name": "hr1", "resourceVersion": "1",
+                                                         "creationTimestamp": broker.stamp()}, "spec": body["spec"]}
+                return body
+            return self.api(method, path, body)
+        with mock.patch.object(broker, "k8s", k8s):
+            broker.sync_human_review()
+            self.assertEqual((len(created), self.status()), (0, "pending"))
+            self.assertIn("after the required changes", self.gh.statuses[HEAD][0]["description"])
+            # The author fixed them; the reviewer's review of the new head says ready.
+            self.gh.pulls[5]["head"]["sha"] = "n" * 40
+            self.gh.reviews[5].append(review(REVIEWER, "n" * 40, {"needs_human": "RBAC", "ready": True},
+                                             at="2026-11-01T05:00:00Z"))
+            broker.sync_human_review()
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["spec"]["github"]["headSHA"], "n" * 40)
+        self.assertEqual(self.status("n" * 40), "pending")
+
     def test_only_the_reviewers_own_latest_review_of_this_head_counts(self):
         forged = review("agent[bot]", HEAD, {"needs_human": "x"}, at="2026-11-01T02:00:00Z")
         stale = review(REVIEWER, "o" * 40, {"needs_human": "x"})
@@ -1233,7 +1259,9 @@ class TestHumanReview(Served, GitHubBase):
         newer_clean = review(REVIEWER, HEAD, {"critical": {}}, at="2026-11-01T03:00:00Z")
         flagged = review(REVIEWER, HEAD, {"needs_human": "x"})
         self.assertIsNone(broker.githubops.reviewer_flag([flagged, newer_clean], REVIEWER, HEAD))
-        self.assertEqual(broker.githubops.reviewer_flag([flagged], REVIEWER, HEAD), "x")
+        self.assertEqual(broker.githubops.reviewer_flag([flagged], REVIEWER, HEAD), ("x", True))
+        not_yet = review(REVIEWER, HEAD, {"needs_human": "x", "ready": False})
+        self.assertEqual(broker.githubops.reviewer_flag([not_yet], REVIEWER, HEAD), ("x", False))
         broken = {**flagged, "body": "Review.\n\n<!-- pr-reviewer-state {not json -->"}
         self.assertIsNone(broker.githubops.reviewer_flag([broken], REVIEWER, HEAD))
 
