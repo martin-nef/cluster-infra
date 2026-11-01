@@ -1326,6 +1326,50 @@ class TestHumanReview(Served, GitHubBase):
         self.assertIn("Widen &lt;RBAC&gt;", body)
         self.assertIn("rbac.yaml", body)
 
+    def approve_on_github(self, login="owner", commit=HEAD, state="APPROVED", at="2026-11-01T02:00:00Z"):
+        self.gh.reviews[5].append({**review(login, commit, at=at), "state": state})
+
+    def test_your_approve_on_github_signs_off_the_flag(self):
+        self.flag()
+        broker.scan()
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.approve_on_github()
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"Owner"}):
+            broker.sync_human_review()
+            st = self.api.status("hr1")
+            self.assertEqual((st["phase"], st["decidedBy"]), ("Succeeded", "owner (GitHub review)"))
+            self.assertEqual(self.status(), "success")
+            writes = len(self.gh.writes())
+            broker.sync_human_review()  # the request now says the same: nothing to write
+            self.assertEqual(len(self.gh.writes()), writes)
+
+    def test_only_a_current_approve_by_you_counts(self):
+        self.flag()
+        broker.scan()
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
+            for kw in ({"login": "agent[bot]"}, {"commit": "o" * 40}, {"state": "COMMENTED"}):
+                self.gh.reviews[5] = []
+                self.approve_on_github(**kw)
+                broker.sync_human_review()
+                self.assertEqual((self.status(), self.api.status("hr1")["phase"]), ("pending", "Pending"), kw)
+            # Approved, then asked for changes: the later one stands.
+            self.gh.reviews[5] = []
+            self.approve_on_github()
+            self.approve_on_github(state="CHANGES_REQUESTED", at="2026-11-01T03:00:00Z")
+            self.approve_on_github(state="COMMENTED", at="2026-11-01T04:00:00Z")  # a comment changes nothing
+            broker.sync_human_review()
+            self.assertEqual(self.status(), "pending")
+
+    def test_a_reviewer_flag_you_already_approved_isnt_filed(self):
+        self.gh.reviews[5] = [review(REVIEWER, HEAD, {"needs_human": "rbac"})]
+        self.approve_on_github()
+        created = []
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}), \
+                mock.patch.object(broker, "file_human_review", lambda *a: created.append(a)):
+            broker.sync_human_review()
+        self.assertEqual((created, self.status()), ([], "success"))
+
     def test_every_installed_repo_but_the_excluded_archived_and_quiet_ones(self):
         self.gh.installed += [{"name": "old", "open_issues_count": 3, "archived": True},
                               {"name": "quiet", "open_issues_count": 0},
