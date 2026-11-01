@@ -34,7 +34,9 @@ v3 covers what GitHub only lets *you* do, not an App: creating a repo. Approving
 | `flux-suspend` / `flux-resume` | same | Sets `spec.suspend`. |
 | `github-*` | a repo | See [GitHub verbs](#github-verbs-v2). |
 
-A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired`, or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 15 minutes, at most 3 wait at once, and finished ones are kept 90 days, or 7 for `Rejected` and `Expired`, which decided nothing (`config.env`).
+A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired`, or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 15 minutes unless they ask for longer (`spec.ttlSeconds`, up to 12 hours). Each requester named in `PENDING_CAPS` has its own pending slots (the interactive agent: 3), and everyone else shares 3. Finished ones are kept 90 days, or 7 for `Rejected` and `Expired`, which decided nothing (`config.env`). Approving checks the target again first. If it has gone, been replaced, or moved on (a branch that has new commits, a rule someone already set), the request ends `Rejected` and nothing runs.
+
+A request that will still be waiting at 07:00 doesn't notify you between 22:00 and 07:00 (London time); one digest at 07:00 lists them all. See [Async requesters](#async-requesters).
 
 ## GitHub verbs (v2)
 
@@ -70,6 +72,35 @@ spec:
 ```
 
 **Setup, from the phone, once.** Open <https://ops.nefcloud.top/github> and press **Create the App on GitHub**. GitHub shows a pre-filled `martin-nef-ops`, private to `martin-nef`, with `actions`, `administration`, `contents` and `workflows` write. Confirm it there, and it sends you back to the broker, which hands GitHub's one-time code to the minter. Then install it on `martin-nef` from the link the page shows; *All repositories* is fine (below). Until then, GitHub requests are `Rejected` with a link to the setup page.
+
+## Async requesters
+
+The night agents (roadmap: *Night shift*) file requests while you sleep, and keep working on other things while they wait. The v1 rules were made for a human at the phone: a 15-minute expiry, and 3 pending slots shared by everyone. They don't fit that.
+
+```yaml
+spec:
+  verb: rollout-restart
+  target: {kind: Deployment, namespace: valheim, name: valheim}
+  reason: ...
+  ttlSeconds: 36000   # wait until morning; at most MAX_TTL (12 h)
+```
+
+- **Who asked comes from the API server, not the request.** A `MutatingAdmissionPolicy` (`admission.yaml`) sets `spec.requester` to `request.userInfo.username` on create, overwriting anything the request said. The validating policy then refuses any request where it isn't the creator, so if the mutating policy is ever missing or broken, requests fail closed instead of being taken at their word. The page, the list, the audit lines and `kubectl get opsrequests -o wide` show it.
+- **The TTL is the requester's choice, within a cap.** `spec.ttlSeconds` (60 s to 24 h in the schema), capped by `MAX_TTL` (12 h) in the broker. Above the cap it's clamped rather than refused, and `status.expiresAt` says when it actually expires. A night agent asks for long enough to reach the morning. The interactive agent keeps the 15-minute default: you're at the phone, and an old request is more likely to be stale.
+- **Pending caps per requester.** `PENDING_CAPS` gives named requesters slots of their own, and everyone else shares `MAX_PENDING`. A night agent with a dozen blocked streams can't take the slots the interactive agent needs, and the reverse. When a night agent gets its own ServiceAccount, it gets a line here. That's a PR to this repo: a requester can't raise its own cap.
+- **Quiet hours and a morning digest.** Between `QUIET_HOURS` (in `QUIET_TZ`), a request that will still be waiting when they end is admitted but not announced (`status.notifiedAt` stays unset). When they end, one notification lists them all and links to the list. A request that would expire before morning is announced right away, since it's only worth anything now. So the interactive agent at 1am, with its 15-minute default, still reaches you. There's no list of "async" requesters to keep in sync: the TTL a request asks for decides. Each held request is marked before the digest is sent, so a lost digest costs time (the list shows them anyway), and a repeated one can't happen.
+- **Approval re-checks the world.** A request approved 8 hours after it was made may describe a world that's gone. Approve now runs the same check as admission before claiming the request. For cluster verbs, the target's UID must match the one recorded on admission, so a Deployment deleted and recreated, or a pod replaced, is a different target. For GitHub verbs, the branch must still be at `baseSHA`, the rule still absent, the run still failed, the new repo's name still free. If any of that changed, the request ends `Rejected` with the reason, and nothing runs. If the check itself can't complete (an API or GitHub outage, the minter down), nothing is decided: the request stays `Pending`, and you can press Approve again. The checks at run time stay in place for the race between this check and the action: the pod UID precondition, the non-forced ref update, the second protection read.
+
+What it keeps from v1: approval still needs the Google login. A long TTL only means the request can wait longer for one. `spec` is still immutable and hash-checked. A request past its TTL is still `Expired`, never approved late. What a long TTL does add is a longer window for you to approve something that's no longer what you'd want. The re-check covers what the broker can see, but not every change of intent: a reason that was true at 2am may not be by 9. That's why the TTL is capped, and why the page shows when each request was made.
+
+Decided against:
+
+- **A separate approval page or verb set for async requesters.** Same verbs, same page. Only the timing differs.
+- **Setting `requester` by a webhook, or by the broker from managedFields.** A webhook is a new service in the admission path. `managedFields.manager` is the client's own claim (any string the requester sends as `fieldManager`). The MAP is in-tree (GA in 1.36), so it adds nothing to run.
+- **Quiet hours by requester.** That would be one more list to keep in sync. The TTL already says whether a request can wait.
+- **Refusing a TTL above the cap.** Refusing would make an agent's request fail at 2am over a config value it can't see. Clamping, with `expiresAt` in the status, tells it the outcome instead.
+
+Can't be tested without a cluster: the mutating policy itself. After the merge, create a request and check `kubectl -n ops-broker get opsrequest <name> -o jsonpath='{.spec.requester}'` is `system:serviceaccount:claude-remote:claude-remote`. Also check that a request with a `requester` of something else still comes back with yours. If the policy fails, every create is refused (`failurePolicy: Fail`), and Headlamp is the fallback until it's fixed.
 
 ## Design decisions
 
@@ -144,7 +175,7 @@ Decided against, for now:
 
 - **`patch` is broader than the verbs.** RBAC can't say "only this annotation", so the broker's ServiceAccount can patch any field of Deployments, StatefulSets, DaemonSets and the four Flux kinds cluster-wide, and delete any pod. The code only sends the fixed patches above, and nothing but an approved request reaches that code. A ValidatingAdmissionPolicy limiting this ServiceAccount's updates to those fields would close it. It's left for later because it can't be tested without a cluster.
 - **Approvals are as strong as your Google session.** oauth2-proxy cookies last 7 days. Anyone with your unlocked phone can approve. There's no second factor at approve time.
-- **Who asked isn't recorded by the API.** Anything allowed to create OpsRequests can file one. Today that's the agent and cluster admins. When there are more requesters, an admission policy that stamps `request.userInfo` onto the object is the fix.
+- **Who asked is stamped by admission** (see [Async requesters](#async-requesters)). Anything allowed to create OpsRequests can still file one. Today that is the agent and cluster admins.
 - **The ntfy topic is a shared secret, but not a security one.** It's random and SOPS-encrypted (`secrets.yaml`), so outsiders can't read what the agent asks for. Knowing it lets someone send you fake notifications. Those can only link somewhere else, so check the link is `ops.nefcloud.top` before you sign in to anything. The agent generated this topic, so it knows it. A reserved topic with an access token on ntfy, or a self-hosted ntfy, would take that away.
 - **Polling, not watching.** The broker lists requests every 5 seconds. A watch would be quicker, but it's more code to get right for no real gain at this volume.
 - **Audit lives in etcd for 90 days.** Each request's status records who decided what and when, and the broker prints one JSON line per transition (`kubectl -n ops-broker logs deploy/ops-broker`). Logs go when the pod does, and there is no API server audit log on k3s here.

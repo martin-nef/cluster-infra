@@ -4,7 +4,8 @@
 # stops the broker's retention cleanup and holds quota forever. The CRD's own
 # rules can't see metadata, so this refuses both on create, for every requester.
 # Only CREATE: nothing but admins may update requests, and the API server's own
-# foreground-deletion finalizer must keep working.
+# foreground-deletion finalizer must keep working. It also checks the requester
+# stamp below took.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -22,6 +23,10 @@ spec:
       message: OpsRequests may not have ownerReferences (they would let the garbage collector delete the audit record)
     - expression: "!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0"
       message: OpsRequests may not have finalizers (they would block retention cleanup)
+    # Set by the mutating policy below, which runs first. If that policy is
+    # missing or broken, requests are refused rather than taken at their word.
+    - expression: "has(object.spec.requester) && object.spec.requester == request.userInfo.username"
+      message: spec.requester must be the creator; the opsrequests-requester policy sets it, so it isn't running
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -30,3 +35,32 @@ metadata:
 spec:
   policyName: opsrequests-plain-metadata
   validationActions: [Deny]
+---
+# Who asked, as the API server authenticated them, so the approval page and the
+# per-requester pending caps (config.env PENDING_CAPS) don't rest on the
+# requester's word. Overwrites whatever spec.requester the request carried.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: opsrequests-requester
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [ops.nefcloud.top]
+        apiVersions: ["*"]
+        operations: [CREATE]
+        resources: [opsrequests]
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >-
+          Object{spec: Object.spec{requester: request.userInfo.username}}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: opsrequests-requester
+spec:
+  policyName: opsrequests-requester

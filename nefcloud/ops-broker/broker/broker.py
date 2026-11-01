@@ -30,8 +30,20 @@ reach ntfy.sh too, but it can't log in as you.
 
 Every transition is written to the request's status (the audit trail, kept for
 RETENTION_DAYS; Rejected and Expired ones, which decided nothing, for
-SHORT_RETENTION_DAYS) and printed as one JSON line. Unanswered requests expire
-after REQUEST_TTL seconds; at most MAX_PENDING wait at once.
+SHORT_RETENTION_DAYS) and printed as one JSON line.
+
+Requests from agents that run while you sleep (README, "Async requesters"):
+
+- spec.requester is stamped by an admission policy from the API server's view
+  of who created it, so the page and the caps can trust it.
+- spec.ttlSeconds picks how long it waits, REQUEST_TTL by default and at most
+  MAX_TTL.
+- Each requester named in PENDING_CAPS has its own pending slots; everyone else
+  shares MAX_PENDING. So a night agent can't take the interactive agent's slots.
+- During QUIET_HOURS, a request that will still be waiting when they end isn't
+  announced; one digest lists them all when they end.
+- Approving checks the target again, so a request approved hours later never
+  acts on a target that has since been replaced or moved on.
 
 Status writes carry the resourceVersion the broker read, so if two broker pods
 overlap (a deleted pod's replacement starts before it has gone), only one can
@@ -55,7 +67,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time as clock, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # -I leaves the script's directory off sys.path; githubops.py sits beside it.
@@ -65,7 +78,13 @@ import githubops  # noqa: E402
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
 ALLOWED_APPROVERS = {e.strip().lower() for e in os.environ["ALLOWED_APPROVERS"].split(",") if e.strip()}
 REQUEST_TTL = int(os.environ.get("REQUEST_TTL", "900"))
-MAX_PENDING = int(os.environ.get("MAX_PENDING", "3"))
+MAX_PENDING = int(os.environ.get("MAX_PENDING", "3"))  # shared by requesters not in PENDING_CAPS
+MAX_TTL = int(os.environ.get("MAX_TTL", "43200"))
+# "user=n,user=n": requesters (API server usernames) with pending slots of their own.
+PENDING_CAPS = {u.strip(): int(n) for u, _, n in
+                (c.rpartition("=") for c in os.environ.get("PENDING_CAPS", "").split(",") if c.strip())}
+QUIET_HOURS = os.environ.get("QUIET_HOURS", "")  # "22:00-07:00" in QUIET_TZ; empty: never quiet
+QUIET_TZ = os.environ.get("QUIET_TZ", "UTC")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
@@ -174,6 +193,66 @@ def phase(req):
     return req.get("status", {}).get("phase", "")
 
 
+def requester(req):
+    """Who created it, as the admission policy stamped it. Older requests, and
+    any made while the policy was missing, have none and share the pool."""
+    return req["spec"].get("requester", "")
+
+
+def ttl(req):
+    """Seconds it may wait for a decision: the requester's choice, capped."""
+    return min(int(req["spec"].get("ttlSeconds") or REQUEST_TTL), MAX_TTL)
+
+
+def expires(req):
+    return parse_time(req["metadata"]["creationTimestamp"]) + timedelta(seconds=ttl(req))
+
+
+def pending_cap(who):
+    """(the pool a requester's pending requests count against, its size)."""
+    return (who, PENDING_CAPS[who]) if who in PENDING_CAPS else ("", MAX_PENDING)
+
+
+def quiet_window():
+    """(start, end) clock times of the quiet hours, or None."""
+    if not QUIET_HOURS:
+        return None
+    start, _, end = QUIET_HOURS.partition("-")
+    return tuple(clock(*map(int, t.strip().split(":"))) for t in (start, end))
+
+
+try:
+    QUIET_ZONE = ZoneInfo(QUIET_TZ)
+except ZoneInfoNotFoundError:  # no tzdata: better quiet at the wrong hour than never
+    print(f"QUIET_TZ {QUIET_TZ!r} unknown; using UTC", flush=True)
+    QUIET_ZONE = timezone.utc
+
+
+def quiet_until(t=None):
+    """When the quiet hours in progress at t end, or None if it isn't quiet."""
+    window = quiet_window()
+    if window is None:
+        return None
+    start, end = window
+    local = (t or now()).astimezone(QUIET_ZONE)
+    today_end = datetime.combine(local.date(), end, QUIET_ZONE)
+    if start <= end:
+        quiet = start <= local.time() < end
+    else:  # over midnight
+        quiet = local.time() >= start or local.time() < end
+        if local.time() >= start:
+            today_end += timedelta(days=1)
+    return today_end.astimezone(timezone.utc) if quiet else None
+
+
+def held(req, t=None):
+    """Whether to save its notification for the digest: it's quiet now, and the
+    request will still be waiting when it stops being quiet. One that would
+    expire before then is announced now, since it's only worth anything now."""
+    until = quiet_until(t)
+    return until is not None and expires(req) > until
+
+
 def describe(req):
     s = req["spec"]
     if s["verb"] in GITHUB_VERBS:
@@ -184,7 +263,7 @@ def describe(req):
 
 def audit(event, req, **fields):
     print(json.dumps({"time": stamp(), "event": event, "request": req["metadata"]["name"],
-                      "action": describe(req), **fields}), flush=True)
+                      "action": describe(req), "requester": requester(req), **fields}), flush=True)
 
 
 def set_status(req, **status):
@@ -281,17 +360,35 @@ def act(spec, uid, code=None):
 def notify(req):
     if not NTFY_URL:
         return
-    server, _, topic = NTFY_URL.rstrip("/").rpartition("/")
     url = f"{PUBLIC_URL}/r/{req['metadata']['name']}"
-    body = {
-        "topic": topic,
+    send({
         "title": f"Approve? {describe(req)}",
         "message": req["spec"]["reason"][:300],
         "priority": 4,
         "tags": ["rotating_light"],
         "click": url,
         "actions": [{"action": "view", "label": "Review", "url": url, "clear": True}],
-    }
+    })
+
+
+def notify_digest(reqs):
+    """One notification for the requests held through the quiet hours."""
+    lines = [f"{describe(r)} ({requester(r) or 'unknown requester'}), until {stamp(expires(r))}" for r in reqs]
+    send({
+        "title": f"{len(reqs)} ops request{'s' if len(reqs) != 1 else ''} waiting since the night",
+        "message": "\n".join(lines)[:1000],
+        "priority": 3,
+        "tags": ["sunrise"],
+        "click": f"{PUBLIC_URL}/",
+        "actions": [{"action": "view", "label": "Review", "url": f"{PUBLIC_URL}/", "clear": True}],
+    })
+
+
+def send(body):
+    if not NTFY_URL:
+        return
+    server, _, topic = NTFY_URL.rstrip("/").rpartition("/")
+    body = {"topic": topic, **body}
     try:
         urllib.request.urlopen(urllib.request.Request(
             server, data=json.dumps(body).encode(), method="POST",
@@ -312,7 +409,7 @@ def age(req):
 def tidy(req):
     """Expire, recover or delete one request that is past its time."""
     p = phase(req)
-    if p in ("", "Pending") and age(req) > REQUEST_TTL:
+    if p in ("", "Pending") and now() > expires(req):
         set_status(req, phase="Expired", message="nobody approved it in time", finishedAt=stamp())
         audit("expired", req)
     elif p == "Approved" and (now() - parse_time(req["status"].get("decidedAt") or stamp())).total_seconds() > STRANDED_AFTER:
@@ -326,20 +423,46 @@ def tidy(req):
 
 
 def admit(req, pending):
-    """Check a new request and either reject it or make it Pending. Returns
-    whether it is now Pending."""
+    """Check a new request and either reject it or make it Pending. pending
+    counts the Pending requests per pool (pending_cap). Returns whether it is
+    now Pending."""
     problem, uid = check(req)
-    if problem is None and pending >= MAX_PENDING:
-        problem = f"{MAX_PENDING} requests already wait for a decision"
+    pool, cap = pending_cap(requester(req))
+    if problem is None and pending.get(pool, 0) >= cap:
+        problem = (f"{cap} requests from {pool} already wait for a decision" if pool else
+                   f"{cap} requests already wait for a decision")
     if problem:
         set_status(req, phase="Rejected", message=problem, finishedAt=stamp())
         audit("rejected", req, reason=problem)
         return False
-    set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid,
-               message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
-    audit("pending", req, reason=req["spec"]["reason"])
-    notify(req)
+    hold = held(req)
+    status = {"phase": "Pending", "specHash": spec_hash(req), "targetUID": uid, "expiresAt": stamp(expires(req)),
+              "message": f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}"
+                         + (" (announced when the quiet hours end)" if hold else "")}
+    if not hold:
+        status["notifiedAt"] = stamp()
+    set_status(req, **status)
+    audit("pending", req, reason=req["spec"]["reason"], held=hold)
+    if not hold:
+        notify(req)
     return True
+
+
+def digest(items):
+    """Once the quiet hours are over, announce what they held, in one message.
+    Each is marked first: a lost digest only costs time, a repeated one is noise."""
+    if quiet_until() is not None:
+        return
+    waiting = [r for r in items if phase(r) == "Pending" and not r["status"].get("notifiedAt")]
+    marked = []
+
+    def mark(req):
+        set_status(req, notifiedAt=stamp())
+        marked.append(req)
+    each(waiting, mark)
+    if marked:
+        audit("digest", marked[0], requests=[r["metadata"]["name"] for r in marked])
+        notify_digest(marked)
 
 
 def each(items, fn):
@@ -358,13 +481,18 @@ def scan():
     with lock:
         items = sorted(list_requests(), key=lambda r: r["metadata"]["creationTimestamp"])
         each(items, tidy)
-        pending = sum(phase(r) == "Pending" for r in items)
+        pending = {}
+        for r in items:
+            if phase(r) == "Pending":
+                pool = pending_cap(requester(r))[0]
+                pending[pool] = pending.get(pool, 0) + 1
 
         def admit_new(req):
-            nonlocal pending
             if phase(req) == "" and admit(req, pending):
-                pending += 1
+                pool = pending_cap(requester(req))[0]
+                pending[pool] = pending.get(pool, 0) + 1
         each(items, admit_new)
+        digest(items)
 
 
 def decidable(name, seen_hash):
@@ -375,7 +503,7 @@ def decidable(name, seen_hash):
         return None, ((404 if e.code == 404 else 502), str(e))
     if phase(req) != "Pending":
         return None, (409, f"it is {phase(req) or 'not yet admitted'}, not Pending")
-    if age(req) > REQUEST_TTL:
+    if now() > expires(req):
         return None, (409, "it has expired")
     # spec is immutable in the CRD; this also catches a page that went stale.
     if seen_hash != spec_hash(req) or seen_hash != req["status"].get("specHash"):
@@ -392,6 +520,24 @@ def decide(name, decision, seen_hash, approver, code=None):
             return refused
         if decision == "approve" and req["spec"]["verb"] in USER_VERBS and not code:
             return 400, "this one needs you to sign in to GitHub; approve it from its page"
+        if decision == "approve":
+            # The world may have moved on since it was admitted, hours ago for a
+            # night agent's request: check again, and never act on a replaced
+            # target or a branch that has moved.
+            try:
+                problem, uid = check(req)
+            except (K8sError, githubops.GitHubError) as e:
+                return 502, f"couldn't check the target again ({e}); try again"
+            if problem is None and uid != req["status"].get("targetUID"):
+                problem = "the target was replaced since the request (its UID changed)"
+            if problem:
+                try:
+                    set_status(req, phase="Rejected", finishedAt=stamp(),
+                               message=f"not run, the target changed since the request: {problem}")
+                except K8sError as e:
+                    return (409 if e.code == 409 else 502), f"not recorded: {e}"
+                audit("rejected", req, reason=problem, by=approver)
+                return 409, f"Not run: the target changed since the request: {problem}"
         # The claim is conditional on the version just read: if another broker
         # pod decided it in the meantime, this one stops here.
         try:
@@ -464,7 +610,9 @@ def request_page(req):
             ("Target", target),
             ("Phase", e(st.get("phase", "new"))),
             ("Status", e(st.get("message", ""))),
-            ("Created", e(req["metadata"]["creationTimestamp"]))]
+            ("Requester", e(s.get("requester") or "unknown (made without the admission policy)")),
+            ("Created", e(req["metadata"]["creationTimestamp"])),
+            ("Expires", e(stamp(expires(req))))]
     if st.get("decidedBy"):
         rows.append(("Decided by", e(st["decidedBy"])))
     body = (f"<h1>{e(req['metadata']['name'])}</h1><table>"
@@ -499,7 +647,8 @@ def index_page(items):
     items = [r for r in items if phase(r) == "Pending"] + [r for r in items if phase(r) != "Pending"][:30]
     rows = "".join(
         f'<tr><td><a href="/r/{e(r["metadata"]["name"])}">{e(r["metadata"]["name"])}</a></td>'
-        f"<td><code>{e(describe(r))}</code></td><td>{e(phase(r) or 'new')}</td></tr>"
+        f"<td><code>{e(describe(r))}</code></td><td>{e(requester(r).rpartition(':')[2] or '?')}</td>"
+        f"<td>{e(phase(r) or 'new')}</td></tr>"
         for r in items)
     return (f"<h1>Ops requests</h1><table>{rows or '<tr><td>None yet.</td></tr>'}</table>"
             '<p><a href="/github">GitHub App</a></p>')
