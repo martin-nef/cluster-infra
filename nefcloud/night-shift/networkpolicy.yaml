@@ -1,0 +1,72 @@
+# Default deny, then one policy per exception, as in claude-remote/ and
+# pr-reviewer/. The task Jobs run an agent on repos' code, so they get the
+# internet over HTTPS (GitHub, Anthropic, package registries) and nothing
+# inside: no LAN, tailnet, cluster services or API server. No ingress at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: night-shift
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: night-shift
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# The apiserver, for the runner only: it manages the Jobs and files OpsRequests. Endpoints are the
+# k3s servers' tailnet IPs (see claude-remote/networkpolicy.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apiserver
+  namespace: night-shift
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: night-shift-runner
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: {cidr: 100.64.0.0/10}
+      ports:
+        - {protocol: TCP, port: 6443}
+---
+# Public HTTPS only, the same exceptions as the agent's internet policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-internet-https
+  namespace: night-shift
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - {protocol: TCP, port: 443}

@@ -1,0 +1,13 @@
+# The sandbox of the night shift (martin-nef/agent-harness): the runner that
+# starts the nightly agents' Jobs, and the Jobs themselves. It lives here, not
+# in the app repo, because the agents open PRs to that repo: whatever limits
+# them must not be changeable from there. The app repo's deploy/ is applied as
+# night-shift-deployer (rbac.yaml), which can only manage the workload.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - networkpolicy.yaml
+  - quota.yaml
+  - pvc.yaml

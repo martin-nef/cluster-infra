@@ -9,3 +9,4 @@ resources:
   - cv-current.yaml
   - claude-remote.yaml
   - pr-reviewer.yaml
+  - night-shift.yaml

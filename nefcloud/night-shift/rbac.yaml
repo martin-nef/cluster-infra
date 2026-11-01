@@ -1,0 +1,111 @@
+# The runner starts each task as a Job (with a ConfigMap holding its task.json),
+# waits for it, reads its pods' logs for the outcome, and cleans up. Task pods
+# run as the default ServiceAccount with no token mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runner
+  namespace: night-shift
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: runner
+  namespace: night-shift
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, delete]
+  # create can't be limited to a name: any ConfigMap in this namespace. It
+  # holds no secrets; the code ConfigMap is Flux's and is re-applied.
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create, get, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: runner
+  namespace: night-shift
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: runner
+subjects:
+  - kind: ServiceAccount
+    name: runner
+    namespace: night-shift
+---
+# The ops broker (nefcloud/ops-broker/): the runner files human-review flags
+# for the PRs a task asks for, and reads the requests a stream is blocked on.
+# File and read only; approval stays on the page behind your Google login. It
+# has its own PENDING_CAPS slots there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: night-shift-ops-requests
+  namespace: ops-broker
+rules:
+  - apiGroups: [ops.nefcloud.top]
+    resources: [opsrequests]
+    verbs: [create, get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: night-shift-ops-requests
+  namespace: ops-broker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: night-shift-ops-requests
+subjects:
+  - kind: ServiceAccount
+    name: runner
+    namespace: night-shift
+---
+# The account Flux impersonates to apply agent-harness's deploy/
+# (spec.serviceAccountName of nefcloud/apps/night-shift.yaml): ConfigMaps,
+# Secrets and the CronJob only. No RBAC, NetworkPolicy, quota, PVC or Jobs, so
+# a change to the app repo can't widen what the runner or a task may do.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: night-shift-deployer
+  namespace: flux-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: night-shift-deployer
+  namespace: night-shift
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, secrets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [batch]
+    resources: [cronjobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: night-shift-deployer
+  namespace: night-shift
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: night-shift-deployer
+subjects:
+  - kind: ServiceAccount
+    name: night-shift-deployer
+    namespace: flux-system

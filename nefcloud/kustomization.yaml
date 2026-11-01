@@ -12,3 +12,4 @@ resources:
   - claude-remote
   - ops-broker
   - pr-reviewer
+  - night-shift
