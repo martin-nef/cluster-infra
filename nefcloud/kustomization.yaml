@@ -13,3 +13,4 @@ resources:
   - ops-broker
   - pr-reviewer
   - night-shift
+  - observability

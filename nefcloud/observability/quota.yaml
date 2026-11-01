@@ -1,0 +1,41 @@
+# Live game servers share these nodes. Sized for VictoriaMetrics and the
+# collector plus one collector surge pod during a rollout (VictoriaMetrics is
+# Recreate). Grafana raises this when it moves in.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: observability
+  namespace: observability
+spec:
+  hard:
+    requests.cpu: 200m
+    requests.memory: 512Mi
+    limits.cpu: "1"
+    limits.memory: 1536Mi
+    requests.ephemeral-storage: 512Mi
+    limits.ephemeral-storage: 2Gi
+    requests.storage: 5Gi
+    persistentvolumeclaims: "1"
+    pods: "4"
+    services: "2"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: observability
+  namespace: observability
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 20m
+        memory: 64Mi
+        ephemeral-storage: 64Mi
+      default:
+        cpu: 200m
+        memory: 256Mi
+        ephemeral-storage: 256Mi
+      max:
+        cpu: "1"
+        memory: 1Gi
+        ephemeral-storage: 1Gi
