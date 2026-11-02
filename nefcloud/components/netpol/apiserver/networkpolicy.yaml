@@ -1,0 +1,19 @@
+# The apiserver. NetworkPolicy sees the Service's endpoints (the k3s servers'
+# tailnet IPs, port 6443), not its ClusterIP, so allow 6443 on the whole
+# tailnet range: no node IPs to keep in sync, and only k3s servers listen on
+# 6443 there. The rest of the tailnet stays denied.
+#
+# Every pod by default; narrow podSelector with a patch when only some pods
+# talk to the apiserver.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apiserver
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: {cidr: 100.64.0.0/10}
+      ports:
+        - {protocol: TCP, port: 6443}
