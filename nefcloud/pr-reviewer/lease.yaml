@@ -1,0 +1,9 @@
+# Which receiver copy starts queued review Jobs (pr-reviewer docs/design.md,
+# "Several receivers, no lock"). Created here so the receiver needs no create
+# on Leases, only get/update on this one. No spec: the receiver writes it, and
+# Flux only owns the fields set here, so it doesn't undo the holder.
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: receiver-resume
+  namespace: pr-reviewer

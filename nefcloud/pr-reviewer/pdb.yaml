@@ -1,0 +1,12 @@
+# Keeps one receiver copy up through a node drain, so GitHub's deliveries keep
+# landing. The receiver runs two copies with a rolling update.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: receiver
+  namespace: pr-reviewer
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: receiver

@@ -1,6 +1,7 @@
 # The receiver manages the review Jobs in this namespace (create, list to see
 # what runs, patch to resume or fold into a queued one, delete when a PR
-# closes) and nothing else. The Jobs run as the namespace's default
+# closes) and holds the one Lease that says which copy starts Jobs, and
+# nothing else. The Jobs run as the namespace's default
 # ServiceAccount with no token mounted.
 apiVersion: v1
 kind: ServiceAccount
@@ -17,6 +18,10 @@ rules:
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [create, list, patch, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [receiver-resume]
+    verbs: [get, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

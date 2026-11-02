@@ -11,3 +11,5 @@ resources:
   - networkpolicy.yaml
   - quota.yaml
   - service.yaml
+  - lease.yaml
+  - pdb.yaml
