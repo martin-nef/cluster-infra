@@ -446,6 +446,12 @@ def human_review_state(head, reqs):
     return "pending", f"flag {p.lower()} without a sign-off: flag it again", True
 
 
+def review_url(reqs):
+    """The ops page of a PR's newest human-review request, or None if it has
+    none: the human-review check's Details link."""
+    return f"{PUBLIC_URL}/r/{reqs[-1]['metadata']['name']}" if reqs else None
+
+
 def file_human_review(repo, pr, head, reason):
     """File a request for the reviewer's flag. The admission policy stamps this
     broker as the requester; the reason says whose flag it is."""
@@ -510,7 +516,7 @@ def sync_human_review(rulesets=False):
         try:
             to_file, OPEN_PRS[repo], approved = githubops.sync(
                 MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck,
-                HUMAN_REVIEWERS)
+                HUMAN_REVIEWERS, link=lambda pr, head: review_url(reqs.get(pr, [])))
             for pr, head, reason in to_file:
                 file_human_review(repo, pr, head, reason)
             for pr, head, login in approved:
