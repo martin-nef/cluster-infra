@@ -1,0 +1,17 @@
+# nefcloud/pr-reviewer/networkpolicy.yaml, from the components.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: pr-reviewer
+components:
+  - ../../../nefcloud/components/netpol/default-deny
+  - ../../../nefcloud/components/netpol/dns
+  - ../../../nefcloud/components/netpol/apiserver
+  - ../../../nefcloud/components/netpol/internet-https
+  - ../../../nefcloud/components/netpol/from-traefik
+patches:
+  # Only the receiver manages Jobs and takes GitHub's webhooks.
+  - target: {kind: NetworkPolicy, name: allow-apiserver|allow-from-traefik}
+    patch: |-
+      - op: replace
+        path: /spec/podSelector
+        value: {matchLabels: {app.kubernetes.io/name: receiver}}

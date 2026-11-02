@@ -1,0 +1,10 @@
+# Default deny for every pod in the namespace, then one policy per exception.
+# Policies only ever add allows, which is why an app repo's deployer can't
+# create them.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
