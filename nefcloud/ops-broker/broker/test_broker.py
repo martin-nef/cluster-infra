@@ -1177,6 +1177,21 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         self.assertEqual(len(self.gh.writes()), writes)  # same status: no second write
 
+    def test_the_check_links_to_the_request(self):
+        broker.sync_human_review()
+        self.assertNotIn("target_url", self.gh.statuses[HEAD][0])  # not flagged: nothing to link
+        self.flag()
+        broker.scan()
+        broker.sync_human_review()
+        self.assertEqual(self.gh.statuses[HEAD][0]["target_url"], f"{broker.PUBLIC_URL}/r/hr1")
+        writes = len(self.gh.writes())
+        broker.sync_human_review()
+        self.assertEqual(len(self.gh.writes()), writes)  # same link: no second write
+        # A status from before links existed gets one, even though nothing else changed.
+        del self.gh.statuses[HEAD][0]["target_url"]
+        broker.sync_human_review()
+        self.assertEqual(self.gh.statuses[HEAD][0]["target_url"], f"{broker.PUBLIC_URL}/r/hr1")
+
     def test_a_flag_holds_the_pr_until_signed_off(self):
         self.flag()
         broker.scan()  # admitted: Pending

@@ -435,8 +435,11 @@ def approve_pr(minter, g):
     return "; approved on GitHub"
 
 
-def status_body(state, description):
-    return {"state": state, "context": HUMAN_REVIEW, "description": description[:140]}
+def status_body(state, description, url=None):
+    body = {"state": state, "context": HUMAN_REVIEW, "description": description[:140]}
+    if url:
+        body["target_url"] = url  # "Details" on the PR's check: the request's ops page
+    return body
 
 
 ACTS = {
@@ -531,7 +534,7 @@ class Lazy:
         return self.tok(*args)
 
 
-def sync(minter, repo, desired, reviewer, recheck=None, humans=()):
+def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None):
     """Set the human-review status on every open PR head in repo to what
     desired(pr number, head sha) says, or success where one of humans approved
     the head on GitHub. Returns (the reviewer's flags that have no request yet:
@@ -540,8 +543,9 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=()):
     desired returns (state, description, flagged), flagged meaning a request
     covers this head. recheck(pr number, head sha) is asked again, from fresh
     requests, before a success is turned pending: a sign-off may have landed
-    since desired's were read. Reads with a read-only token; one that can write
-    statuses is minted only if a status has to change."""
+    since desired's were read. link(pr number, head sha) is the status's
+    target_url (the request's ops page), or None. Reads with a read-only token;
+    one that can write statuses is minted only if a status has to change."""
     to_file, numbers, approved = [], set(), []
     with minter.token(repo, "github-human-review", "sync") as tok, \
             Lazy(lambda: minter.token(repo, "github-human-review", "write")) as write:
@@ -574,8 +578,10 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=()):
             mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
             if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
                 state, description, _ = recheck(number, head)
-            if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
-                write("POST", f"/statuses/{head}", status_body(state, description))
+            url = link(number, head) if link else None
+            if not mine or ((mine[0].get("state"), mine[0].get("description"), mine[0].get("target_url") or None)
+                            != (state, description[:140], url)):
+                write("POST", f"/statuses/{head}", status_body(state, description, url))
     return to_file, numbers, approved
 
 
