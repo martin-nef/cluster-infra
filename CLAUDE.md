@@ -2,6 +2,17 @@ Manages the nodes (ansible/) and the k3s cluster (nefcloud/, reconciled by Flux 
 
 Important! Do not `kubectl apply`. Everything under nefcloud/ is managed through Flux: commit + push to `main`, then `flux reconcile kustomization <name> --with-source` if you don't want to wait. The one exception is an app's `<name>-sops-age` secret: the ops broker makes it (`create-sops-age-key`), or you create it with kubectl (see SOPS below).
 
+## What goes where
+
+This repo holds cluster-wide config only: the nodes, cluster services every app shares (Flux, Traefik, Longhorn, Tailscale, the ops broker), and, for each Flux app, what Flux needs plus the app's limits:
+
+- `nefcloud/apps/<name>.yaml` (generated, see below) and its line in `flux-apps`;
+- `nefcloud/<name>/`: the namespace, ResourceQuota, RBAC (including what the app's deployer may manage) and NetworkPolicy. These are the limits on the app and its agents, so they stay out of the app's own reach.
+
+Everything else of a Flux app goes in its own repo's `deploy/`: Deployments, Services, Ingresses, PVCs, ConfigMaps, PodDisruptionBudgets, Leases, Jobs, CRs. If the app's deployer can't manage a kind yet, widen its RBAC here and put the object there: two PRs, this one first. Don't put the object here because the RBAC is easier.
+
+`nefcloud/pr-reviewer/service.yaml` and `nefcloud/night-shift/pvc.yaml` predate this rule and are to move.
+
 ## Adding a new Flux app
 
 An app is its own GitHub repo under `martin-nef/` with its manifests in `deploy/`. Registering it here is one line plus CI. Do not hand-write `nefcloud/apps/<name>.yaml` for a new app, `flux.sh` generates it.
