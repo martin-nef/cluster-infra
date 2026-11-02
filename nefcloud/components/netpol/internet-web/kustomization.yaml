@@ -1,0 +1,19 @@
+# internet-https plus port 80, as allow-internet-web. The address list stays in
+# internet-https/networkpolicy.yaml. Use one of the two, not both.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+components:
+  - ../internet-https
+patches:
+  - target:
+      kind: NetworkPolicy
+      name: allow-internet-https
+    options:
+      allowNameChange: true
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: allow-internet-web
+      - op: add
+        path: /spec/egress/0/ports/-
+        value: {protocol: TCP, port: 80}

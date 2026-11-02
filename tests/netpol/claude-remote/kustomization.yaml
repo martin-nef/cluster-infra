@@ -1,0 +1,9 @@
+# nefcloud/claude-remote/networkpolicy.yaml, from the components.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: claude-remote
+components:
+  - ../../../nefcloud/components/netpol/default-deny
+  - ../../../nefcloud/components/netpol/dns
+  - ../../../nefcloud/components/netpol/apiserver
+  - ../../../nefcloud/components/netpol/internet-web
