@@ -1,0 +1,37 @@
+# OTLP over HTTP in, metrics out to VictoriaMetrics' OTLP endpoint. Only a
+# metrics pipeline: Claude Code's events (OTEL_LOGS_EXPORTER) have nowhere to
+# go yet, so senders should export metrics only.
+#
+# VictoriaMetrics stores delta sums as-is, which breaks increase() and rate().
+# Claude Code exports delta by default, so a sender sets
+# OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative (the core
+# collector has no deltatocumulative processor).
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch: {}
+
+exporters:
+  otlp_http/victoria-metrics:
+    metrics_endpoint: http://victoria-metrics.observability.svc.cluster.local:8428/opentelemetry/v1/metrics
+    compression: gzip
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/victoria-metrics]
