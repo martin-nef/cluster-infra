@@ -35,6 +35,9 @@ os.environ.update(
     MAX_PENDING="2",
     RETENTION_DAYS="90",
     GITHUB_OWNER="owner",
+    # Announced on the scan that admits them, unless a test says otherwise.
+    NOTIFY_DEBOUNCE="0",
+    NOTIFY_INTERVAL="0",
 )
 import broker  # noqa: E402  (reads the environment above at import)
 import minter  # noqa: E402
@@ -397,7 +400,8 @@ class TestScan(Base):
             self.api.add(f"r{i}", "flux-reconcile", "Kustomization", "flux-system", "web", age=10 - i)
         broker.scan()
         self.assertEqual([self.api.status(f"r{i}")["phase"] for i in range(3)], ["Pending", "Pending", "Rejected"])
-        self.assertEqual(self.notify.call_count, 2)
+        self.notify.assert_called_once()  # one summary of both
+        self.assertEqual([r["metadata"]["name"] for r in self.notify.call_args[0][0]], ["r0", "r1"])
 
     def test_stale_new_requests_expire_before_taking_slots(self):
         # After a broker outage: three stale unadmitted requests and a fresh one.
@@ -636,7 +640,7 @@ class TestHTTP(Served, Base):
         status, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("/r/waiting", body)
-        self.assertEqual(body.count("/r/done"), 30)
+        self.assertEqual(body.count("/r/done"), broker.ITEMS_SHOWN)  # one group; the rest is on its page
 
     def test_page_escapes_the_reason(self):
         self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
@@ -644,7 +648,7 @@ class TestHTTP(Served, Base):
         broker.scan()
         status, body = self.request("GET", "/r/r1")
         self.assertEqual(status, 200)
-        self.assertNotIn("<script>", body)
+        self.assertNotIn("<script>alert", body)
         self.assertIn("&lt;script&gt;", body)
         self.assertIn('name=decision value=approve', body)
 
@@ -663,6 +667,77 @@ class TestHTTP(Served, Base):
         self.assertEqual(self.request("POST", "/r/r1", origin="https://evil.test", form=form)[0], 403)
         self.assertEqual(self.api.status("r1")["phase"], "Pending")
         self.assertEqual(self.api.actions(), [])
+
+    def add_in(self, name, who, workstream=None, **status):
+        self.api.add(name, "rollout-restart", "Deployment", "app", "web", **status)
+        spec = self.api.requests[name]["spec"]
+        spec["requester"] = who
+        if workstream:
+            spec["workstream"] = workstream
+
+    def test_index_groups_by_agent_and_workstream(self):
+        with mock.patch.object(broker, "MAX_PENDING", 10):
+            self.add_in("a1", AGENT, "fix valheim")
+            self.add_in("a2", AGENT, "fix valheim")
+            self.add_in("b1", AGENT, "ci")
+            self.add_in("n1", NIGHT, "roadmap-42", phase="Succeeded")
+            broker.scan()
+        status, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("3 requests waiting, in 2 groups.", body)
+        self.assertEqual(body.count("<details class=group open>"), 2)
+        self.assertEqual(body.count("<details class=group>"), 1)  # nothing waiting: closed
+        self.assertIn("<b>claude-remote</b> · fix valheim<span class=badge>2 waiting</span>", body)
+        self.assertLess(body.index("fix valheim"), body.index("roadmap-42"))
+        for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
+            self.assertIn(f'href="/g/{broker.group_id(key)}"', body)
+
+    def test_group_page_decides_each_request(self):
+        with mock.patch.object(broker, "MAX_PENDING", 10):
+            self.add_in("a1", AGENT, "fix valheim")
+            self.add_in("a2", AGENT, "fix valheim")
+            self.add_in("b1", AGENT, "ci")
+            broker.scan()
+        gid = broker.group_id((AGENT, "fix valheim"))
+        status, body = self.request("GET", f"/g/{gid}")
+        self.assertEqual(status, 200)
+        self.assertIn("Waiting (2)", body)
+        self.assertNotIn("/r/b1", body)
+        for name in ("a1", "a2"):
+            self.assertIn(f'<form method=post action="/r/{name}">', body)
+        self.assertEqual(body.count("name=decision value=approve"), 2)
+        h = self.api.status("a1")["specHash"]
+        status, body = self.request("POST", "/r/a1", form={"decision": "approve", "hash": h})
+        self.assertEqual(status, 200)
+        self.assertIn(f'href="/g/{gid}">Its group', body)
+        self.assertEqual(self.api.status("a1")["phase"], "Succeeded")
+        self.assertEqual(self.api.status("a2")["phase"], "Pending")
+        self.assertEqual(self.request("GET", "/g/000000000000")[0], 404)
+        self.assertEqual(self.request("GET", "/g/../r")[0], 404)
+
+    def test_buttons_give_feedback_and_the_csp_allows_only_that_script(self):
+        self.admit("r1", "rollout-restart", "Deployment", "app", "web")
+        conn = http.client.HTTPConnection(*self.server.server_address)
+        conn.request("GET", "/r/r1", headers={"X-Auth-Request-Email": APPROVER})
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        csp = resp.getheader("Content-Security-Policy")
+        scripts = re.findall(r"<script>(.*?)</script>", body, re.S)
+        self.assertEqual(len(scripts), 1)
+        digest = base64.b64encode(__import__("hashlib").sha256(scripts[0].encode()).digest()).decode()
+        self.assertIn(f"script-src 'sha256-{digest}'", csp)
+        self.assertIn('data-busy="Approving…"', body)
+        # The decision is a hidden field: disabling the button can't drop it.
+        self.assertIn("<input type=hidden name=decision value=approve>", body)
+
+    def test_a_decided_request_keeps_its_reason(self):
+        self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
+        self.api.requests["r1"]["spec"]["reason"] = "long " * 150 + "end"
+        broker.scan()
+        broker.decide("r1", "deny", self.api.status("r1")["specHash"], APPROVER)
+        self.assertEqual(self.api.status("r1")["phase"], "Denied")
+        body = self.request("GET", "/r/r1")[1]
+        self.assertIn("long " * 150 + "end", body)
 
     def test_path_cannot_escape_the_queue(self):
         for path in ("/r/..%2F..%2Fsecrets", "/r/..", "/r/a/b"):
@@ -842,6 +917,27 @@ class TestGitHubHTTP(Served, GitHubBase):
         self.assertIn("with this repo's secrets", body)
         self.assertIn("value=approve", body)
 
+    def test_a_decided_request_still_says_what_it_asked_for(self):
+        self.admit_github("r1", "github-commit-workflows", **COMMIT)
+        h = self.api.status("r1")["specHash"]
+        self.assertEqual(broker.decide("r1", "deny", h, APPROVER)[0], 200)
+        status, body = self.request("GET", "/r/r1")
+        self.assertEqual(status, 200)
+        self.assertIn("What it asked for", body)
+        self.assertIn("ci: build &lt;arm64&gt;", body)
+        self.assertIn(".github/workflows/ci.yml", body)
+        self.assertIn("pull_request", body)
+        self.assertNotIn("value=approve", body)
+
+    def test_a_group_page_sends_github_approvals_to_their_own_page(self):
+        self.admit_github("r1", "github-commit-workflows", **COMMIT)
+        gid = broker.group_id(broker.group_key(self.api.requests["r1"]))
+        status, body = self.request("GET", f"/g/{gid}")
+        self.assertEqual(status, 200)
+        self.assertIn('href="/r/r1">Review and approve', body)  # the diff is there, not here
+        self.assertNotIn("value=approve", body)
+        self.assertIn("value=deny", body)
+
     def test_no_approve_without_details(self):
         self.admit_github("r1", "github-rerun-workflow", repo="web", runID=7)
         self.gh.fail[("GET", f"{REPO}/actions/runs/7")] = broker.githubops.GitHubError(502, "x")
@@ -1015,8 +1111,7 @@ class TestAsync(Base):
         super().setUp()
         for p in (mock.patch.object(broker, "PENDING_CAPS", {AGENT: 2, NIGHT: 3}),
                   mock.patch.object(broker, "MAX_TTL", 43200),
-                  mock.patch.object(broker, "QUIET_HOURS", ""),
-                  mock.patch.object(broker, "notify_digest", mock.Mock())):
+                  mock.patch.object(broker, "QUIET_HOURS", "")):
             p.start()
             self.addCleanup(p.stop)
 
@@ -1078,14 +1173,13 @@ class TestAsync(Base):
             self.assertNotIn("notifiedAt", self.api.status("night"))
             self.assertIn("notifiedAt", self.api.status("urgent"))
             self.notify.assert_called_once()
-            self.assertEqual(self.notify.call_args[0][0]["metadata"]["name"], "urgent")
-            broker.notify_digest.assert_not_called()
-            # Morning: one digest for what the night held, once.
+            self.assertEqual([r["metadata"]["name"] for r in self.notify.call_args[0][0]], ["urgent"])
+            # Morning: one summary for what the night held, once.
             with mock.patch.object(broker, "now", return_value=broker.parse_time("2026-11-01T07:01:00Z")):
                 broker.scan()
                 broker.scan()
-            broker.notify_digest.assert_called_once()
-            self.assertEqual([r["metadata"]["name"] for r in broker.notify_digest.call_args[0][0]], ["night"])
+            self.assertEqual(self.notify.call_count, 2)
+            self.assertEqual([r["metadata"]["name"] for r in self.notify.call_args[0][0]], ["night"])
             self.assertIn("notifiedAt", self.api.status("night"))
 
     def test_quiet_hours_in_a_zone(self):
@@ -1112,36 +1206,126 @@ class TestAsync(Base):
 
 
 class TestNotify(unittest.TestCase):
-    def test_posts_a_link_not_a_decision(self):
-        req = {"metadata": {"name": "r1"},
-               "spec": {"verb": "flux-resume", "target": {"kind": "Kustomization", "namespace": "flux-system", "name": "web"},
-                        "reason": "x"}}
+    def req(self, name, who="", workstream=None, reason="x"):
+        spec = {"verb": "flux-resume", "requester": who, "reason": reason,
+                "target": {"kind": "Kustomization", "namespace": "flux-system", "name": name}}
+        if workstream:
+            spec["workstream"] = workstream
+        return {"metadata": {"name": name, "creationTimestamp": "2026-11-01T02:00:00Z"}, "spec": spec,
+                "status": {"phase": "Pending"}}
+
+    def sent(self, new, waiting):
         with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
                 mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify(req)
+            broker.notify(new, waiting)
         sent = urlopen.call_args[0][0]
         self.assertEqual(sent.full_url, "https://ntfy.example.test")
-        body = json.loads(sent.data)
-        self.assertEqual(body["topic"], "topic123")
-        self.assertEqual([a["action"] for a in body["actions"]], ["view"])
-        self.assertEqual(body["click"], "https://ops.example.test/r/r1")
+        return json.loads(sent.data)
 
-    def test_digest_links_to_the_list(self):
-        req = {"metadata": {"name": "r1", "creationTimestamp": "2026-11-01T02:00:00Z"},
-               "spec": {"verb": "flux-resume", "requester": "someone",
-                        "target": {"kind": "Kustomization", "namespace": "flux-system", "name": "web"}, "reason": "x"}}
-        with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
-                mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify_digest([req, req])
-        body = json.loads(urlopen.call_args[0][0].data)
+    def test_posts_links_not_decisions(self):
+        r = self.req("r1", AGENT, "fix valheim")
+        body = self.sent([r], [r])
+        self.assertEqual(body["topic"], "topic123")
+        self.assertEqual({a["action"] for a in body["actions"]}, {"view"})
+        gid = broker.group_id((AGENT, "fix valheim"))
+        self.assertEqual(body["click"], f"https://ops.example.test/g/{gid}")  # one group: straight to it
+        self.assertIn("claude-remote · fix valheim", body["message"])
+
+    def test_one_summary_grouped_by_agent_and_workstream(self):
+        a = [self.req(f"a{i}", AGENT, "fix valheim") for i in range(6)]
+        b = [self.req("b0", AGENT, "ci"), self.req("n0", NIGHT, "roadmap-42")]
+        old = self.req("o0", NIGHT, "older")
+        body = self.sent(a + b, a + b + [old])
+        self.assertEqual(body["title"], "8 ops requests to approve, from claude-remote, night-shift/night-worker")
+        msg = body["message"]
+        self.assertLess(msg.index("fix valheim"), msg.index("roadmap-42"))  # the biggest group first
+        self.assertIn("6 new", msg)
+        self.assertIn("and 2 more", msg)  # SUMMARY_ITEMS per group
+        for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
+            self.assertIn(f"(https://ops.example.test/g/{broker.group_id(key)})", msg)
+        self.assertIn("Still waiting: night-shift/night-worker · older (1)", msg)
         self.assertEqual(body["click"], "https://ops.example.test/")
-        self.assertIn("2 ops requests", body["title"])
-        self.assertIn("someone", body["message"])
+        self.assertTrue(body["markdown"])
+        self.assertEqual(len(body["actions"]), 3)
+
+    def test_the_requester_cant_add_links(self):
+        r = self.req("r1", AGENT, "[x](https://evil.test)", reason="see [here](https://evil.test) **now**")
+        msg = self.sent([r], [r])["message"]
+        self.assertNotIn("](https://evil", msg)
+        self.assertNotIn("**now**", msg)
+        self.assertIn("\\[here\\]", msg)
 
     def test_off_without_url(self):
         with mock.patch.object(broker, "NTFY_URL", ""), mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify({})
+            broker.notify([], [])
         urlopen.assert_not_called()
+
+
+class TestDebounce(Base):
+    """One notification for a burst, and at most one per NOTIFY_INTERVAL."""
+
+    def setUp(self):
+        super().setUp()
+        for p in (mock.patch.object(broker, "NOTIFY_DEBOUNCE", 120), mock.patch.object(broker, "NOTIFY_INTERVAL", 900),
+                  mock.patch.object(broker, "QUIET_HOURS", "")):
+            p.start()
+            self.addCleanup(p.stop)
+        self.t = broker.parse_time("2026-11-01T12:00:00Z")
+
+    def at(self, seconds):
+        with mock.patch.object(broker, "now", return_value=self.t + timedelta(seconds=seconds)):
+            broker.scan()
+
+    def add(self, name, at, ttl=14400):
+        self.api.add(name, "flux-reconcile", "Kustomization", "flux-system", "web")
+        self.api.requests[name]["spec"].update(requester=AGENT, ttlSeconds=ttl)
+        self.api.requests[name]["metadata"]["creationTimestamp"] = broker.stamp(self.t + timedelta(seconds=at))
+
+    def names(self, call):
+        return [r["metadata"]["name"] for r in call[0][0]]
+
+    def test_a_burst_is_one_notification(self):
+        with mock.patch.object(broker, "MAX_PENDING", 50), mock.patch.object(broker, "PENDING_CAPS", {}):
+            for i in range(20):
+                self.add(f"r{i}", at=i * 5)
+                self.at(i * 5)
+            self.notify.assert_not_called()  # the first is still waiting for others
+            self.at(125)
+        self.notify.assert_called_once()
+        self.assertEqual(len(self.notify.call_args[0][0]), 20)
+        self.assertTrue(all(self.api.status(f"r{i}").get("notifiedAt") for i in range(20)))
+
+    def test_at_most_one_per_interval(self):
+        self.add("r1", at=0)
+        self.at(0)
+        self.at(120)
+        self.assertEqual(self.notify.call_count, 1)
+        self.add("r2", at=200)
+        self.at(320)
+        self.at(900)
+        self.assertEqual(self.notify.call_count, 1)  # 120 + 900 = 1020
+        self.at(1020)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.names(self.notify.call_args), ["r2"])
+        self.assertEqual(len(self.notify.call_args[0][1]), 2)  # r1 is still waiting, and listed as such
+        self.at(2000)
+        self.assertEqual(self.notify.call_count, 2)  # nothing new
+
+    def test_a_restart_remembers_the_last_one(self):
+        self.add("r1", at=0)
+        self.at(120)
+        self.add("r2", at=200)
+        # A new broker process: nothing in memory, but r1's notifiedAt is in the queue.
+        self.at(400)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_a_short_lived_request_skips_the_interval(self):
+        self.add("r1", at=0)
+        self.at(120)
+        self.add("short", at=200, ttl=600)  # would lose most of its 10 minutes to the interval
+        self.at(320)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.names(self.notify.call_args), ["short"])
 
 
 HEAD = "h" * 40

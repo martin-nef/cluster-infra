@@ -32,8 +32,11 @@ One verb isn't an action but a sign-off (README, "Human review required"):
                         standard ruleset. The broker files it for each
                         covered repo that lacks one.
 
-The broker checks the target exists, marks the request Pending, and sends an
-ntfy notification linking to PUBLIC_URL/r/<name>. That page is behind Traefik's
+The broker checks the target exists and marks the request Pending. Requests
+are grouped by requester and spec.workstream, the requester's own label for
+what it's working on. Notifications are debounced (announce): one ntfy summary
+of everything new, by group, linking to each group's page, PUBLIC_URL/g/<id>,
+which lists its requests, PUBLIC_URL/r/<name>. The pages are behind Traefik's
 oauth2-proxy (Google) login; the broker runs the action only when someone in
 ALLOWED_APPROVERS presses Approve there. Nothing in the notification can
 approve anything, so it doesn't matter who else reads the topic: the agent can
@@ -52,7 +55,7 @@ Requests from agents that run while you sleep (README, "Async requesters"):
 - Each requester named in PENDING_CAPS has its own pending slots; everyone else
   shares MAX_PENDING. So a night agent can't take the interactive agent's slots.
 - During QUIET_HOURS, a request that will still be waiting when they end isn't
-  announced; one digest lists them all when they end.
+  announced; the first summary after them lists them all.
 - Approving checks the target again, so a request approved hours later never
   acts on a target that has since been replaced or moved on.
 
@@ -99,6 +102,11 @@ PENDING_CAPS = {u.strip(): int(n) for u, _, n in
                 (c.rpartition("=") for c in os.environ.get("PENDING_CAPS", "").split(",") if c.strip())}
 QUIET_HOURS = os.environ.get("QUIET_HOURS", "")  # "22:00-07:00" in QUIET_TZ; empty: never quiet
 QUIET_TZ = os.environ.get("QUIET_TZ", "UTC")
+# Notifications are debounced: a new request waits NOTIFY_DEBOUNCE seconds for
+# others to join it, and one summary goes out at most every NOTIFY_INTERVAL,
+# unless waiting that long would cost a request half of the time it has left.
+NOTIFY_DEBOUNCE = int(os.environ.get("NOTIFY_DEBOUNCE", "120"))
+NOTIFY_INTERVAL = int(os.environ.get("NOTIFY_INTERVAL", "900"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
@@ -135,6 +143,7 @@ POLL = 5  # seconds between scans of the queue
 # (running takes seconds); younger ones may still be running in another pod.
 STRANDED_AFTER = 60
 NAME = re.compile(r"[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?")
+GROUP = re.compile(r"/g/[0-9a-f]{12}")
 
 # Where each target kind lives in the API.
 KINDS = {
@@ -236,6 +245,40 @@ def requester(req):
     return req["spec"].get("requester", "")
 
 
+def group_key(req):
+    """(requester, workstream): the page and the notifications group by it.
+    The workstream is the requester's own label for what it's working on, so
+    an agent doing several things keeps them apart; none is a group too."""
+    return requester(req), req["spec"].get("workstream", "")
+
+
+def group_id(key):
+    """A short, URL-safe name for a group: /g/<id>."""
+    return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:12]
+
+
+def agent_name(who):
+    """A requester as people say it: system:serviceaccount:night-shift:runner
+    is night-shift/runner, and claude-remote:claude-remote is claude-remote."""
+    if who.startswith("system:serviceaccount:"):
+        ns, _, sa = who[len("system:serviceaccount:"):].partition(":")
+        return ns if ns == sa else f"{ns}/{sa}"
+    return who or "unknown requester"
+
+
+def group_title(key):
+    who, workstream = key
+    return agent_name(who) + (f" · {workstream}" if workstream else "")
+
+
+def groups(items):
+    """{group key: its requests, newest first}."""
+    out = {}
+    for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"], reverse=True):
+        out.setdefault(group_key(r), []).append(r)
+    return out
+
+
 def ttl(req):
     """Seconds it may wait for a decision: the requester's choice, capped."""
     return min(int(req["spec"].get("ttlSeconds") or REQUEST_TTL), MAX_TTL)
@@ -283,7 +326,7 @@ def quiet_until(t=None):
 
 
 def held(req, t=None):
-    """Whether to save its notification for the digest: it's quiet now, and the
+    """Whether to save its notification for after the quiet hours: it's quiet now, and the
     request will still be waiting when it stops being quiet. One that would
     expire before then is announced now, since it's only worth anything now."""
     until = quiet_until(t)
@@ -459,7 +502,8 @@ def file_human_review(repo, pr, head, reason):
         "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
         "metadata": {"generateName": "github-human-review-", "namespace": NAMESPACE},
         "spec": {"verb": "github-human-review", "github": {"repo": repo, "pr": pr, "headSHA": head},
-                 "reason": f"{REVIEWER_LOGIN}: {reason}"[:2000], "ttlSeconds": MAX_TTL},
+                 "reason": f"{REVIEWER_LOGIN}: {reason}"[:1000], "ttlSeconds": MAX_TTL,
+                 "workstream": "PR reviewer's flags"},
     }, content_type="application/json")
     print(json.dumps({"time": stamp(), "event": "filed", "action": f"github-human-review {GITHUB_OWNER}/{repo}#{pr}",
                       "reason": reason}), flush=True)
@@ -488,7 +532,8 @@ def file_require(repo):
         "metadata": {"generateName": "github-require-human-review-", "namespace": NAMESPACE},
         "spec": {"verb": "github-require-human-review", "github": {"repo": repo},
                  "reason": (f"{repo} has no human-review ruleset, so a PR an agent flags there can still be "
-                            "merged. Approving adds the standard one."), "ttlSeconds": MAX_TTL},
+                            "merged. Approving adds the standard one."), "ttlSeconds": MAX_TTL,
+                 "workstream": "human-review rulesets"},
     }, content_type="application/json")
     print(json.dumps({"time": stamp(), "event": "filed",
                       "action": f"github-require-human-review {GITHUB_OWNER}/{repo}"}), flush=True)
@@ -585,30 +630,67 @@ def create_sops_age_key(name):
     return f"created flux-system/{name}; its public key, for the app's .sops.yaml: {public}"
 
 
-def notify(req):
+def local(t):
+    """A time as you'd read it on the phone: 14:05, in QUIET_TZ."""
+    return t.astimezone(QUIET_ZONE).strftime("%H:%M")
+
+
+def md(s):
+    """Text the requester wrote, safe in ntfy's markdown: no links or
+    formatting of its own, so the only links are the ones the broker adds."""
+    # ":" too, so a URL in a reason isn't made a link either.
+    return re.sub(r"([\\`*_\[\]()<>|~:])", r"\\\1", " ".join(str(s).split()))
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+# How much of each group the summary shows; the rest is a link away.
+SUMMARY_ITEMS = 4
+SUMMARY_GROUPS = 6
+
+
+def notify(new, waiting):
+    """One summary for the requests not announced yet (new), grouped by agent
+    and workstream, each group with a link to its page; then the groups that
+    are only still waiting. waiting: every Pending request, new ones too."""
     if not NTFY_URL:
         return
-    url = f"{PUBLIC_URL}/r/{req['metadata']['name']}"
+    new_names = {r["metadata"]["name"] for r in new}
+    all_groups = groups(waiting)
+    fresh = sorted((k for k, rs in all_groups.items() if any(r["metadata"]["name"] in new_names for r in rs)),
+                   key=lambda k: -sum(r["metadata"]["name"] in new_names for r in all_groups[k]))
+    lines = []
+    for key in fresh[:SUMMARY_GROUPS]:
+        reqs = all_groups[key]
+        added = [r for r in reqs if r["metadata"]["name"] in new_names]
+        older = len(reqs) - len(added)
+        head = f"**{md(group_title(key))}**: {len(added)} new" + (f", {older} still waiting" if older else "")
+        head += f", first expires {local(min(expires(r) for r in reqs))}"
+        lines += [head, *(f"- {md(describe(r))}: {md(r['spec']['reason'][:140])}" for r in added[:SUMMARY_ITEMS])]
+        if len(added) > SUMMARY_ITEMS:
+            lines.append(f"- and {len(added) - SUMMARY_ITEMS} more")
+        lines += [f"[Open {md(group_title(key))}]({PUBLIC_URL}/g/{group_id(key)})", ""]
+    if len(fresh) > SUMMARY_GROUPS:
+        lines += [f"…and {plural(len(fresh) - SUMMARY_GROUPS, 'more group')} with new requests.", ""]
+    still = [k for k in all_groups if k not in fresh]
+    if still:
+        lines.append("Still waiting: " + ", ".join(f"{md(group_title(k))} ({len(all_groups[k])})" for k in still))
+    agents = sorted({agent_name(requester(r)) for r in new})
+    url = f"{PUBLIC_URL}/g/{group_id(fresh[0])}" if len(fresh) == 1 else f"{PUBLIC_URL}/"
+    actions = [{"action": "view", "label": f"Open {group_title(k)}"[:40], "url": f"{PUBLIC_URL}/g/{group_id(k)}",
+                "clear": True} for k in fresh[:2]] if len(fresh) > 1 else []
+    actions.append({"action": "view", "label": "Review" if len(fresh) == 1 else "All requests", "url": url,
+                    "clear": True})
     send({
-        "title": f"Approve? {describe(req)}",
-        "message": req["spec"]["reason"][:300],
+        "title": f"{plural(len(new), 'ops request')} to approve, from {', '.join(agents)}"[:200],
+        "message": "\n".join(lines).strip()[:3800],
+        "markdown": True,
         "priority": 4,
-        "tags": ["rotating_light"],
+        "tags": ["inbox_tray"],
         "click": url,
-        "actions": [{"action": "view", "label": "Review", "url": url, "clear": True}],
-    })
-
-
-def notify_digest(reqs):
-    """One notification for the requests held through the quiet hours."""
-    lines = [f"{describe(r)} ({requester(r) or 'unknown requester'}), until {stamp(expires(r))}" for r in reqs]
-    send({
-        "title": f"{len(reqs)} ops request{'s' if len(reqs) != 1 else ''} waiting since the night",
-        "message": "\n".join(lines)[:1000],
-        "priority": 3,
-        "tags": ["sunrise"],
-        "click": f"{PUBLIC_URL}/",
-        "actions": [{"action": "view", "label": "Review", "url": f"{PUBLIC_URL}/", "clear": True}],
+        "actions": actions,
     })
 
 
@@ -673,34 +755,47 @@ def admit(req, pending):
         set_status(req, phase="Rejected", message=problem, finishedAt=stamp())
         audit("rejected", req, reason=problem)
         return False
-    hold = held(req)
-    status = {"phase": "Pending", "specHash": spec_hash(req), "targetUID": uid, "expiresAt": stamp(expires(req)),
-              "message": f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}"
-                         + (" (announced when the quiet hours end)" if hold else "")}
-    if not hold:
-        status["notifiedAt"] = stamp()
-    set_status(req, **status)
-    audit("pending", req, reason=req["spec"]["reason"], held=hold)
-    if not hold:
-        notify(req)
+    set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid, expiresAt=stamp(expires(req)),
+               message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
+    audit("pending", req, reason=req["spec"]["reason"], workstream=group_key(req)[1])
     return True
 
 
-def digest(items):
-    """Once the quiet hours are over, announce what they held, in one message.
-    Each is marked first: a lost digest only costs time, a repeated one is noise."""
-    if quiet_until() is not None:
+def announce(items):
+    """One notification for the Pending requests not announced yet, once they
+    are due (announce_at). Each is marked first: a lost summary only costs
+    time, a repeated one is noise. The last announcement is read back from the
+    requests (status.notifiedAt), so a restart doesn't send an early one."""
+    t = now()
+    waiting = [r for r in items if phase(r) == "Pending"]
+    # During the quiet hours, only those that won't last until they end.
+    new = [r for r in waiting if not r["status"].get("notifiedAt") and not held(r, t)]
+    if not new or t < announce_at(new, items):
         return
-    waiting = [r for r in items if phase(r) == "Pending" and not r["status"].get("notifiedAt")]
     marked = []
 
     def mark(req):
-        set_status(req, notifiedAt=stamp())
+        set_status(req, notifiedAt=stamp(t))
         marked.append(req)
-    each(waiting, mark)
+    each(new, mark)
     if marked:
-        audit("digest", marked[0], requests=[r["metadata"]["name"] for r in marked])
-        notify_digest(marked)
+        audit("notified", marked[0], requests=[r["metadata"]["name"] for r in marked])
+        notify(marked, waiting)
+
+
+def announce_at(new, items):
+    """When the unannounced requests are due: NOTIFY_DEBOUNCE after the oldest
+    of them, so a burst goes in one message, and NOTIFY_INTERVAL after the last
+    one. A request that would lose half its remaining time to the interval
+    skips it: it's only worth anything soon."""
+    t = now()
+    due = min(parse_time(r["metadata"]["creationTimestamp"]) for r in new) + timedelta(seconds=NOTIFY_DEBOUNCE)
+    sent = [parse_time(r["status"]["notifiedAt"]) for r in items if r.get("status", {}).get("notifiedAt")]
+    if sent:
+        paced = max(due, max(sent) + timedelta(seconds=NOTIFY_INTERVAL))
+        if not any(paced - t > (expires(r) - t) / 2 for r in new):
+            due = paced
+    return due
 
 
 def each(items, fn):
@@ -730,7 +825,7 @@ def scan():
                 pool = pending_cap(requester(req))[0]
                 pending[pool] = pending.get(pool, 0) + 1
         each(items, admit_new)
-        digest(items)
+        announce(items)
 
 
 def decidable(name, seen_hash):
@@ -818,22 +913,77 @@ def scan_loop():
         time.sleep(POLL)
 
 
+# Feedback the moment a form is sent: approving a GitHub action can take a few
+# seconds, and the reply only comes when it's done. Also stops a second tap from
+# sending a second decision. The CSP allows exactly this script, by its hash.
+SCRIPT = """document.addEventListener("submit", function (ev) {
+  if (document.body.classList.contains("busy")) { ev.preventDefault(); return; }
+  document.body.classList.add("busy");
+  var b = ev.target.querySelector("button");
+  document.querySelectorAll("button").forEach(function (x) { x.dataset.label = x.textContent; x.disabled = true; });
+  if (b) { b.textContent = b.dataset.busy || "Working…"; b.classList.add("working"); }
+});
+window.addEventListener("pageshow", function (ev) {
+  if (!ev.persisted) return;
+  document.body.classList.remove("busy");
+  document.querySelectorAll("button").forEach(function (x) {
+    x.disabled = false; x.classList.remove("working"); if (x.dataset.label) x.textContent = x.dataset.label;
+  });
+});"""
+SCRIPT_HASH = base64.b64encode(hashlib.sha256(SCRIPT.encode()).digest()).decode()
+
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Ops broker</title>
 <style>
 body{{font:16px/1.4 system-ui,sans-serif;margin:0 auto;max-width:40rem;padding:1rem;color:#1b1b1b;background:#fafafa}}
 @media(prefers-color-scheme:dark){{body{{color:#e8e8e8;background:#161616}}a{{color:#8ab4f8}}}}
-code{{font-size:1.05em}} table{{border-collapse:collapse;width:100%}} td{{padding:.3rem .5rem .3rem 0;vertical-align:top}}
-.reason{{white-space:pre-wrap;border-left:3px solid #888;padding-left:.6rem}}
-form{{display:inline}} button{{font-size:1.1rem;padding:.7rem 1.4rem;margin:.6rem .6rem 0 0;border:0;border-radius:.4rem;color:#fff}}
-.approve{{background:#1a7f37}} .deny{{background:#b42318}}
+code{{font-size:1.05em;overflow-wrap:anywhere}} table{{border-collapse:collapse;width:100%}} td{{padding:.3rem .5rem .3rem 0;vertical-align:top}}
+.reason{{white-space:pre-wrap;overflow-wrap:anywhere;border-left:3px solid #888;padding-left:.6rem}}
+form{{display:inline}} button,.button{{font-size:1.1rem;padding:.7rem 1.4rem;margin:.6rem .6rem 0 0;border:0;border-radius:.4rem;color:#fff;
+display:inline-block;text-decoration:none;font-family:inherit}}
+.approve{{background:#1a7f37}} .deny{{background:#b42318}} .review{{background:#0969da}}
+button:disabled{{opacity:.6}} button.working{{opacity:1}}
+button.working::after{{content:"";display:inline-block;width:.9em;height:.9em;margin-left:.5em;vertical-align:-.1em;
+border:2px solid #fff8;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}}
+@keyframes spin{{to{{transform:rotate(1turn)}}}}
 pre{{overflow-x:auto;font-size:.85rem;background:#8881;padding:.5rem}} .add{{color:#1a7f37}} .del{{color:#b42318}} .hunk{{color:#888}}
 .warn{{border-left:3px solid #b42318;padding-left:.6rem}}
-</style></head><body>{body}</body></html>"""
+.muted{{color:#888;font-size:.9rem}}
+details.group{{border:1px solid #8884;border-radius:.5rem;margin:.6rem 0;padding:.2rem .7rem}}
+details.group>summary{{cursor:pointer;padding:.5rem 0;list-style-position:outside}}
+.badge{{display:inline-block;background:#bf8700;color:#fff;border-radius:1rem;padding:0 .55rem;font-size:.85rem;margin-left:.3rem}}
+.item{{border-top:1px solid #8883;padding:.6rem 0}}
+.item .reason{{margin:.3rem 0}}
+.clamp{{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}}
+.phase{{font-size:.85rem;padding:0 .4rem;border-radius:.3rem;background:#8882}}
+.phase.Pending{{background:#bf8700;color:#fff}} .phase.Succeeded{{background:#1a7f37;color:#fff}}
+.phase.Failed,.phase.Unknown,.phase.Denied{{background:#b42318;color:#fff}}
+</style></head><body>{body}<script>{script}</script></body></html>"""
 
 
 def e(s):
     return html.escape(str(s), quote=True)
+
+
+def group_link(req):
+    key = group_key(req)
+    return f'<a href="/g/{group_id(key)}">{e(group_title(key))}</a>'
+
+
+def decision_forms(req, can_approve=True):
+    """Approve and Deny for a Pending request: one form each, so the decision
+    is a hidden field the script can't drop by disabling its button."""
+    s, st = req["spec"], req.get("status", {})
+    h = e(st.get("specHash", ""))
+    name = e(req["metadata"]["name"])
+    # A USER_VERBS approval goes through GitHub's sign-in first.
+    signin = '<input type=hidden name=signin value=github>' if s["verb"] in USER_VERBS else ""
+    busy = {"approve": "Opening GitHub…" if signin else "Approving…", "deny": "Denying…"}
+    return "".join(
+        f'<form method=post action="/r/{name}"><input type=hidden name=hash value="{h}">'
+        f'<input type=hidden name=decision value={d}>{signin if d == "approve" else ""}'
+        f'<button class={d} data-busy="{busy[d]}">{d.capitalize()}</button></form>'
+        for d in ("approve", "deny") if d == "deny" or can_approve)
 
 
 def request_page(req):
@@ -846,50 +996,117 @@ def request_page(req):
         target = f"<code>{e(t['kind'])} {e(t['namespace'])}/{e(t['name'])}</code>"
     rows = [("Verb", f"<code>{e(s['verb'])}</code>"),
             ("Target", target),
-            ("Phase", e(st.get("phase", "new"))),
+            ("Group", group_link(req)),
+            ("Phase", f'<span class="phase {e(st.get("phase", ""))}">{e(st.get("phase", "new"))}</span>'),
             ("Status", e(st.get("message", ""))),
             ("Requester", e(s.get("requester") or "unknown (made without the admission policy)")),
             ("Created", e(req["metadata"]["creationTimestamp"])),
             ("Expires", e(stamp(expires(req))))]
     if st.get("decidedBy"):
         rows.append(("Decided by", e(st["decidedBy"])))
-    body = (f"<h1>{e(req['metadata']['name'])}</h1><table>"
+    body = (f"<h1>{e(describe(req))}</h1><p class=muted>{e(req['metadata']['name'])}</p><table>"
             + "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
             + "</table><p>The requester's reason (their claim, not checked):</p>"
             + f"<p class=reason>{e(s['reason'])}</p>")
     can_approve = True
     if github and st.get("phase") == "Pending":
         # What approving does, read live, so the page shows what will run: for a
-        # commit, the diff against the exact commit it will sit on. Decided
-        # requests skip it; their status says what happened.
+        # commit, the diff against the exact commit it will sit on.
         try:
             body += "<h2>What it does</h2>" + githubops.details(MINTER, s)
         except Exception as err:
             body += (f"<p class=warn>Couldn't show what this does ({e(err)}), so it can't be approved "
                      "from here. Reload, or deny it.</p>")
             can_approve = False
+    elif github:
+        # Decided: the live view would describe today's GitHub, not what was
+        # asked (a repo that now exists, a rule that's now there), so show the
+        # request itself. Its status says what happened.
+        body += "<h2>What it asked for</h2>" + githubops.asked(GITHUB_OWNER, s)
     if st.get("phase") == "Pending":
-        h = e(st.get("specHash", ""))
-        # A USER_VERBS approval goes through GitHub's sign-in first.
-        signin = '<input type=hidden name=signin value=github>' if s["verb"] in USER_VERBS else ""
-        body += "".join(
-            f'<form method=post><input type=hidden name=hash value="{h}">{signin if d == "approve" else ""}'
-            f'<button class={d} name=decision value={d}>{d.capitalize()}</button></form>'
-            for d in ("approve", "deny") if d == "deny" or can_approve)
-    return body + '<p><a href="/">All requests</a></p>'
+        body += decision_forms(req, can_approve)
+    return body + f'<p><a href="/g/{group_id(group_key(req))}">Its group</a> · <a href="/">All requests</a></p>'
+
+
+def item(req, clamp=False, actions=False):
+    """One request in a list: what, its phase, why; with actions, the buttons
+    a Pending one can be decided with from the list."""
+    st, name = req.get("status", {}), e(req["metadata"]["name"])
+    p = st.get("phase", "")
+    when = f"expires {local(expires(req))}" if p == "Pending" else f"{p.lower() or 'new'}, " + local(
+        parse_time(st.get("finishedAt") or req["metadata"]["creationTimestamp"]))
+    out = (f'<div class=item><a href="/r/{name}"><code>{e(describe(req))}</code></a> '
+           f'<span class="phase {e(p)}">{e(p or "new")}</span> <span class=muted>{e(when)}</span>'
+           f'<div class="reason{" clamp" if clamp else ""}">{e(req["spec"]["reason"])}</div>')
+    if p != "Pending" and st.get("message"):
+        out += f"<div class=muted>{e(st['message'])}</div>"
+    if actions and p == "Pending":
+        if req["spec"]["verb"] in GITHUB_VERBS:
+            # Its page shows what approving does, read live (a diff, a PR): it's
+            # approved there, after you've seen it.
+            out += f'<a class="button review" href="/r/{name}">Review and approve</a>' + decision_forms(req, False)
+        else:
+            out += decision_forms(req)
+    return out + "</div>"
+
+
+def group_summary(key, reqs):
+    waiting = [r for r in reqs if phase(r) == "Pending"]
+    others = len(reqs) - len(waiting)
+    badge = f"<span class=badge>{len(waiting)} waiting</span>" if waiting else ""
+    meta = (f"first expires {local(min(expires(r) for r in waiting))}" if waiting else
+            f"latest {local(parse_time(reqs[0]['metadata']['creationTimestamp']))}")
+    meta += f" · {others} decided or closed" if others else ""
+    who, workstream = key
+    return (f"<b>{e(agent_name(who))}</b>" + (f" · {e(workstream)}" if workstream else "")
+            + f"{badge}<br><span class=muted>{e(meta)}</span>")
 
 
 def index_page(items):
-    """Every request waiting for a decision, then the 30 newest others."""
-    items = sorted(items, key=lambda r: r["metadata"]["creationTimestamp"], reverse=True)
-    items = [r for r in items if phase(r) == "Pending"] + [r for r in items if phase(r) != "Pending"][:30]
-    rows = "".join(
-        f'<tr><td><a href="/r/{e(r["metadata"]["name"])}">{e(r["metadata"]["name"])}</a></td>'
-        f"<td><code>{e(describe(r))}</code></td><td>{e(requester(r).rpartition(':')[2] or '?')}</td>"
-        f"<td>{e(phase(r) or 'new')}</td></tr>"
-        for r in items)
-    return (f"<h1>Ops requests</h1><table>{rows or '<tr><td>None yet.</td></tr>'}</table>"
+    """Groups (requester, workstream), those with requests waiting first and
+    open, then the GROUPS_SHOWN most recent others, closed. Each opens into its
+    requests: every waiting one, and the newest ITEMS_SHOWN of the rest."""
+    by = groups(items)
+    waiting = sorted((k for k, rs in by.items() if any(phase(r) == "Pending" for r in rs)),
+                     key=lambda k: min(expires(r) for r in by[k] if phase(r) == "Pending"))
+    rest = [k for k in by if k not in waiting][:GROUPS_SHOWN]  # groups() is newest first
+    out = []
+    for key in waiting + rest:
+        reqs = by[key]
+        shown = [r for r in reqs if phase(r) == "Pending"] + [r for r in reqs if phase(r) != "Pending"][:ITEMS_SHOWN]
+        out.append(f'<details class=group{" open" if key in waiting else ""}><summary>{group_summary(key, reqs)}'
+                   "</summary>" + "".join(item(r, clamp=True) for r in shown)
+                   + f'<p><a href="/g/{group_id(key)}">Open the group</a>'
+                   + (f" ({len(reqs)} requests)" if len(reqs) > len(shown) else "") + "</p></details>")
+    n = sum(phase(r) == "Pending" for r in items)
+    lead = (f"<p>{plural(n, 'request')} waiting, in {plural(len(waiting), 'group')}.</p>" if n else
+            "<p>Nothing waiting.</p>")
+    return (f"<h1>Ops requests</h1>{lead}{''.join(out) or '<p>None yet.</p>'}"
             '<p><a href="/github">GitHub App</a></p>')
+
+
+GROUPS_SHOWN = 20  # decided groups on the index
+ITEMS_SHOWN = 5  # decided requests per group on the index
+GROUP_ITEMS = 100  # decided requests on a group's page
+
+
+def group_page(gid, items):
+    """One group's requests: every waiting one, with its buttons, then the
+    newest GROUP_ITEMS others. None if no request is in the group."""
+    for key, reqs in groups(items).items():
+        if group_id(key) != gid:
+            continue
+        waiting = [r for r in reqs if phase(r) == "Pending"]
+        done = [r for r in reqs if phase(r) != "Pending"][:GROUP_ITEMS]
+        who, workstream = key
+        return (f"<h1>{e(agent_name(who))}</h1>"
+                + (f"<p><b>Workstream:</b> {e(workstream)}</p>" if workstream else "")
+                + f"<p class=muted>{e(who or 'no requester recorded')}</p>"
+                + (f"<h2>Waiting ({len(waiting)})</h2>" + "".join(item(r, actions=True) for r in waiting)
+                   if waiting else "<p>Nothing waiting.</p>")
+                + (f"<h2>Decided or closed</h2>" + "".join(item(r) for r in done) if done else "")
+                + '<p><a href="/">All requests</a></p>')
+    return None
 
 
 # Started App setups: state -> (approver, deadline). In memory: the broker is
@@ -1006,7 +1223,16 @@ def finish_authorize(approver, code, state):
         return 400, "<p>This sign-in wasn't started from an approval by you, or took too long. Approve it again.</p>"
     _, name, seen_hash, _ = started
     status, message = decide(name, "approve", seen_hash, approver, code=code)
-    return status, f'<p>{e(message)}</p><p><a href="/r/{e(name)}">Back</a></p>'
+    return status, result_page(name, message)
+
+
+def result_page(name, message):
+    """What a decision did, with the way back to the request and its group."""
+    try:
+        group = f' · <a href="/g/{group_id(group_key(k8s("GET", f"{REQUESTS}/{name}")))}">Its group</a>'
+    except K8sError:
+        group = ""
+    return f'<p>{e(message)}</p><p><a href="/r/{e(name)}">The request</a>{group} · <a href="/">All requests</a></p>'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1039,6 +1265,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(status, page, html_page=True)
             if self.path.startswith("/r/"):
                 return self.reply(200, request_page(k8s("GET", f"{REQUESTS}/{self.request_name()}")), html_page=True)
+            if GROUP.fullmatch(url.path):
+                page = group_page(url.path[len("/g/"):], list_requests())
+                if page is None:
+                    return self.reply(404, "no requests in this group (retention may have deleted them)")
+                return self.reply(200, page, html_page=True)
         except K8sError as err:
             return self.reply(404 if err.code == 404 else 502, str(err))
         self.reply(404, "not found")
@@ -1085,7 +1316,7 @@ class Handler(BaseHTTPRequestHandler):
         if decision == "approve" and form.get("signin", [""])[0] == "github":
             return self.reply(*start_authorize(name, form.get("hash", [""])[0], approver), html_page=True)
         status, message = decide(name, decision, form.get("hash", [""])[0], approver)
-        self.reply(status, f"<p>{e(message)}</p><p><a href=\"{e(self.path)}\">Back</a></p>", html_page=True)
+        self.reply(status, result_page(name, message), html_page=True)
 
     def form(self):
         """The posted form, or None if it has no length or is too large."""
@@ -1105,13 +1336,14 @@ class Handler(BaseHTTPRequestHandler):
         return name
 
     def reply(self, status, content, html_page=False, form_action="'self'"):
-        data = (PAGE.format(body=content) if html_page else content + "\n").encode()
+        data = (PAGE.format(body=content, script=SCRIPT) if html_page else content + "\n").encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8" if html_page else "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}")
+        self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{SCRIPT_HASH}'; "
+                         f"form-action {form_action}")
         self.end_headers()
         self.wfile.write(data)
 

@@ -645,6 +645,39 @@ def details(minter, spec):
                 + (f"<table>{inputs}</table>" if inputs else "<p>No inputs.</p>"))
 
 
+def asked(owner, spec):
+    """HTML of what a request asked for, from the request alone: for one that
+    has been decided, when details() would describe GitHub as it is now."""
+    g = spec["github"]
+    web = f"https://github.com/{owner}/{g['repo']}"
+    verb = spec["verb"]
+    if verb == "github-commit-workflows":
+        files = "".join(
+            f"<p><code>{e(f['path'])}</code>: deleted</p>" if f.get("delete") else
+            f"<p><code>{e(f['path'])}</code>:</p><pre>{e(f.get('content', ''))}</pre>" for f in g["files"])
+        return (f"<p>A commit on {link(f'{web}/tree/{g['branch']}', g['branch'])}, on top of "
+                f"{link(f'{web}/commit/{g['baseSHA']}', g['baseSHA'][:12])}:</p><pre>{e(g['message'])}</pre>{files}")
+    if verb == "github-human-review":
+        return (f"<p>A sign-off of {link(f'{web}/pull/{int(g['pr'])}', f'{g['repo']}#{int(g['pr'])}')} at "
+                f"{link(f'{web}/commit/{g['headSHA']}', g['headSHA'][:12])}.</p>")
+    if verb == "github-require-human-review":
+        return f"<p>The standard <code>{HUMAN_REVIEW}</code> ruleset on {link(web + '/settings/rules', g['repo'])}.</p>"
+    if verb == "github-protect-branch":
+        return (f"<p>The standard rule on the default branch of {link(web + '/settings/branches', g['repo'])}:</p>"
+                f"<pre>{e(json.dumps(PROTECTION, indent=2))}</pre>")
+    if verb == "github-rerun-workflow":
+        return f"<p>A re-run of the failed jobs of {link(f'{web}/actions/runs/{int(g['runID'])}', f'run {int(g['runID'])}')}.</p>"
+    if verb == "github-dispatch-workflow":
+        inputs = "".join(f"<tr><td><code>{e(k)}</code></td><td><code>{e(v)}</code></td></tr>"
+                         for k, v in sorted(g.get("inputs", {}).items()))
+        return (f"<p>A run of {link(f'{web}/actions/workflows/{g['workflow']}', g['workflow'])} on the default "
+                "branch.</p>" + (f"<table>{inputs}</table>" if inputs else "<p>No inputs.</p>"))
+    if verb == "github-create-repo":
+        return (f"<p>{'A private' if g.get('private', True) else 'A public'} repo {link(web, f'{owner}/{g['repo']}')}"
+                + (f", described as <q>{e(g['description'])}</q>" if g.get("description") else "") + ".</p>")
+    return f"<p><code>{e(describe(owner, spec))}</code></p>"
+
+
 def details_human_review(tok, web, g):
     pr = tok("GET", f"/pulls/{int(g['pr'])}")
     files = tok("GET", f"/pulls/{int(g['pr'])}/files?per_page=100")
