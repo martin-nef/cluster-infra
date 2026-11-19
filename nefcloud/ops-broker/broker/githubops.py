@@ -477,6 +477,58 @@ def reviewer_flag(reviews, reviewer, head):
     return reason.strip()[:500], state.get("ready", True) is not False
 
 
+def load_triggers(path):
+    """The code-trigger list (code-triggers.json) as {"trusted": set of logins,
+    "triggers": [(repos or None, compiled regex, what)]}. Raises on anything
+    unreadable: the caller fails closed."""
+    with open(path) as f:
+        data = json.load(f)
+    trusted = {str(t).lower() for t in data["trusted"]}
+    rules = []
+    for rule in data["triggers"]:
+        repos = rule.get("repos")
+        if repos is not None and not (isinstance(repos, list) and all(isinstance(r, str) for r in repos)):
+            raise ValueError(f"{rule.get('what')}: repos must be a list of names")
+        if not rule["paths"] or not str(rule["what"]).strip():
+            raise ValueError("every trigger needs paths and what")
+        for pattern in rule["paths"]:
+            rules.append((set(repos) if repos is not None else None, re.compile(pattern), str(rule["what"])))
+    return {"trusted": trusted, "triggers": rules}
+
+
+def code_trigger(tok, repo, pr, rules, humans):
+    """(why the PR needs a human, whether to file a flag for it) from the
+    code-trigger list, or None. Your own PRs aren't checked: you wrote them.
+    rules None (the list couldn't be read) holds every other PR. A PR or
+    commit by someone not on the trusted list is held but not filed: nobody
+    automated will merge it, so you approve it on GitHub when you look. A path
+    trigger on a trusted PR is filed, so you're asked."""
+    author = (pr.get("user") or {}).get("login", "")
+    if author.lower() in {h.lower() for h in humans}:
+        return None
+    if rules is None:
+        return "the code-trigger list can't be read, so every PR waits for a human", False
+    number = pr["number"]
+    untrusted = set()
+    if author.lower() not in rules["trusted"]:
+        untrusted.add(author or "an unknown author")
+    for c in pages(tok, f"/pulls/{number}/commits"):
+        login = (c.get("author") or {}).get("login")
+        if not login or login.lower() not in rules["trusted"]:
+            untrusted.add(login or "an author with no GitHub account")
+    if untrusted:
+        return f"by {', '.join(sorted(untrusted))}, not on the trusted list: approve it on GitHub", False
+    hits = {}
+    for f in pages(tok, f"/pulls/{number}/files"):
+        for path in filter(None, (f.get("filename"), f.get("previous_filename"))):
+            for repos, pattern, what in rules["triggers"]:
+                if (repos is None or repo in repos) and pattern.search(path):
+                    hits.setdefault(what, path)
+    if hits:
+        return "touches " + "; ".join(f"{w} ({p})" for w, p in hits.items()), True
+    return None
+
+
 def human_approval(reviews, humans, head):
     """The login of a human in humans whose latest decisive review (Approve or
     Request changes, not a comment) approves exactly head; else None. That's
@@ -534,12 +586,13 @@ class Lazy:
         return self.tok(*args)
 
 
-def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None):
+def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, triggers=None):
     """Set the human-review status on every open PR head in repo to what
     desired(pr number, head sha) says, or success where one of humans approved
-    the head on GitHub. Returns (the reviewer's flags that have no request yet:
-    [(pr number, head sha, reason)], the open PR numbers, the GitHub approvals:
-    [(pr number, head sha, login)]).
+    the head on GitHub. Returns (the flags that have no request yet: [(pr
+    number, head sha, reason, whose: "reviewer" or "code")], the open PR
+    numbers, the GitHub approvals: [(pr number, head sha, login)]).
+    triggers(tok, pr) is code_trigger's answer for an unflagged head.
     desired returns (state, description, flagged), flagged meaning a request
     covers this head. recheck(pr number, head sha) is asked again, from fresh
     requests, before a success is turned pending: a sign-off may have landed
@@ -559,15 +612,21 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None):
             login = human_approval(reviews, humans, head)
             if not flagged:
                 flag = reviewer_flag(reviews, reviewer, head)
+                trigger = triggers(tok, pr) if triggers else None
                 if flag:
                     reason, ready = flag
                     if ready:
                         if not login:  # you've already looked: nothing to file
-                            to_file.append((number, head, reason))
+                            to_file.append((number, head, reason, "reviewer"))
                         state, description = "pending", f"human review required: {reason}"
                     else:
                         # Held, but nobody is pinged until the author has done what's required.
                         state, description = "pending", f"human review after the required changes: {reason}"
+                elif trigger:
+                    reason, fileable = trigger
+                    if fileable and not login:
+                        to_file.append((number, head, reason, "code"))
+                    state, description = "pending", f"human review required: {reason}"
             if state == "pending" and login:
                 # Worded as human_review_state words the request it signs off,
                 # so the next pass writes nothing.

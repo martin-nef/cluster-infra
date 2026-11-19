@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "The one list of changes that always need a human, whoever opened the PR and whatever any reviewer said.",
+    "The ops broker applies it on every sync (README, 'Code triggers'): a PR head that matches keeps its",
+    "human-review status pending, and an agent's PR gets a flag filed for you. paths are Python regexes",
+    "matched against every path a PR touches (a rename's old one too); repos limits a rule to those repos,",
+    "and a rule without repos holds everywhere. trusted: who may author a PR or its commits without that",
+    "alone needing you. This file is itself a trigger: changing it needs your sign-off."
+  ],
+  "trusted": [
+    "martin-nef",
+    "martin-nef-agent[bot]",
+    "martin-nef-reviewer[bot]",
+    "martin-nef-ops[bot]",
+    "nefcloud-agent[bot]",
+    "cv-agent[bot]"
+  ],
+  "triggers": [
+    {"what": "CI", "paths": ["^\\.github/(workflows|actions)/"]},
+    {"what": "secrets or keys",
+     "paths": ["(^|/)\\.sops\\.yaml$", "\\.secrets?\\.ya?ml$", "(^|/)secrets?\\.ya?ml$", "\\.(agekey|pem|key)$"]},
+    {"what": "RBAC, NetworkPolicy, admission or quota",
+     "paths": ["(^|/)(rbac|networkpolicy|network-?polic(y|ies)|admission|quota)[^/]*\\.ya?ml$"]},
+    {"what": "an agent's sandbox or the ops broker", "repos": ["cluster-infra"],
+     "paths": ["^nefcloud/(claude-remote|ops-broker|pr-reviewer|night-shift)/"]},
+    {"what": "an agent's policy or merge gate", "repos": ["claude-remote"],
+     "paths": ["^deploy/policy/", "^image/bin/agent-pr$"]},
+    {"what": "an agent's profile or limits", "repos": ["agent-harness"],
+     "paths": ["^harness/(profile|paths|steps)\\.py$", "^profiles/"]},
+    {"what": "the reviewer's policy or config", "repos": ["pr-reviewer"],
+     "paths": ["^deploy/agent/(policy|prompt)\\.md$", "^deploy/config\\.env$"]}
+  ]
+}

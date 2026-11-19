@@ -81,6 +81,13 @@ class FakeAPI:
             raise self.fail.pop((method, path))
         if path == broker.REQUESTS and method == "GET":
             return {"items": copy.deepcopy(list(self.requests.values()))}
+        if path == broker.REQUESTS and method == "POST":
+            # As the API server and the admission policy make it.
+            name = f"{body['metadata']['generateName']}{len(self.requests)}"
+            self.requests[name] = {"metadata": {"name": name, "resourceVersion": str(next(self.versions)),
+                                                "creationTimestamp": broker.stamp()},
+                                   "spec": {**copy.deepcopy(body["spec"]), "requester": broker.SELF}}
+            return copy.deepcopy(self.requests[name])
         if path.startswith(broker.REQUESTS + "/"):
             name, _, sub = path[len(broker.REQUESTS) + 1:].partition("/")
             if name not in self.requests:
@@ -173,6 +180,7 @@ class FakeGitHub:
                           "html_url": "https://github.test/owner/web/pull/5", "user": {"login": "agent[bot]"}}}
         self.reviews = {5: []}
         self.pr_files = {5: [{"filename": "rbac.yaml", "additions": 3, "deletions": 0}]}
+        self.pr_commits = {5: [{"author": {"login": "agent[bot]"}}]}
         self.statuses = {}  # sha -> [status], newest first
         self.installed = [{"name": "web", "open_issues_count": 1}]  # what the ops App is installed on
         self.rulesets = []
@@ -252,7 +260,10 @@ class FakeGitHub:
         if sub.startswith("/pulls/") and method == "GET":
             number, _, rest = sub[len("/pulls/"):].partition("/")
             if int(number) in self.pulls:
-                found = {"": self.pulls, "reviews": self.reviews, "files": self.pr_files}[rest][int(number)]
+                found = {"": self.pulls, "reviews": self.reviews, "files": self.pr_files,
+                         "commits": self.pr_commits}[rest].get(int(number), [])
+                if rest == "commits" and int(number) not in self.pr_commits:
+                    found = [{"author": {"login": "agent[bot]"}}]
                 return page(found) if isinstance(found, list) else copy.deepcopy(found)
         if sub.startswith("/commits/") and sub.endswith("/status"):
             return {"statuses": copy.deepcopy(self.statuses.get(sub.split("/")[2], []))}
@@ -1340,10 +1351,114 @@ def review(login, commit, state=None, at="2026-11-01T01:00:00Z"):
 class TestHumanReview(Served, GitHubBase):
     def setUp(self):
         super().setUp()
+        # A trigger list that trusts the fake agent and matches nothing, unless a test says otherwise.
+        self.triggers({"trusted": ["agent[bot]"], "triggers": []})
         for p in (mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", set()),
                   mock.patch.object(broker, "REVIEWER_LOGIN", REVIEWER)):
             p.start()
             self.addCleanup(p.stop)
+
+    def triggers(self, data):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        self.addCleanup(os.remove, path)
+        for p in (mock.patch.object(broker, "CODE_TRIGGERS", path), mock.patch.dict(broker.TRIGGER_CACHE, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def requests_filed(self):
+        return [r for r in self.api.requests.values() if r["spec"].get("workstream") == "Code triggers"]
+
+    def description(self, sha=HEAD):
+        return [s for s in self.gh.statuses.get(sha, []) if s["context"] == "human-review"][0]["description"]
+
+    def test_a_path_trigger_on_an_agents_pr_holds_it_and_files_a_flag(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [
+            {"what": "RBAC", "paths": ["(^|/)rbac[^/]*\\.ya?ml$"]},
+            {"what": "elsewhere only", "repos": ["other"], "paths": ["."]}]})
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.assertIn("human review required: touches RBAC (rbac.yaml)", self.description())
+        self.assertNotIn("elsewhere", self.description())  # a rule for another repo doesn't apply
+        filed, = self.requests_filed()
+        self.assertEqual(filed["spec"]["reason"], "code trigger: touches RBAC (rbac.yaml)")
+        self.assertEqual(filed["spec"]["github"], {"repo": "web", "pr": 5, "headSHA": HEAD})
+
+    def test_a_renamed_files_old_path_counts(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [{"what": "CI", "paths": ["^\\.github/workflows/"]}]})
+        self.gh.pr_files[5] = [{"filename": "ci.yml.bak", "previous_filename": ".github/workflows/ci.yml"}]
+        broker.sync_human_review()
+        self.assertIn("touches CI (.github/workflows/ci.yml)", self.description())
+
+    def test_an_untrusted_author_or_commit_is_held_but_not_filed(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": []})
+        self.gh.pulls[5]["user"] = {"login": "dependabot[bot]"}
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.assertIn("by dependabot[bot], not on the trusted list", self.description())
+        self.assertEqual(self.requests_filed(), [])  # nobody automated merges it: no ping
+        self.gh.pulls[5]["user"] = {"login": "agent[bot]"}
+        self.gh.pr_commits[5].append({"author": None})
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        broker.sync_human_review()
+        self.assertIn("an author with no GitHub account", self.description("n" * 40))
+
+    def test_your_own_prs_are_not_checked(self):
+        self.triggers({"trusted": [], "triggers": [{"what": "RBAC", "paths": ["rbac"]}]})
+        self.gh.pulls[5]["user"] = {"login": "owner"}
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_an_unreadable_list_holds_every_pr(self):
+        for bad in ("{not json", json.dumps({"trusted": []}), json.dumps({"trusted": [], "triggers": [
+                {"what": "x", "paths": ["("]}]})):
+            with self.subTest(bad=bad):
+                self.gh.statuses.clear()
+                self.triggers(bad)
+                broker.sync_human_review()
+                self.assertEqual(self.status(), "pending")
+                self.assertIn("can't be read", self.description())
+                self.assertEqual(self.requests_filed(), [])
+
+    def test_your_github_approval_clears_a_held_pr(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": []})
+        self.gh.pulls[5]["user"] = {"login": "dependabot[bot]"}
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
+            self.gh.reviews[5] = [{**review("owner", HEAD), "state": "APPROVED"}]
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_flags_wait_for_a_free_slot_instead_of_being_rejected(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [{"what": "RBAC", "paths": ["rbac"]}]})
+        with mock.patch.object(broker, "pending_cap", lambda who: (who, 0)):
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(self.requests_filed(), [])
+        broker.sync_human_review()  # a slot is free now
+        self.assertEqual(len(self.requests_filed()), 1)
+
+    def test_the_shipped_list_loads_and_holds_what_agent_pr_held(self):
+        rules = broker.githubops.load_triggers(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                                            "code-triggers.json"))
+        self.assertIn("martin-nef-agent[bot]", rules["trusted"])
+        self.assertNotIn("dependabot[bot]", rules["trusted"])
+
+        def hit(repo, path):
+            return [w for repos, rx, w in rules["triggers"] if (repos is None or repo in repos) and rx.search(path)]
+        for repo, path in (("any", ".github/workflows/ci.yml"), ("any", "deploy/secrets.yaml"), ("any", ".sops.yaml"),
+                           ("any", "deploy/rbac.yaml"), ("any", "x/networkpolicy.yaml"), ("any", "age.agekey"),
+                           ("cluster-infra", "nefcloud/ops-broker/code-triggers.json"),
+                           ("cluster-infra", "nefcloud/night-shift/pvc.yaml"), ("claude-remote", "deploy/policy/CLAUDE.md"),
+                           ("claude-remote", "image/bin/agent-pr"), ("agent-harness", "profiles/night-worker.json"),
+                           ("agent-harness", "harness/paths.py"), ("pr-reviewer", "deploy/agent/policy.md")):
+            with self.subTest(path=path):
+                self.assertTrue(hit(repo, path))
+        for repo, path in (("any", "README.md"), ("pr-reviewer", "deploy/receiver/server.py"),
+                           ("agent-harness", "harness/shift.py"), ("other", "nefcloud/ops-broker/x.py")):
+            with self.subTest(path=path):
+                self.assertFalse(hit(repo, path))
 
     def status(self, sha=HEAD):
         mine = [s for s in self.gh.statuses.get(sha, []) if s["context"] == "human-review"]
@@ -1534,7 +1649,7 @@ class TestHumanReview(Served, GitHubBase):
         with mock.patch.object(broker, "file_human_review", lambda *a: created.append(a)):
             broker.sync_human_review()
         self.assertEqual(self.status(f"{159:040d}"), "success")  # past the first 100 PRs
-        self.assertEqual(created, [("web", 150, flagged, "late")])  # past the first 100 reviews
+        self.assertEqual(created, [("web", 150, flagged, "late", "reviewer")])  # past the first 100 reviews
 
     def test_a_fresh_sign_off_isnt_overwritten_by_a_stale_read(self):
         self.flag()
