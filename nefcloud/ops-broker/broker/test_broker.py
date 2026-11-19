@@ -1393,10 +1393,10 @@ class TestHumanReview(Served, GitHubBase):
 
     def test_an_untrusted_author_or_commit_is_held_but_not_filed(self):
         self.triggers({"trusted": ["agent[bot]"], "triggers": []})
-        self.gh.pulls[5]["user"] = {"login": "dependabot[bot]"}
+        self.gh.pulls[5]["user"] = {"login": "stranger"}
         broker.sync_human_review()
         self.assertEqual(self.status(), "pending")
-        self.assertIn("by dependabot[bot], not on the trusted list", self.description())
+        self.assertIn("by stranger, not on the trusted list", self.description())
         self.assertEqual(self.requests_filed(), [])  # nobody automated merges it: no ping
         self.gh.pulls[5]["user"] = {"login": "agent[bot]"}
         self.gh.pr_commits[5].append({"author": None})
@@ -1424,7 +1424,7 @@ class TestHumanReview(Served, GitHubBase):
 
     def test_your_github_approval_clears_a_held_pr(self):
         self.triggers({"trusted": ["agent[bot]"], "triggers": []})
-        self.gh.pulls[5]["user"] = {"login": "dependabot[bot]"}
+        self.gh.pulls[5]["user"] = {"login": "stranger"}
         with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
             self.gh.reviews[5] = [{**review("owner", HEAD), "state": "APPROVED"}]
             broker.sync_human_review()
@@ -1443,7 +1443,7 @@ class TestHumanReview(Served, GitHubBase):
         rules = broker.githubops.load_triggers(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                                                             "code-triggers.json"))
         self.assertIn("martin-nef-agent[bot]", rules["trusted"])
-        self.assertNotIn("dependabot[bot]", rules["trusted"])
+        self.assertIn("dependabot[bot]", rules["trusted"])  # its version bumps aren't held; a trigger path still is
 
         def hit(repo, path):
             return [w for repos, rx, w in rules["triggers"] if (repos is None or repo in repos) and rx.search(path)]

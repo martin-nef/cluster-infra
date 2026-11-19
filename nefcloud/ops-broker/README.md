@@ -163,7 +163,7 @@ For each open PR head that no request covers yet, it reads the PR's commits and 
 | The PR | Its `human-review` check | Request filed for you |
 |---|---|---|
 | Yours (`HUMAN_REVIEWERS`) | not checked: you wrote it | no |
-| Opened by, or with commits by, someone not in `trusted` (dependabot, a stranger) | pending: *by \<login\>, not on the trusted list* | no. Nothing automated merges it, so approve it on GitHub when you get to it |
+| Opened by, or with commits by, someone not in `trusted` (a stranger) | pending: *by \<login\>, not on the trusted list* | no. Nothing automated merges it, so approve it on GitHub when you get to it |
 | A trusted author's, touching a trigger path (a rename's old path too) | pending: *touches \<what\> (\<path\>)* | yes, in the *Code triggers* group, so you're asked |
 | Anything else | as before: success unless flagged | |
 

@@ -13,7 +13,8 @@
     "martin-nef-reviewer[bot]",
     "martin-nef-ops[bot]",
     "nefcloud-agent[bot]",
-    "cv-agent[bot]"
+    "cv-agent[bot]",
+    "dependabot[bot]"
   ],
   "triggers": [
     {"what": "CI", "paths": ["^\\.github/(workflows|actions)/"]},
