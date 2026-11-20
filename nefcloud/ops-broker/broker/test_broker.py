@@ -181,6 +181,7 @@ class FakeGitHub:
         self.reviews = {5: []}
         self.pr_files = {5: [{"filename": "rbac.yaml", "additions": 3, "deletions": 0}]}
         self.pr_commits = {5: [{"author": {"login": "agent[bot]"}}]}
+        self.files_at = {}  # (path, ref) -> a file's text at that commit
         self.statuses = {}  # sha -> [status], newest first
         self.installed = [{"name": "web", "open_issues_count": 1}]  # what the ops App is installed on
         self.rulesets = []
@@ -239,8 +240,12 @@ class FakeGitHub:
                 return copy.deepcopy(self.branches[name])
         if sub.startswith("/contents/"):
             path_ = urllib.parse.unquote(sub[len("/contents/"):])
-            if path_ in self.files:
-                return {"content": base64.b64encode(self.files[path_].encode()).decode()}
+            ref = dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("ref")
+            text = self.files_at.get((path_, ref))
+            if text is None and not any(k[0] == path_ for k in self.files_at):
+                text = self.files.get(path_)  # a file with one version, whatever the ref
+            if text is not None:
+                return {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
         if sub == f"/git/commits/{BASE}":
             return {"tree": {"sha": "basetree"}}
         if sub == "/git/trees" and method == "POST":
@@ -1385,6 +1390,56 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(filed["spec"]["reason"], "code trigger: touches RBAC (rbac.yaml)")
         self.assertEqual(filed["spec"]["github"], {"repo": "web", "pr": 5, "headSHA": HEAD})
 
+    def kind_rules(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [
+            {"what": "RBAC", "kinds": ["Role", "ClusterRoleBinding"]}, {"what": "secrets", "kinds": ["Secret"]}]})
+        self.gh.pulls[5]["base"] = {"sha": "b" * 40}
+
+    def test_a_yaml_files_kind_counts_whatever_it_is_called(self):
+        self.kind_rules()
+        self.gh.pr_files[5] = [{"filename": "deploy/app.yaml", "status": "modified"}, {"filename": "README.md"}]
+        self.gh.files_at[("deploy/app.yaml", HEAD)] = ("apiVersion: v1\nkind: ConfigMap\n---\n"
+                                                      "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\n")
+        broker.sync_human_review()
+        self.assertIn("touches RBAC (deploy/app.yaml: Role)", self.description())
+        self.assertEqual(len(self.requests_filed()), 1)
+
+    def test_kinds_before_the_change_count_too(self):
+        self.kind_rules()
+        # A Secret turned into a ConfigMap, a removed binding, a kustomize patch's target.
+        self.gh.pr_files[5] = [{"filename": "a.yaml", "status": "modified"},
+                               {"filename": "b.yml", "status": "removed"},
+                               {"filename": "kustomization.yaml", "status": "added"}]
+        self.gh.files_at.update({("a.yaml", HEAD): "kind: ConfigMap\n", ("a.yaml", "b" * 40): "kind: Secret\n",
+                                 ("b.yml", "b" * 40): "- kind: ClusterRoleBinding\n",
+                                 ("kustomization.yaml", HEAD): "patches:\n  - target: {kind: ClusterRoleBinding}\n"})
+        broker.sync_human_review()
+        self.assertIn("secrets (a.yaml: Secret)", self.description())
+        self.assertIn("RBAC (b.yml: ClusterRoleBinding)", self.description())
+        reads = [p for _, p, *_ in self.gh.calls if "/contents/" in p]
+        self.assertFalse(any("b.yml" in p and HEAD in p for p in reads))  # removed: only its base is read
+        self.assertFalse(any("kustomization" in p and "b" * 40 in p for p in reads))  # added: only its head
+
+    def test_other_kinds_and_files_dont_count(self):
+        self.kind_rules()
+        self.gh.pr_files[5] = [{"filename": "deploy/app.yaml", "status": "modified"}, {"filename": "notes.txt"}]
+        self.gh.files_at[("deploy/app.yaml", HEAD)] = "kind: Deployment\nspec: {}\n# kind: Role in a comment\n"
+        self.gh.files_at[("notes.txt", HEAD)] = "kind: Role\n"
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_yaml_it_cant_read_holds_the_pr(self):
+        self.kind_rules()
+        self.gh.pr_files[5] = [{"filename": f"f{i}.yaml", "status": "added"} for i in range(51)]
+        broker.sync_human_review()
+        self.assertIn("51 YAML files, too many to read", self.description())
+        self.gh.pr_files[5] = [{"filename": "big.yaml", "status": "added"}]
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        self.gh.files_at[("big.yaml", "n" * 40)] = "x"
+        with mock.patch.object(broker.githubops, "kinds_in", side_effect=broker.githubops.GitHubError(413, "too large")):
+            broker.sync_human_review()
+        self.assertIsNone(self.status("n" * 40))  # no status: the required check blocks the merge until it can read it
+
     def test_a_renamed_files_old_path_counts(self):
         self.triggers({"trusted": ["agent[bot]"], "triggers": [{"what": "CI", "paths": ["^\\.github/workflows/"]}]})
         self.gh.pr_files[5] = [{"filename": "ci.yml.bak", "previous_filename": ".github/workflows/ci.yml"}]
@@ -1443,6 +1498,11 @@ class TestHumanReview(Served, GitHubBase):
         rules = broker.githubops.load_triggers(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                                                             "code-triggers.json"))
         self.assertIn("martin-nef-agent[bot]", rules["trusted"])
+        self.assertNotIn("martin-nef-reviewer[bot]", rules["trusted"])  # it reviews, it doesn't author code
+        self.assertNotIn("martin-nef-ops[bot]", rules["trusted"])
+        kinds = {k for _, ks, _ in rules["kinds"] for k in ks}
+        self.assertTrue({"Secret", "Role", "ClusterRoleBinding", "NetworkPolicy", "ResourceQuota",
+                         "ValidatingAdmissionPolicy"} <= kinds)
         self.assertIn("dependabot[bot]", rules["trusted"])  # its version bumps aren't held; a trigger path still is
 
         def hit(repo, path):
@@ -1452,11 +1512,12 @@ class TestHumanReview(Served, GitHubBase):
                            ("cluster-infra", "nefcloud/ops-broker/code-triggers.json"),
                            ("cluster-infra", "nefcloud/night-shift/pvc.yaml"), ("claude-remote", "deploy/policy/CLAUDE.md"),
                            ("claude-remote", "image/bin/agent-pr"), ("agent-harness", "profiles/night-worker.json"),
-                           ("agent-harness", "harness/paths.py"), ("pr-reviewer", "deploy/agent/policy.md")):
+                           ("agent-harness", "harness/paths.py"), ("pr-reviewer", "deploy/agent/policy.md"),
+                           ("pr-reviewer", "deploy/receiver/server.py"), ("pr-reviewer", "README.md")):
             with self.subTest(path=path):
                 self.assertTrue(hit(repo, path))
-        for repo, path in (("any", "README.md"), ("pr-reviewer", "deploy/receiver/server.py"),
-                           ("agent-harness", "harness/shift.py"), ("other", "nefcloud/ops-broker/x.py")):
+        for repo, path in (("any", "README.md"), ("agent-harness", "harness/shift.py"),
+                           ("other", "nefcloud/ops-broker/x.py")):
             with self.subTest(path=path):
                 self.assertFalse(hit(repo, path))
 
@@ -1530,9 +1591,10 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         perms = [p for _, p in self.gh.tokens]
         self.assertIn({"pull_requests": "read"}, perms)  # the scan's check
-        self.assertIn({"pull_requests": "read", "statuses": "read"}, perms)  # sync
+        self.assertIn({"pull_requests": "read", "statuses": "read", "contents": "read"}, perms)  # sync
         self.assertIn({"statuses": "write"}, perms)  # sync, to set the status
-        self.assertTrue(all("contents" not in p and "administration" not in p for p in perms))
+        # contents only to read (a YAML file's kinds), never to write; no administration.
+        self.assertTrue(all(p.get("contents") in (None, "read") and "administration" not in p for p in perms))
 
     def test_states(self):
         def state(**status):
@@ -1739,13 +1801,13 @@ class TestHumanReview(Served, GitHubBase):
     def test_tokens_are_per_repo_and_write_only_when_a_status_changes(self):
         broker.sync_human_review()
         self.assertEqual(self.gh.tokens, [(None, {"metadata": "read"}),
-                                          (["web"], {"pull_requests": "read", "statuses": "read"}),
+                                          (["web"], {"pull_requests": "read", "statuses": "read", "contents": "read"}),
                                           (["web"], {"statuses": "write"})])
         self.assertEqual(len(self.gh.revoked), 3)
         self.gh.tokens.clear()
         broker.sync_human_review()  # nothing changed: no write token
         self.assertEqual([p for _, p in self.gh.tokens], [{"metadata": "read"},
-                                                          {"pull_requests": "read", "statuses": "read"}])
+                                                          {"pull_requests": "read", "statuses": "read", "contents": "read"}])
 
     def test_only_the_list_token_is_for_every_repo(self):
         with self.assertRaises(broker.githubops.GitHubError) as cm:

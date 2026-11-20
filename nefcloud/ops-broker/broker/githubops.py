@@ -477,23 +477,51 @@ def reviewer_flag(reviews, reviewer, head):
     return reason.strip()[:500], state.get("ready", True) is not False
 
 
+YAML_FILE = re.compile(r"\.ya?ml$", re.I)
+# A manifest's kind, as a document or a list item declares it, and as a
+# kustomize patch's target names it ("target: {kind: Role}" on one line too).
+KIND = re.compile(r"""(?:^\s*(?:-\s*)?|[{,]\s*)kind:\s*['"]?([A-Za-z0-9]+)""", re.M)
+# More YAML files than this in one PR aren't read one by one: the PR is held.
+MAX_YAML_FILES = 50
+
+
 def load_triggers(path):
     """The code-trigger list (code-triggers.json) as {"trusted": set of logins,
-    "triggers": [(repos or None, compiled regex, what)]}. Raises on anything
-    unreadable: the caller fails closed."""
+    "triggers": [(repos or None, compiled path regex, what)], "kinds":
+    [(repos or None, set of kinds, what)]}. Raises on anything unreadable: the
+    caller fails closed."""
     with open(path) as f:
         data = json.load(f)
     trusted = {str(t).lower() for t in data["trusted"]}
-    rules = []
+    rules, kinds = [], []
     for rule in data["triggers"]:
         repos = rule.get("repos")
         if repos is not None and not (isinstance(repos, list) and all(isinstance(r, str) for r in repos)):
             raise ValueError(f"{rule.get('what')}: repos must be a list of names")
-        if not rule["paths"] or not str(rule["what"]).strip():
-            raise ValueError("every trigger needs paths and what")
-        for pattern in rule["paths"]:
-            rules.append((set(repos) if repos is not None else None, re.compile(pattern), str(rule["what"])))
-    return {"trusted": trusted, "triggers": rules}
+        paths, rule_kinds = rule.get("paths", []), rule.get("kinds", [])
+        if not (paths or rule_kinds) or not str(rule["what"]).strip():
+            raise ValueError("every trigger needs what, and paths or kinds")
+        if not all(isinstance(k, str) and re.fullmatch(r"[A-Za-z0-9]+", k) for k in rule_kinds):
+            raise ValueError(f"{rule['what']}: kinds must be plain kind names")
+        scope = set(repos) if repos is not None else None
+        rules += [(scope, re.compile(pattern), str(rule["what"])) for pattern in paths]
+        if rule_kinds:
+            kinds.append((scope, set(rule_kinds), str(rule["what"])))
+    return {"trusted": trusted, "triggers": rules, "kinds": kinds}
+
+
+def kinds_in(tok, path, ref):
+    """The kinds a YAML file declares at ref; empty if it isn't there. Raises
+    GitHubError when the file can't be read whole, so the caller holds the PR."""
+    try:
+        got = tok("GET", f"/contents/{urllib.parse.quote(path)}?ref={ref}")
+    except GitHubError as e:
+        if e.code == 404:
+            return set()
+        raise
+    if not isinstance(got, dict) or got.get("encoding") != "base64":
+        raise GitHubError(413, f"{path} is too large to read")
+    return set(KIND.findall(base64.b64decode(got["content"]).decode("utf-8", "replace")))
 
 
 def code_trigger(tok, repo, pr, rules, humans):
@@ -519,11 +547,30 @@ def code_trigger(tok, repo, pr, rules, humans):
     if untrusted:
         return f"by {', '.join(sorted(untrusted))}, not on the trusted list: approve it on GitHub", False
     hits = {}
-    for f in pages(tok, f"/pulls/{number}/files"):
+    files = pages(tok, f"/pulls/{number}/files")
+    for f in files:
         for path in filter(None, (f.get("filename"), f.get("previous_filename"))):
             for repos, pattern, what in rules["triggers"]:
                 if (repos is None or repo in repos) and pattern.search(path):
                     hits.setdefault(what, path)
+    # What a YAML file declares, before and after: a Role whose rules change,
+    # or a Secret whatever the file is called. Only when a kind rule applies here.
+    kind_rules = [(kinds, what) for repos, kinds, what in rules.get("kinds", []) if repos is None or repo in repos]
+    yaml = [f for f in files if YAML_FILE.search(f.get("filename", "")) or YAML_FILE.search(f.get("previous_filename") or "")]
+    if kind_rules and yaml:
+        if len(yaml) > MAX_YAML_FILES:
+            return f"touches {len(yaml)} YAML files, too many to read for their kinds", True
+        head, base = pr["head"]["sha"], (pr.get("base") or {}).get("sha")
+        for f in yaml:
+            found = set()
+            if f.get("status") != "removed":
+                found |= kinds_in(tok, f["filename"], head)
+            if base and f.get("status") != "added":
+                found |= kinds_in(tok, f.get("previous_filename") or f["filename"], base)
+            for kinds, what in kind_rules:
+                matched = sorted(found & kinds)
+                if matched:
+                    hits.setdefault(what, f"{f['filename']}: {', '.join(matched)}")
     if hits:
         return "touches " + "; ".join(f"{w} ({p})" for w, p in hits.items()), True
     return None

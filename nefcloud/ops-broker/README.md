@@ -164,10 +164,12 @@ For each open PR head that no request covers yet, it reads the PR's commits and 
 |---|---|---|
 | Yours (`HUMAN_REVIEWERS`) | not checked: you wrote it | no |
 | Opened by, or with commits by, someone not in `trusted` (a stranger) | pending: *by \<login\>, not on the trusted list* | no. Nothing automated merges it, so approve it on GitHub when you get to it |
-| A trusted author's, touching a trigger path (a rename's old path too) | pending: *touches \<what\> (\<path\>)* | yes, in the *Code triggers* group, so you're asked |
+| A trusted author's, touching a trigger path (a rename's old path too), or a YAML file declaring a trigger `kind` before or after the change | pending: *touches \<what\> (\<path\>)* | yes, in the *Code triggers* group, so you're asked |
 | Anything else | as before: success unless flagged | |
 
-Your sign-off clears it as for any flag: Approve on the ops page, or Approve the PR on GitHub. A push needs a new sign-off. A rule with `repos` holds only there, one without holds everywhere. `paths` are Python regexes over the repo-relative path.
+Your sign-off clears it as for any flag: Approve on the ops page, or Approve the PR on GitHub. A push needs a new sign-off. A rule with `repos` holds only there, one without holds everywhere. `paths` are Python regexes over the repo-relative path. `kinds` are matched against the `kind:` lines of every `.yaml`/`.yml` file the PR touches, read at the head and at the base (so a Role whose rules change counts, as does a Secret renamed to anything, a removed binding, or a kustomize patch whose `target` names a kind). That's one read per YAML file per version, once per head, and only in repos where a kind rule applies. A PR with more than 50 YAML files is held without reading them, and a file too large to read leaves the PR without a status (so blocked) until it can be read.
+
+`trusted` is who may author code: you, the agents that write it, and dependabot. The PR reviewer and the ops App aren't on it: they review and sign off, so a commit of theirs on a PR holds it for you like anyone else's.
 
 - **Fails closed.** If the broker can't read or parse the list, every PR but yours waits for you (*the code-trigger list can't be read*).
 - **No lost flags when the queue is full.** A flag is filed only while the broker has a free pending slot (`PENDING_CAPS`). Otherwise the check is pending without a link, and the flag is filed on a later pass. Before this, a full queue left the PR with a rejected flag for good.
