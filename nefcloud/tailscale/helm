@@ -12,4 +12,5 @@ helm upgrade \
   tailscale/tailscale-operator \
   --namespace=tailscale \
   --create-namespace \
-  --wait
+  --wait \
+  -f values.yaml

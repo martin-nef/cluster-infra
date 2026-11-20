@@ -14,3 +14,19 @@ spec:
         kind: HelmRepository
         name: tailscale
   interval: 10m0s
+  values:
+    operatorConfig:
+      extraEnv:
+      - name: HOME
+        value: /tmp
+      podSecurityContext:
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL

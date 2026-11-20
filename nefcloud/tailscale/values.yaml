@@ -1,0 +1,21 @@
+# The operator image has no USER, so it ran as root. It keeps its tailnet state
+# in a Secret and needs no privileges, so run it as nobody with no way to gain
+# privileges back. tsnet still makes a config dir under $HOME, which for an
+# unknown uid would be /; point it at the image's world-writable /tmp.
+#
+# Proxy pods the operator creates (ProxyClass, Connector, Ingress) are not
+# covered by this: they need NET_ADMIN, so the namespace stays unlabelled.
+operatorConfig:
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+  extraEnv:
+    - name: HOME
+      value: /tmp
