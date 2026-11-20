@@ -68,19 +68,26 @@ RERUNNABLE = {"failure", "cancelled", "timed_out", "startup_failure"}
 # is installed on, made a required check by RULESET, pinned to the ops App: only
 # this broker sets it.
 HUMAN_REVIEW = "human-review"
+# GitHub Apps the human-review ruleset doesn't hold (CI that pushes to default
+# branches itself), by name for the reader: their App ids.
+RULESET_BYPASS_APPS = {"martin-nef-ci": 5855882}
 
 
 def ruleset(app_id):
     """The one human-review ruleset, the same on every repo: the check is
     required on the default branch, from the ops App only, so no other App or
-    user can set it. Repo admins (you) bypass it, so you can always merge.
-    Beside the branch rule, not in it: it adds a check without rewriting it."""
+    user can set it. Repo admins (you, martin-nef, as the owner) and
+    RULESET_BYPASS_APPS bypass it. Rulesets on a personal account's repos can't
+    name a user, so you're in by your admin role. Beside the branch rule, not
+    in it: it adds a check without rewriting it."""
     return {"name": HUMAN_REVIEW, "target": "branch", "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [{"type": "required_status_checks", "parameters": {
                 "strict_required_status_checks_policy": False,
                 "required_status_checks": [{"context": HUMAN_REVIEW, "integration_id": int(app_id)}]}}],
-            "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
+            "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+            + [{"actor_id": i, "actor_type": "Integration", "bypass_mode": "always"}
+               for i in RULESET_BYPASS_APPS.values()]}
 # The marker the PR reviewer ends each review with (pr-reviewer job.py STATE_MARK).
 REVIEW_MARK = "<!-- pr-reviewer-state "
 

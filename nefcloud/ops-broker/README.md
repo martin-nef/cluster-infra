@@ -152,7 +152,7 @@ Agents merge their own PRs once the PR reviewer approves (roadmap: *Autonomous m
   - Approving overrides an earlier Deny, and a reviewer flag you've already approved isn't filed at all.
   - Only reviews the API says are yours count, and the agents' Apps review as `…[bot]`, so they can't approve as you.
 - **Once flagged, always your call.** A push after your sign-off goes back to `pending`, and only a new flag and a new sign-off clear it. An expired flag is filed again if the reviewer's flag still stands. A rejected one isn't, so a full queue can't loop.
-- **The guard is GitHub's.** One `human-review` ruleset makes the check required on the default branch, pinned to the ops App (`martin-nef-ops`) as its only source, so no other App or user can set it. Then no agent can merge a flagged PR, whatever it does. Repo admins bypass it, so you can always merge. The broker holds the ruleset's one definition (`githubops.ruleset`) and asks you to add it where it's missing (below).
+- **The guard is GitHub's.** One `human-review` ruleset makes the check required on the default branch, pinned to the ops App (`martin-nef-ops`) as its only source, so no other App or user can set it. Then no agent can merge a flagged PR, whatever it does. Two bypass it: repo admins, so you (`martin-nef`, the owner) can always merge, and the Apps in `githubops.RULESET_BYPASS_APPS` (today the CI App, `martin-nef-ci`), which push to default branches themselves. GitHub doesn't let a personal account's rulesets name a user, so you're in by your admin role, not by name. The broker holds the ruleset's one definition (`githubops.ruleset`) and asks you to add it where it's missing (below).
 
 ### Code triggers
 

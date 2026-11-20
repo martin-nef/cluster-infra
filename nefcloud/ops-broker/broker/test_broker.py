@@ -1916,7 +1916,8 @@ class TestRequireHumanReview(Served, GitHubBase):
         (rs,) = self.gh.rulesets
         check = rs["rules"][0]["parameters"]["required_status_checks"]
         self.assertEqual(check, [{"context": "human-review", "integration_id": 42}])
-        self.assertEqual(rs["bypass_actors"][0]["actor_type"], "RepositoryRole")
+        self.assertEqual([(a["actor_type"], a["actor_id"]) for a in rs["bypass_actors"]],
+                         [("RepositoryRole", 5), ("Integration", 5855882)])
         self.assertIn({"administration": "write"}, [p for _, p in self.gh.tokens])
 
     def test_rejected_where_there_is_one_or_it_would_hold_prs_with_no_status(self):
