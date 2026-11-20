@@ -17,7 +17,7 @@
     "dependabot[bot]"
   ],
   "triggers": [
-    {"what": "CI", "paths": ["^\\.github/(workflows|actions)/"]},
+    {"what": "CI or GitHub config (.github/)", "paths": ["^\\.github/"]},
     {"what": "secrets or keys",
      "paths": ["(^|/)\\.sops\\.yaml$", "\\.secrets?\\.ya?ml$", "(^|/)secrets?\\.ya?ml$", "\\.(agekey|pem|key)$"],
      "kinds": ["Secret", "SealedSecret"]},
