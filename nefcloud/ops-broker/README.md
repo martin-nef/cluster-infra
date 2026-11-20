@@ -154,6 +154,28 @@ Agents merge their own PRs once the PR reviewer approves (roadmap: *Autonomous m
 - **Once flagged, always your call.** A push after your sign-off goes back to `pending`, and only a new flag and a new sign-off clear it. An expired flag is filed again if the reviewer's flag still stands. A rejected one isn't, so a full queue can't loop.
 - **The guard is GitHub's.** One `human-review` ruleset makes the check required on the default branch, pinned to the ops App (`martin-nef-ops`) as its only source, so no other App or user can set it. Then no agent can merge a flagged PR, whatever it does. Repo admins bypass it, so you can always merge. The broker holds the ruleset's one definition (`githubops.ruleset`) and asks you to add it where it's missing (below).
 
+### Code triggers
+
+Some changes always need you, whoever opened the PR and whatever any reviewer said: CI, secrets and keys, RBAC, NetworkPolicy, admission, quotas, an agent's sandbox, policy, profile or merge gate. They're listed once, in [`code-triggers.json`](code-triggers.json), and the broker applies the list itself on every sync. Agents don't have to remember to flag them, and no agent's copy of the list can drift.
+
+For each open PR head that no request covers yet, it reads the PR's commits and changed files (once per head) and decides:
+
+| The PR | Its `human-review` check | Request filed for you |
+|---|---|---|
+| Yours (`HUMAN_REVIEWERS`) | not checked: you wrote it | no |
+| Opened by, or with commits by, someone not in `trusted` (a stranger) | pending: *by \<login\>, not on the trusted list* | no. Nothing automated merges it, so approve it on GitHub when you get to it |
+| A trusted author's, touching a trigger path (a rename's old path too), or a YAML file declaring a trigger `kind` before or after the change | pending: *touches \<what\> (\<path\>)* | yes, in the *Code triggers* group, so you're asked |
+| Anything else | as before: success unless flagged | |
+
+Your sign-off clears it as for any flag: Approve on the ops page, or Approve the PR on GitHub. A push needs a new sign-off. A rule with `repos` holds only there, one without holds everywhere. `paths` are Python regexes over the repo-relative path. `kinds` are matched against the `kind:` lines of every `.yaml`/`.yml` file the PR touches, read at the head and at the base (so a Role whose rules change counts, as does a Secret renamed to anything, a removed binding, or a kustomize patch whose `target` names a kind). That's one read per YAML file per version, once per head, and only in repos where a kind rule applies. A PR with more than 50 YAML files is held without reading them, and a file too large to read leaves the PR without a status (so blocked) until it can be read.
+
+`trusted` is who may author code: you, the agents that write it, and dependabot. The PR reviewer and the ops App aren't on it: they review and sign off, so a commit of theirs on a PR holds it for you like anyone else's.
+
+- **Fails closed.** If the broker can't read or parse the list, every PR but yours waits for you (*the code-trigger list can't be read*).
+- **No lost flags when the queue is full.** A flag is filed only while the broker has a free pending slot (`PENDING_CAPS`). Otherwise the check is pending without a link, and the flag is filed on a later pass. Before this, a full queue left the PR with a rejected flag for good.
+- **The list is a trigger itself** (it's under `nefcloud/ops-broker/`), so changing it needs you.
+- **Agents' own checks can go.** `agent-pr`'s copy of the list, and the night worker's path denies, were early guards that each only held if that agent ran them. With the broker enforcing the list, they can be dropped.
+
 ### Every repo, with exceptions
 
 There's no list of repos to keep up to date. Any agent can flag a PR on any repo, so the default is everything the ops App is installed on: a status on every open PR, the reviewer's flags filed (ntfy), and the ruleset, which the broker asks you to add. The one exception is `HUMAN_REVIEW_EXCLUDE` in `config.env`, for repos that are **fully automatic**. They get no status and no ruleset, the reviewer's flags aren't filed, and an agent's own `github-human-review` request is rejected at once ("its PRs merge without human review"), so it never pings you. The agent learns straight away that nobody will look, instead of waiting on a review that holds nothing. A request to add the ruleset there is rejected too. Considered: letting agents still ask on an excluded repo. But nothing would hold the PR while you looked, so one agent could wait on you while another merged.

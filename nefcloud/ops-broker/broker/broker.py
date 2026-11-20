@@ -120,6 +120,14 @@ REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  #
 # its request on the ops page. Yours; never an agent's.
 HUMAN_REVIEWERS = {r.strip() for r in os.environ.get("HUMAN_REVIEWERS", GITHUB_OWNER).split(",") if r.strip()}
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
+# The one list of changes that always need a human (code-triggers.json, README
+# "Code triggers"), read on every pass. Unreadable holds every PR.
+CODE_TRIGGERS = os.environ.get("CODE_TRIGGERS", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                             "code-triggers.json"))
+# (repo, head sha) -> code_trigger's answer: a head's files and commits don't change.
+TRIGGER_CACHE = {}
+# The broker's own requests, for its pending slots (PENDING_CAPS).
+SELF = f"system:serviceaccount:{os.environ.get('POD_NAMESPACE', 'ops-broker')}:ops-broker"
 # Every this many passes, the sync also looks for repos without the ruleset.
 RULESET_EVERY = 10
 # At most this many github-require-human-review requests wait at once, so the
@@ -495,15 +503,17 @@ def review_url(reqs):
     return f"{PUBLIC_URL}/r/{reqs[-1]['metadata']['name']}" if reqs else None
 
 
-def file_human_review(repo, pr, head, reason):
-    """File a request for the reviewer's flag. The admission policy stamps this
-    broker as the requester; the reason says whose flag it is."""
+def file_human_review(repo, pr, head, reason, whose="reviewer"):
+    """File a request for the reviewer's flag or a code trigger. The admission
+    policy stamps this broker as the requester; the reason says whose flag it is."""
+    by, workstream = ((REVIEWER_LOGIN, "PR reviewer's flags") if whose == "reviewer"
+                      else ("code trigger", "Code triggers"))
     k8s("POST", REQUESTS, {
         "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
         "metadata": {"generateName": "github-human-review-", "namespace": NAMESPACE},
         "spec": {"verb": "github-human-review", "github": {"repo": repo, "pr": pr, "headSHA": head},
-                 "reason": f"{REVIEWER_LOGIN}: {reason}"[:1000], "ttlSeconds": MAX_TTL,
-                 "workstream": "PR reviewer's flags"},
+                 "reason": f"{by}: {reason}"[:1000], "ttlSeconds": MAX_TTL,
+                 "workstream": workstream},
     }, content_type="application/json")
     print(json.dumps({"time": stamp(), "event": "filed", "action": f"github-human-review {GITHUB_OWNER}/{repo}#{pr}",
                       "reason": reason}), flush=True)
@@ -548,6 +558,16 @@ def sync_human_review(rulesets=False):
         return
     items = list_requests()
     clean = True
+    try:
+        rules = githubops.load_triggers(CODE_TRIGGERS)
+    except (OSError, ValueError, KeyError, TypeError, re.error) as e:
+        rules = None  # fail closed: every PR but yours waits for you
+        print(f"code triggers: can't read {CODE_TRIGGERS}: {e!r}; holding every PR", flush=True)
+    if len(TRIGGER_CACHE) > 5000:
+        TRIGGER_CACHE.clear()
+    # Filed flags count against the broker's own slots: when they're full, a
+    # flag waits for a later pass instead of being rejected for good.
+    room = [pending_cap(SELF)[1] - sum(1 for r in items if requester(r) == SELF and phase(r) in ("", "Pending"))]
     with MINTER.token(None, "github-human-review", "list") as tok:
         repos = [(r, n) for r, n in githubops.installed(tok) if r not in HUMAN_REVIEW_EXCLUDE]
     for repo, open_count in repos:
@@ -558,12 +578,24 @@ def sync_human_review(rulesets=False):
 
         def recheck(pr, head, repo=repo):
             return human_review_state(head, human_review_requests(list_requests(), repo).get(pr, []))
+
+        def triggers(tok, pr, repo=repo):
+            key = (repo, pr["head"]["sha"])
+            if rules is None:
+                return githubops.code_trigger(tok, repo, pr, None, HUMAN_REVIEWERS)
+            if key not in TRIGGER_CACHE:
+                TRIGGER_CACHE[key] = githubops.code_trigger(tok, repo, pr, rules, HUMAN_REVIEWERS)
+            return TRIGGER_CACHE[key]
         try:
             to_file, OPEN_PRS[repo], approved = githubops.sync(
                 MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck,
-                HUMAN_REVIEWERS, link=lambda pr, head: review_url(reqs.get(pr, [])))
-            for pr, head, reason in to_file:
-                file_human_review(repo, pr, head, reason)
+                HUMAN_REVIEWERS, link=lambda pr, head: review_url(reqs.get(pr, [])), triggers=triggers)
+            for pr, head, reason, whose in to_file:
+                if room[0] <= 0:
+                    print(f"human-review {repo}#{pr}: no free slot; filed on a later pass", flush=True)
+                    continue
+                file_human_review(repo, pr, head, reason, whose)
+                room[0] -= 1
             for pr, head, login in approved:
                 signed_off_on_github(repo, pr, head, login)
         except (githubops.GitHubError, K8sError, OSError) as e:

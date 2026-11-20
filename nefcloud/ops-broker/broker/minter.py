@@ -101,7 +101,8 @@ TOKENS = {
     "github-human-review": {"check": {"pull_requests": "read"}, "run": {"statuses": "write"},
                             "approve": {"pull_requests": "write"},
                             "list": {"metadata": "read"},
-                            "sync": {"pull_requests": "read", "statuses": "read"},
+                            # contents: a YAML file's kinds, for the code triggers.
+                            "sync": {"pull_requests": "read", "statuses": "read", "contents": "read"},
                             "write": {"statuses": "write"}},
     "github-require-human-review": {"check": {"administration": "read"}, "run": {"administration": "write"}},
 }
