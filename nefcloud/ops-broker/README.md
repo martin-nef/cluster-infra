@@ -156,7 +156,7 @@ Agents merge their own PRs once the PR reviewer approves (roadmap: *Autonomous m
 
 ### Code triggers
 
-Some changes always need you, whoever opened the PR and whatever any reviewer said: CI, secrets and keys, RBAC, NetworkPolicy, admission, quotas, an agent's sandbox, policy, profile or merge gate. They're listed once, in [`code-triggers.json`](code-triggers.json), and the broker applies the list itself on every sync. Agents don't have to remember to flag them, and no agent's copy of the list can drift.
+Some changes always need you, whoever opened the PR and whatever any reviewer said: CI and anything else under `.github/`, secrets and keys, RBAC, NetworkPolicy, admission, quotas, an agent's sandbox, policy, profile or merge gate. They're listed once, in [`code-triggers.json`](code-triggers.json), the one source of truth for which changes need a human, and the broker applies the list itself on every sync. Agents and the PR reviewer keep no path lists of their own: the reviewer only flags by judgement (`needs_human`), which the broker files too. Agents don't have to remember to flag them, and no agent's copy of the list can drift.
 
 For each open PR head that no request covers yet, it reads the PR's commits and changed files (once per head) and decides:
 

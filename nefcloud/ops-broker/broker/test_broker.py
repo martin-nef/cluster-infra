@@ -1507,7 +1507,8 @@ class TestHumanReview(Served, GitHubBase):
 
         def hit(repo, path):
             return [w for repos, rx, w in rules["triggers"] if (repos is None or repo in repos) and rx.search(path)]
-        for repo, path in (("any", ".github/workflows/ci.yml"), ("any", "deploy/secrets.yaml"), ("any", ".sops.yaml"),
+        for repo, path in (("any", ".github/workflows/ci.yml"), ("any", ".github/dependabot.yml"),
+                           ("any", ".github/CODEOWNERS"), ("any", "deploy/secrets.yaml"), ("any", ".sops.yaml"),
                            ("any", "deploy/rbac.yaml"), ("any", "x/networkpolicy.yaml"), ("any", "age.agekey"),
                            ("cluster-infra", "nefcloud/ops-broker/code-triggers.json"),
                            ("cluster-infra", "nefcloud/night-shift/pvc.yaml"), ("claude-remote", "deploy/policy/CLAUDE.md"),
@@ -1516,7 +1517,7 @@ class TestHumanReview(Served, GitHubBase):
                            ("pr-reviewer", "deploy/receiver/server.py"), ("pr-reviewer", "README.md")):
             with self.subTest(path=path):
                 self.assertTrue(hit(repo, path))
-        for repo, path in (("any", "README.md"), ("agent-harness", "harness/shift.py"),
+        for repo, path in (("any", "README.md"), ("any", "docs/.github/x.yml"), ("agent-harness", "harness/shift.py"),
                            ("other", "nefcloud/ops-broker/x.py")):
             with self.subTest(path=path):
                 self.assertFalse(hit(repo, path))
