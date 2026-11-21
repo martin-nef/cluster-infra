@@ -1,0 +1,16 @@
+# nefcloud/ops-broker/networkpolicy.yaml, from the components.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ops-broker
+components:
+  - ../../../nefcloud/components/netpol/default-deny
+  - ../../../nefcloud/components/netpol/dns
+  - ../../../nefcloud/components/netpol/apiserver
+  - ../../../nefcloud/components/netpol/internet-https
+  - ../../../nefcloud/components/netpol/from-traefik
+patches:
+  - target: {kind: NetworkPolicy, name: allow-from-traefik}
+    patch: |-
+      - op: replace
+        path: /spec/podSelector
+        value: {matchLabels: {app: ops-broker}}
