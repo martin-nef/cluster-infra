@@ -184,7 +184,8 @@ class FakeGitHub:
         self.files_at = {}  # (path, ref) -> a file's text at that commit
         self.statuses = {}  # sha -> [status], newest first
         self.installed = [{"name": "web", "open_issues_count": 1}]  # what the ops App is installed on
-        self.rulesets = []
+        self.rulesets = {}  # repo -> its rulesets, as GET /rulesets/<id> shows them
+        self.next_ruleset = 76
 
     def __call__(self, method, path, token=None, body=None, basic=None, base=None):
         self.calls.append((method, path, body))
@@ -218,12 +219,23 @@ class FakeGitHub:
         if route == "/installation/repositories":
             n = int(dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("page", 1))
             return {"repositories": copy.deepcopy(self.installed[(n - 1) * 100:n * 100])}
-        if route.startswith("/repos/owner/") and route.endswith("/rulesets"):  # one list for every repo
-            if method == "POST":
-                self.rulesets.append({**body, "id": 77})
-                return {"id": 77}
-            n = int(dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("page", 1))
-            return copy.deepcopy(self.rulesets[(n - 1) * 100:n * 100])
+        m = re.fullmatch(r"/repos/owner/([^/]+)/rulesets(?:/(\d+))?", route)
+        if m:  # repo -> [ruleset]
+            have = self.rulesets.setdefault(m[1], [])
+            if m[2] is None and method == "POST":
+                self.next_ruleset += 1
+                have.append({**copy.deepcopy(body), "id": self.next_ruleset, "_links": {}})
+                return {"id": self.next_ruleset}
+            if m[2] is None:
+                n = int(dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("page", 1))
+                return [{"id": r["id"], "name": r["name"]} for r in have[(n - 1) * 100:n * 100]]
+            (i,) = [i for i, r in enumerate(have) if r["id"] == int(m[2])]
+            if method == "DELETE":
+                del have[i]
+                return {}
+            if method == "PUT":
+                have[i] = {**copy.deepcopy(body), "id": int(m[2])}
+            return copy.deepcopy(have[i])
         if route == REPO and method == "GET":
             return {"default_branch": self.default}
         sub = route[len(REPO):]
@@ -1824,7 +1836,7 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(self.gh.calls, [])
 
 
-class TestRequireHumanReview(Served, GitHubBase):
+class TestRulesets(Served, GitHubBase):
     def setUp(self):
         super().setUp()
         self.gh.installed.append({"name": "cv", "open_issues_count": 0})
@@ -1833,52 +1845,71 @@ class TestRequireHumanReview(Served, GitHubBase):
             p.start()
             self.addCleanup(p.stop)
 
-    def filed(self):
-        return sorted(r["spec"]["github"]["repo"] for r in self.api.requests.values()
-                      if r["spec"]["verb"] == "github-require-human-review")
+    def standard(self):
+        return broker.githubops.ruleset(42)
 
-    def capture(self):
-        """file_require, into the fake API as the admission policy would."""
-        return mock.patch.object(broker, "file_require",
-                                 lambda repo: self.add_github(f"req-{repo}", "github-require-human-review", repo=repo))
+    def names(self, repo):
+        return [r["name"] for r in self.gh.rulesets.get(repo, [])]
 
-    def test_repos_without_the_ruleset_are_asked_about_once(self):
-        with self.capture():
+    def test_added_where_missing_with_no_request(self):
+        broker.sync_human_review(rulesets=True)
+        for repo in ("web", "cv"):
+            (rs,) = self.gh.rulesets[repo]
+            self.assertTrue(broker.githubops.matches(self.standard(), rs))
+        self.assertEqual(self.api.requests, {})
+        self.assertIn({"administration": "write"}, [p for _, p in self.gh.tokens])
+
+    def test_the_standard_one(self):
+        broker.sync_human_review(rulesets=True)
+        (rs,) = self.gh.rulesets["web"]
+        check = rs["rules"][0]["parameters"]["required_status_checks"]
+        self.assertEqual(check, [{"context": "human-review", "integration_id": 42}])
+        self.assertEqual([(a["actor_type"], a["actor_id"]) for a in rs["bypass_actors"]],
+                         [("RepositoryRole", 5), ("Integration", 5855882)])
+
+    def test_left_alone_when_it_matches(self):
+        broker.sync_human_review(rulesets=True)
+        self.gh.calls.clear()
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual([(m, p) for m, p, _ in self.gh.calls if "/rulesets" in p and m != "GET"], [])
+
+    def test_an_edited_or_disabled_one_is_put_back(self):
+        broker.sync_human_review(rulesets=True)
+        (rs,) = self.gh.rulesets["web"]
+        rs["bypass_actors"].append({"actor_id": 1, "actor_type": "Integration", "bypass_mode": "always"})
+        (cv,) = self.gh.rulesets["cv"]
+        cv["enforcement"] = "disabled"
+        broker.sync_human_review(rulesets=True)
+        for repo in ("web", "cv"):
+            (now,) = self.gh.rulesets[repo]
+            self.assertTrue(broker.githubops.matches(self.standard(), now))
+
+    def test_a_deleted_one_comes_back_and_a_second_one_goes(self):
+        broker.sync_human_review(rulesets=True)
+        self.gh.rulesets["web"].clear()
+        self.gh.rulesets["cv"].append({"name": "human-review", "id": 5, "enforcement": "disabled"})
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.names("web"), ["human-review"])
+        self.assertEqual(self.names("cv"), ["human-review"])
+        self.assertNotEqual(self.gh.rulesets["cv"][0]["id"], 5)
+
+    def test_other_rulesets_are_left_alone(self):
+        self.gh.rulesets["web"] = [{"name": "main", "id": 3, "enforcement": "disabled"}]
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.names("web"), ["main", "human-review"])
+        self.assertEqual(self.gh.rulesets["web"][0]["enforcement"], "disabled")
+
+    def test_excluded_repos_have_none(self):
+        broker.sync_human_review(rulesets=True)
+        with mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"cv"}):
             broker.sync_human_review(rulesets=True)
-            self.assertEqual(self.filed(), ["cv", "web"])
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), ["cv", "web"])
+        self.assertEqual((self.names("web"), self.names("cv")), (["human-review"], []))
 
     def test_not_every_pass(self):
-        with self.capture():
-            broker.sync_human_review()
-        self.assertEqual(self.filed(), [])
+        broker.sync_human_review()
+        self.assertEqual(self.gh.rulesets, {})
 
-    def test_a_repo_with_one_or_excluded_isnt_asked_about(self):
-        self.gh.rulesets.append({"name": "human-review", "id": 1})  # the fake shares rulesets across repos
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
-        self.gh.rulesets.clear()
-        with self.capture(), mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"web", "cv"}):
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
-
-    def test_a_denied_repo_isnt_asked_again(self):
-        self.add_github("no", "github-require-human-review", repo="web")
-        self.api.requests["no"]["status"] = {"phase": "Denied"}
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), ["cv", "web"])  # web's is the Denied one, not a new one
-        self.assertEqual(len(self.api.requests), 2)
-
-    def test_at_most_a_batch_waits(self):
-        self.gh.installed += [{"name": f"r{i}", "open_issues_count": 0} for i in range(10)]
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(len(self.filed()), broker.RULESET_BATCH)
-
-    def test_nothing_filed_where_the_app_cant_set_statuses(self):
+    def test_none_where_the_app_cant_set_statuses(self):
         self.gh.installed = [{"name": "cv", "open_issues_count": 0}]  # no status to write this pass
         real = self.gh.__call__
 
@@ -1886,53 +1917,24 @@ class TestRequireHumanReview(Served, GitHubBase):
             if "access_tokens" in path and body["permissions"] == {"statuses": "write"}:
                 raise broker.githubops.GitHubError(422, "permissions not granted")
             return real(method, path, token, body, **kw)
-        with self.capture(), mock.patch.object(broker.githubops, "api", no_statuses), \
-                mock.patch.object(minter, "api", no_statuses):
+        with mock.patch.object(broker.githubops, "api", no_statuses), mock.patch.object(minter, "api", no_statuses):
             broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
+        self.assertEqual(self.gh.rulesets, {})
 
-    def test_nothing_filed_after_a_pass_that_couldnt_set_statuses(self):
+    def test_none_after_a_pass_that_couldnt_set_statuses(self):
         # A required check nobody can set would hold every PR.
         self.gh.fail[("GET", f"{REPO}/commits/{HEAD}/status")] = broker.githubops.GitHubError(403, "no statuses")
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.gh.rulesets, {})
 
-    def test_file_require_files_a_request(self):
-        with mock.patch.object(broker, "k8s") as k8s:
-            broker.file_require("web")
-        (method, path, body), _ = k8s.call_args
-        self.assertEqual((method, path, body["spec"]["verb"], body["spec"]["github"]), (
-            "POST", broker.REQUESTS, "github-require-human-review", {"repo": "web"}))
+    def test_one_repo_failing_doesnt_stop_the_rest(self):
+        self.gh.fail[("GET", "/repos/owner/web/rulesets?includes_parents=false&per_page=100&page=1")] = \
+            broker.githubops.GitHubError(500, "boom")
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.names("cv"), ["human-review"])
 
-    def test_approving_adds_the_standard_ruleset(self):
-        st = self.admit_github("r1", "github-require-human-review", repo="web")
-        self.assertEqual(st["phase"], "Pending")
-        status, body = self.request("GET", "/r/r1")
-        self.assertEqual(status, 200)
-        self.assertIn("~DEFAULT_BRANCH", body)
-        code, _ = broker.decide("r1", "approve", st["specHash"], APPROVER)
-        self.assertEqual((code, self.api.status("r1")["phase"]), (200, "Succeeded"))
-        (rs,) = self.gh.rulesets
-        check = rs["rules"][0]["parameters"]["required_status_checks"]
-        self.assertEqual(check, [{"context": "human-review", "integration_id": 42}])
-        self.assertEqual([(a["actor_type"], a["actor_id"]) for a in rs["bypass_actors"]],
-                         [("RepositoryRole", 5), ("Integration", 5855882)])
-        self.assertIn({"administration": "write"}, [p for _, p in self.gh.tokens])
-
-    def test_rejected_where_there_is_one_or_it_would_hold_prs_with_no_status(self):
-        self.gh.rulesets.append({"name": "human-review", "id": 1})
-        self.assertIn("already has", self.admit_github("r1", "github-require-human-review", repo="web")["message"])
-        self.gh.rulesets.clear()
-        with mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"web"}):
-            self.assertIn("EXCLUDE", self.admit_github("r2", "github-require-human-review", repo="web")["message"])
-
-    def test_one_made_since_the_check_is_left_alone(self):
-        st = self.admit_github("r1", "github-require-human-review", repo="web")
-        self.gh.rulesets.append({"name": "human-review", "id": 1})
-        broker.decide("r1", "approve", st["specHash"], APPROVER)
-        self.assertEqual(len(self.gh.rulesets), 1)
-        self.assertNotEqual(self.api.status("r1")["phase"], "Succeeded")
+    def test_the_old_verb_is_rejected(self):
+        self.assertIn("retired", self.admit_github("r1", "github-require-human-review", repo="web")["message"])
 
 
 class TestSopsKey(Base):
