@@ -133,9 +133,16 @@ rules:
   - apiGroups: [batch]
     resources: [cronjobs]
     verbs: [get, list, watch, create, update, patch, delete]
+  # The sessions PVC only: create can't name an object (the quota caps the
+  # count), and the rest are limited to `sessions`, so a change to the app
+  # repo can't touch or prune `state` (pvc.yaml), which holds the ledger.
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
-    verbs: [get, list, watch, create, update, patch, delete]
+    verbs: [get, list, watch, create]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    resourceNames: [sessions]
+    verbs: [update, patch, delete]
   - apiGroups: [""]
     resources: [pods, events]
     verbs: [get, list, watch]
