@@ -18,3 +18,18 @@ spec:
   values:
     clusterRoleBinding:
       create: false
+    podSecurityContext:
+      runAsGroup: 101
+      runAsNonRoot: true
+      runAsUser: 100
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+      privileged: false
+      runAsGroup: 101
+      runAsNonRoot: true
+      runAsUser: 100
