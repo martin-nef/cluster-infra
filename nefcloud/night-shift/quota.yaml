@@ -1,5 +1,5 @@
-# Live game servers share these nodes. Sized for the runner plus one task at a
-# time (MAX_CONCURRENT=1); a task pod's request is its largest step (the agent).
+# Live game servers share these nodes. Sized for the night shift's one pod: the
+# coordinator and the worker that runs the agent.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -14,10 +14,11 @@ spec:
     requests.ephemeral-storage: 3Gi
     limits.ephemeral-storage: 10Gi
     pods: "3"
-    # Running and finished (kept a day): a runner bug can't flood etcd.
+    # Running and finished: a CronJob bug can't flood etcd.
     count/jobs.batch: "40"
     count/configmaps: "40"
-    persistentvolumeclaims: "1"
+    # state (pvc.yaml) and the worker's sessions (agent-harness deploy/).
+    persistentvolumeclaims: "2"
     services: "0"
 ---
 apiVersion: v1

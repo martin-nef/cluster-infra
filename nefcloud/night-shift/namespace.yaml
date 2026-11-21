@@ -3,7 +3,6 @@ kind: Namespace
 metadata:
   name: night-shift
   labels:
-    # No privileged, hostPath or host-network pods, from the app repo or from
-    # the Jobs the runner creates.
+    # No privileged, hostPath or host-network pods from the app repo.
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest

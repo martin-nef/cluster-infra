@@ -1,6 +1,6 @@
 # The ledger and the quota's slots (agent-harness harness/ledger.py, quota.py).
 # local-path: the slots are flock()s, which NFS doesn't keep. Mounted by the
-# runner only, never by a task's pod.
+# coordinator only, never by the worker that runs the agent.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
