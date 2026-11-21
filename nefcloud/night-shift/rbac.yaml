@@ -1,6 +1,6 @@
 # The runner starts each task as a Job (with a ConfigMap holding its task.json),
 # waits for it, reads its pods' logs for the outcome, and cleans up. Task pods
-# run as the default ServiceAccount with no token mounted.
+# run as `worker` (below), whose token only the agent container mounts.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -42,8 +42,8 @@ subjects:
     name: runner
     namespace: night-shift
 ---
-# The ops broker (nefcloud/ops-broker/): the runner files human-review flags
-# for the PRs a task asks for, and reads the requests a stream is blocked on.
+# The ops broker (nefcloud/ops-broker/): the runner and the worker file
+# human-review flags and break-glass requests, and read the ones they wait on.
 # File and read only; approval stays on the page behind your Google login. It
 # has its own PENDING_CAPS slots there.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -69,11 +69,52 @@ subjects:
   - kind: ServiceAccount
     name: runner
     namespace: night-shift
+  - kind: ServiceAccount
+    name: worker
+    namespace: night-shift
+---
+# The night worker's agent: it works like the interactive agent (claude-remote/),
+# so it reads the cluster as claude-remote does, to check what it merged
+# deployed and is healthy, and files OpsRequests (human-review flags, break-glass)
+# through the ops-broker Role above. Read-only: no secrets, exec or writes. What
+# it may merge is held by the ops broker's human-review check, not by this.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker
+  namespace: night-shift
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: night-shift-worker-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: worker
+    namespace: night-shift
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: night-shift-worker-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: claude-remote-read  # nodes, CRDs, RBAC, metrics: what view leaves out (claude-remote/rbac.yaml)
+subjects:
+  - kind: ServiceAccount
+    name: worker
+    namespace: night-shift
 ---
 # The account Flux impersonates to apply agent-harness's deploy/
 # (spec.serviceAccountName of nefcloud/apps/night-shift.yaml): ConfigMaps,
-# Secrets and the CronJob only. No RBAC, NetworkPolicy, quota, PVC or Jobs, so
-# a change to the app repo can't widen what the runner or a task may do.
+# Secrets, the CronJob and PVCs (the worker's sessions; the quota caps them).
+# No RBAC, NetworkPolicy, quota or Jobs, so a change to the app repo can't
+# widen what the runner or a task may do.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -91,6 +132,9 @@ rules:
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [batch]
     resources: [cronjobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [""]
     resources: [pods, events]

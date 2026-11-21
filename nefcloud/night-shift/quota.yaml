@@ -17,7 +17,8 @@ spec:
     # Running and finished (kept a day): a runner bug can't flood etcd.
     count/jobs.batch: "40"
     count/configmaps: "40"
-    persistentvolumeclaims: "1"
+    # state (pvc.yaml) and the worker's sessions (agent-harness deploy/).
+    persistentvolumeclaims: "2"
     services: "0"
 ---
 apiVersion: v1
