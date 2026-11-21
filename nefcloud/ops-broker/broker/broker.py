@@ -28,9 +28,8 @@ One verb isn't an action but a sign-off (README, "Human review required"):
                         every open PR head of every repo the ops App is
                         installed on, but HUMAN_REVIEW_EXCLUDE (sync_loop).
   github-require-human-review
-                        Makes that check required on a repo, with the one
-                        standard ruleset. The broker files it for each
-                        covered repo that lacks one.
+                        Retired, rejected at admission: the broker keeps
+                        the ruleset that requires the check itself.
 
 The broker checks the target exists and marks the request Pending. Requests
 are grouped by requester and spec.workstream, the requester's own label for
@@ -128,11 +127,8 @@ CODE_TRIGGERS = os.environ.get("CODE_TRIGGERS", os.path.join(os.path.dirname(os.
 TRIGGER_CACHE = {}
 # The broker's own requests, for its pending slots (PENDING_CAPS).
 SELF = f"system:serviceaccount:{os.environ.get('POD_NAMESPACE', 'ops-broker')}:ops-broker"
-# Every this many passes, the sync also looks for repos without the ruleset.
+# Every this many passes, the sync also puts each repo's ruleset right.
 RULESET_EVERY = 10
-# At most this many github-require-human-review requests wait at once, so the
-# broker's pending slots stay free for flags.
-RULESET_BATCH = 5
 # repo -> its open PR numbers, as the last sync saw them. tidy keeps a
 # github-human-review request while its PR may still be open: deleting it
 # would make the PR read as never flagged.
@@ -178,7 +174,7 @@ VERBS = {
     "create-sops-age-key": {"Secret"},
 }
 SOPS_KEY = re.compile(r"[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?-sops-age")
-GITHUB_VERBS = set(githubops.VERBS)
+GITHUB_VERBS = set(githubops.VERBS) | set(githubops.RETIRED)
 USER_VERBS = set(githubops.USER_VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
 POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
@@ -404,9 +400,8 @@ def check_github(spec):
         if MINTER.status() is None:
             return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
         repo = spec["github"].get("repo")
-        if spec.get("verb") == "github-require-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
-            # Its PRs get no status, so a required check would hold them all.
-            return f"{repo} is in HUMAN_REVIEW_EXCLUDE: the broker sets no human-review status there"
+        if spec.get("verb") == "github-require-human-review":
+            return "retired: the broker keeps the human-review ruleset on every repo itself, every 10 minutes"
         if spec.get("verb") == "github-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
             # Fully automatic: nothing would hold the PR while you looked, so
             # you're not asked, and the agent learns that at once.
@@ -536,24 +531,11 @@ def signed_off_on_github(repo, pr, head, login):
             audit("succeeded", req, by=f"{login} (GitHub review)")
 
 
-def file_require(repo):
-    k8s("POST", REQUESTS, {
-        "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
-        "metadata": {"generateName": "github-require-human-review-", "namespace": NAMESPACE},
-        "spec": {"verb": "github-require-human-review", "github": {"repo": repo},
-                 "reason": (f"{repo} has no human-review ruleset, so a PR an agent flags there can still be "
-                            "merged. Approving adds the standard one."), "ttlSeconds": MAX_TTL,
-                 "workstream": "human-review rulesets"},
-    }, content_type="application/json")
-    print(json.dumps({"time": stamp(), "event": "filed",
-                      "action": f"github-require-human-review {GITHUB_OWNER}/{repo}"}), flush=True)
-
-
 def sync_human_review(rulesets=False):
     """One pass over every repo the ops App is installed on, but
     HUMAN_REVIEW_EXCLUDE: every open PR head gets its human-review status, and
-    reviewer flags with no request yet get one. rulesets: also file a
-    github-require-human-review request for repos without the ruleset."""
+    reviewer flags with no request yet get one. rulesets: also put every
+    installed repo's human-review ruleset right (reconcile_rulesets)."""
     if MINTER.status() is None:
         return
     items = list_requests()
@@ -569,7 +551,8 @@ def sync_human_review(rulesets=False):
     # flag waits for a later pass instead of being rejected for good.
     room = [pending_cap(SELF)[1] - sum(1 for r in items if requester(r) == SELF and phase(r) in ("", "Pending"))]
     with MINTER.token(None, "github-human-review", "list") as tok:
-        repos = [(r, n) for r, n in githubops.installed(tok) if r not in HUMAN_REVIEW_EXCLUDE]
+        installed = githubops.installed(tok)
+    repos = [(r, n) for r, n in installed if r not in HUMAN_REVIEW_EXCLUDE]
     for repo, open_count in repos:
         if not open_count:
             OPEN_PRS[repo] = set()  # no open issues or PRs: nothing to set, and no token minted for it
@@ -604,32 +587,28 @@ def sync_human_review(rulesets=False):
     # Only after a pass that set every status it had to: a required check the
     # broker can't set (a missing permission) would hold every PR.
     if rulesets and clean:
-        file_rulesets([r for r, _ in repos], items)
+        reconcile_rulesets([r for r, _ in installed])
 
 
-def file_rulesets(repos, items):
-    """File github-require-human-review for repos without the ruleset, up to
-    RULESET_BATCH waiting at once. A repo with any such request already, in
-    any phase, isn't asked again until retention deletes it: a Denied one
-    means no for RETENTION_DAYS (HUMAN_REVIEW_EXCLUDE says it for good)."""
-    asked = {(r["spec"].get("github") or {}).get("repo"): phase(r) for r in items
-             if r["spec"].get("verb") == "github-require-human-review"}
-    room = RULESET_BATCH - sum(1 for p in asked.values() if p in ("", "Pending"))
+def reconcile_rulesets(repos):
+    """Every installed repo's human-review ruleset back to the standard one,
+    or gone where HUMAN_REVIEW_EXCLUDE says so. No request and no skips: an
+    edited, disabled or deleted ruleset is put back on the next round. Only
+    where the App can set the status, or the check would hold every PR."""
+    app_id = MINTER.status()["app_id"]
     for repo in repos:
-        if room <= 0:
-            return
-        if repo in asked:
-            continue
+        want = repo not in HUMAN_REVIEW_EXCLUDE
         try:
-            # Proof the App can set the check there: the mint fails without statuses: write.
-            with MINTER.token(repo, "github-human-review", "write"):
-                pass
-            with MINTER.token(repo, "github-require-human-review", "check") as tok:
-                if githubops.has_ruleset(tok):
-                    continue
-            file_require(repo)
-            room -= 1
-        except (githubops.GitHubError, K8sError, OSError) as e:
+            if want:
+                # Proof the App can set the check there: the mint fails without statuses: write.
+                with MINTER.token(repo, "github-human-review", "write"):
+                    pass
+            with MINTER.token(repo, "github-human-review", "ruleset") as tok:
+                done = githubops.reconcile_ruleset(tok, app_id, want)
+            if done:
+                print(json.dumps({"time": stamp(), "event": "ruleset", "repo": f"{GITHUB_OWNER}/{repo}",
+                                  "action": done}), flush=True)
+        except (githubops.GitHubError, OSError) as e:
             print(f"human-review ruleset {repo}: {e}", flush=True)
 
 

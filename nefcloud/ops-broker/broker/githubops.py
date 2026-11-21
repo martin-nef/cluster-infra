@@ -19,9 +19,8 @@ with a third App (the "ops" App) whose key only the token minter holds:
                             success. Until then sync() keeps it pending, and a
                             required human-review check keeps the PR unmerged.
   github-require-human-review
-                            Add the standard human-review ruleset (RULESET) to
-                            a repo that has none, which makes the check
-                            required there. The broker files these itself.
+                            Retired: the broker keeps the ruleset itself
+                            (reconcile_ruleset). RETIRED.
 
 Every call uses an installation token for one repo with only the permissions
 that step needs (listing the installed repos: metadata on every repo), asked of the minter sidecar (minter.py) by verb and step and
@@ -48,7 +47,11 @@ GITHUB_API = "https://api.github.com"
 
 # The verbs this module runs. Their tokens' permissions are minter.TOKENS.
 VERBS = ("github-commit-workflows", "github-protect-branch", "github-rerun-workflow", "github-dispatch-workflow",
-         "github-create-repo", "github-human-review", "github-require-human-review")
+         "github-create-repo", "github-human-review")
+# Verbs no longer run, kept so the requests already made still show; admission
+# rejects new ones. github-require-human-review: drop it from here and the CRD
+# once retention has deleted the last one (by 2027-02-21).
+RETIRED = ("github-require-human-review",)
 # Run by the minter with the owner's own token (minter.USER_ACTIONS).
 USER_VERBS = ("github-create-repo",)
 # The one rule github-protect-branch applies: changes reach the branch only
@@ -68,19 +71,27 @@ RERUNNABLE = {"failure", "cancelled", "timed_out", "startup_failure"}
 # is installed on, made a required check by RULESET, pinned to the ops App: only
 # this broker sets it.
 HUMAN_REVIEW = "human-review"
+# GitHub Apps the human-review ruleset doesn't hold (CI that pushes to default
+# branches itself), by name for the reader: their App ids.
+RULESET_BYPASS_APPS = {"martin-nef-ci": 5855882}
 
 
 def ruleset(app_id):
     """The one human-review ruleset, the same on every repo: the check is
     required on the default branch, from the ops App only, so no other App or
-    user can set it. Repo admins (you) bypass it, so you can always merge.
-    Beside the branch rule, not in it: it adds a check without rewriting it."""
+    user can set it. The broker keeps it so on every covered repo
+    (reconcile_ruleset). Repo admins (you, martin-nef, as the owner) and
+    RULESET_BYPASS_APPS bypass it. Rulesets on a personal account's repos can't
+    name a user, so you're in by your admin role. Beside the branch rule, not
+    in it: it adds a check without rewriting it."""
     return {"name": HUMAN_REVIEW, "target": "branch", "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [{"type": "required_status_checks", "parameters": {
                 "strict_required_status_checks_policy": False,
                 "required_status_checks": [{"context": HUMAN_REVIEW, "integration_id": int(app_id)}]}}],
-            "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
+            "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+            + [{"actor_id": i, "actor_type": "Integration", "bypass_mode": "always"}
+               for i in RULESET_BYPASS_APPS.values()]}
 # The marker the PR reviewer ends each review with (pr-reviewer job.py STATE_MARK).
 REVIEW_MARK = "<!-- pr-reviewer-state "
 
@@ -297,21 +308,41 @@ def check_human_review(tok, repo, g):
     return None
 
 
-def check_require(tok, repo, g):
-    if has_ruleset(tok):
-        return f"{g['repo']} already has a {HUMAN_REVIEW} ruleset; change it on GitHub"
-    return None
+def matches(want, got):
+    """Whether got says everything want does: dicts by want's keys (GitHub
+    adds its own, like id and _links), lists as the same items in any order."""
+    if isinstance(want, dict):
+        return isinstance(got, dict) and all(matches(v, got.get(k)) for k, v in want.items())
+    if isinstance(want, list):
+        return (isinstance(got, list) and len(got) == len(want)
+                and all(any(matches(w, x) for x in got) for w in want))
+    return want == got
 
 
-def has_ruleset(tok):
-    """Whether the repo has a ruleset named human-review. Only the name is
-    compared: one you've edited by hand is yours, and isn't replaced."""
-    return any(r.get("name") == HUMAN_REVIEW for r in pages(tok, "/rulesets?includes_parents=false"))
+def reconcile_ruleset(tok, app_id, want=True):
+    """Make the repo's human-review rulesets what they should be: the one
+    standard ruleset (want), or none (an excluded repo, whose PRs get no
+    status, so a required check would hold them all). Adds it where it's
+    missing, puts it back where it was edited or disabled, and deletes any
+    second one of that name. Returns what it changed, or None."""
+    have = [r for r in pages(tok, "/rulesets?includes_parents=false") if r.get("name") == HUMAN_REVIEW]
+    done = []
+    for r in have[1 if want else 0:]:
+        tok("DELETE", f"/rulesets/{int(r['id'])}")
+        done.append(f"deleted ruleset {r['id']}")
+    if want:
+        rs = ruleset(app_id)
+        if not have:
+            made = tok("POST", "/rulesets", rs)
+            done.append(f"added ruleset {made.get('id')}")
+        elif not matches(rs, tok("GET", f"/rulesets/{int(have[0]['id'])}")):
+            tok("PUT", f"/rulesets/{int(have[0]['id'])}", rs)
+            done.append(f"restored ruleset {have[0]['id']}")
+    return "; ".join(done) or None
 
 
 CHECKS = {
     "github-human-review": check_human_review,
-    "github-require-human-review": check_require,
     "github-commit-workflows": check_commit,
     "github-protect-branch": check_protect,
     "github-rerun-workflow": check_rerun,
@@ -355,8 +386,6 @@ def act(minter, spec, code=None):
     except GitHubError as e:
         raise NothingChanged(f"no token: {e}") from None
     with tok:
-        if spec["verb"] == "github-require-human-review":
-            return act_require(tok, minter.status()["app_id"])
         done = ACTS[spec["verb"]](tok, g)
     if spec["verb"] == "github-human-review":
         done += approve_pr(minter, g)
@@ -409,14 +438,6 @@ def act_dispatch(tok, g):
 def act_human_review(tok, g):
     tok("POST", f"/statuses/{g['headSHA']}", status_body("success", "signed off by a human on the ops page"))
     return f"signed off #{g['pr']} at {g['headSHA'][:12]}"
-
-
-def act_require(tok, app_id):
-    # Never a second one beside a ruleset made since the check.
-    if has_ruleset(tok):
-        raise NothingChanged(f"a {HUMAN_REVIEW} ruleset appeared since the request; left it alone")
-    made = tok("POST", "/rulesets", ruleset(app_id))
-    return f"added the {HUMAN_REVIEW} ruleset (id {made.get('id')})"
 
 
 def approve_pr(minter, g):
@@ -723,14 +744,6 @@ def details(minter, spec):
             return details_commit(tok, web, g)
         if spec["verb"] == "github-human-review":
             return details_human_review(tok, web, g)
-        if spec["verb"] == "github-require-human-review":
-            return (f"<p>Adds the standard <code>{HUMAN_REVIEW}</code> ruleset to "
-                    f"{link(web + '/settings/rules', g['repo'])}, which has none now. A PR into "
-                    f"<code>{e(repo['default_branch'])}</code> then needs the <code>{HUMAN_REVIEW}</code> check, "
-                    "set only by the ops App: green unless an agent flagged the PR and you haven't signed it off. "
-                    "You bypass it as the repo's admin. The broker already keeps the check on every open PR "
-                    "there, so nothing waits on a check that never comes.</p>"
-                    f"<pre>{e(json.dumps(ruleset(minter.status()['app_id']), indent=2))}</pre>")
         if spec["verb"] == "github-protect-branch":
             return (f"<p>Adds this rule to {link(web + '/settings/branches', repo['default_branch'])}, "
                     "which has none now: changes only through a PR with one approval. You can still "

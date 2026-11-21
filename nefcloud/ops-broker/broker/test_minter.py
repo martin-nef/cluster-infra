@@ -57,7 +57,7 @@ class TestTokens(MinterBase):
             # human-review also has the sync steps (the statuses on every open PR)
             # and approve (your sign-off approves the PR).
             expected = {"check"} if verb in githubops.USER_VERBS else {"check", "run"}
-            self.assertEqual(set(steps), expected | ({"list", "sync", "write", "approve"} if verb == "github-human-review" else set()), verb)
+            self.assertEqual(set(steps), expected | ({"list", "sync", "write", "approve", "ruleset"} if verb == "github-human-review" else set()), verb)
             for perms in steps.values():
                 # Each step's permissions are within what the App was created with.
                 self.assertLessEqual(perms.keys(), minter.PERMISSIONS.keys(), verb)

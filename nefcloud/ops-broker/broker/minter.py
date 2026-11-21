@@ -98,13 +98,14 @@ TOKENS = {
     # (sync), and set a status there only when one has to change (write).
     # approve: on your sign-off, an Approve of the PR, so GitHub's required
     # approval is there too.
+    # ruleset: keep the repo's human-review ruleset the standard one.
     "github-human-review": {"check": {"pull_requests": "read"}, "run": {"statuses": "write"},
                             "approve": {"pull_requests": "write"},
                             "list": {"metadata": "read"},
                             # contents: a YAML file's kinds, for the code triggers.
                             "sync": {"pull_requests": "read", "statuses": "read", "contents": "read"},
-                            "write": {"statuses": "write"}},
-    "github-require-human-review": {"check": {"administration": "read"}, "run": {"administration": "write"}},
+                            "write": {"statuses": "write"},
+                            "ruleset": {"administration": "write"}},
 }
 # Verbs whose check token isn't scoped to the request's repo (it doesn't exist).
 ACCOUNT_CHECKS = {"github-create-repo"}
