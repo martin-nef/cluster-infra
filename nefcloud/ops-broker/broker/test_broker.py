@@ -186,6 +186,7 @@ class FakeGitHub:
         self.installed = [{"name": "web", "open_issues_count": 1}]  # what the ops App is installed on
         self.rulesets = {}  # repo -> its rulesets, as GET /rulesets/<id> shows them
         self.next_ruleset = 76
+        self.no_bypass_apps = set()  # repos the bypass Apps aren't installed on
 
     def __call__(self, method, path, token=None, body=None, basic=None, base=None):
         self.calls.append((method, path, body))
@@ -222,6 +223,9 @@ class FakeGitHub:
         m = re.fullmatch(r"/repos/owner/([^/]+)/rulesets(?:/(\d+))?", route)
         if m:  # repo -> [ruleset]
             have = self.rulesets.setdefault(m[1], [])
+            if method in ("POST", "PUT") and m[1] in self.no_bypass_apps and any(
+                    a["actor_type"] == "Integration" for a in body["bypass_actors"]):
+                raise broker.githubops.GitHubError(422, "Validation Failed; Actor must be installed")
             if m[2] is None and method == "POST":
                 self.next_ruleset += 1
                 have.append({**copy.deepcopy(body), "id": self.next_ruleset, "_links": {}})
@@ -1932,6 +1936,29 @@ class TestRulesets(Served, GitHubBase):
             broker.githubops.GitHubError(500, "boom")
         broker.sync_human_review(rulesets=True)
         self.assertEqual(self.names("cv"), ["human-review"])
+
+    def test_without_the_bypass_apps_where_github_refuses_them(self):
+        self.gh.no_bypass_apps = {"cv"}
+        broker.sync_human_review(rulesets=True)
+        bare = broker.githubops.ruleset(42, bypass_apps=False)
+        (cv,) = self.gh.rulesets["cv"]
+        self.assertEqual([a["actor_type"] for a in cv["bypass_actors"]], ["RepositoryRole"])
+        self.assertTrue(broker.githubops.matches(bare, cv))
+        (web,) = self.gh.rulesets["web"]
+        self.assertTrue(broker.githubops.matches(self.standard(), web))
+        # An edit there is still put back, without them.
+        cv["enforcement"] = "disabled"
+        broker.sync_human_review(rulesets=True)
+        self.assertTrue(broker.githubops.matches(bare, self.gh.rulesets["cv"][0]))
+        # Matching that, nothing is written but the full one's try.
+        self.gh.calls.clear()
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual([(m, p) for m, p, _ in self.gh.calls if "/rulesets/" in p and m == "PUT"],
+                         [("PUT", f"/repos/owner/cv/rulesets/{cv['id']}")])
+        # Installing the App there adds it on the next round.
+        self.gh.no_bypass_apps = set()
+        broker.sync_human_review(rulesets=True)
+        self.assertTrue(broker.githubops.matches(self.standard(), self.gh.rulesets["cv"][0]))
 
     def test_the_old_verb_is_rejected(self):
         self.assertIn("retired", self.admit_github("r1", "github-require-human-review", repo="web")["message"])
