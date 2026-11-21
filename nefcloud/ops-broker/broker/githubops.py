@@ -76,14 +76,16 @@ HUMAN_REVIEW = "human-review"
 RULESET_BYPASS_APPS = {"martin-nef-ci": 5855882}
 
 
-def ruleset(app_id):
+def ruleset(app_id, bypass_apps=True):
     """The one human-review ruleset, the same on every repo: the check is
     required on the default branch, from the ops App only, so no other App or
     user can set it. The broker keeps it so on every covered repo
     (reconcile_ruleset). Repo admins (you, martin-nef, as the owner) and
     RULESET_BYPASS_APPS bypass it. Rulesets on a personal account's repos can't
-    name a user, so you're in by your admin role. Beside the branch rule, not
-    in it: it adds a check without rewriting it."""
+    name a user, so you're in by your admin role. GitHub refuses an App as a
+    bypass actor where it isn't installed: bypass_apps=False is the ruleset for
+    those repos. Beside the branch rule, not in it: it adds a check without
+    rewriting it."""
     return {"name": HUMAN_REVIEW, "target": "branch", "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [{"type": "required_status_checks", "parameters": {
@@ -91,7 +93,7 @@ def ruleset(app_id):
                 "required_status_checks": [{"context": HUMAN_REVIEW, "integration_id": int(app_id)}]}}],
             "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
             + [{"actor_id": i, "actor_type": "Integration", "bypass_mode": "always"}
-               for i in RULESET_BYPASS_APPS.values()]}
+               for i in (RULESET_BYPASS_APPS.values() if bypass_apps else ())]}
 # The marker the PR reviewer ends each review with (pr-reviewer job.py STATE_MARK).
 REVIEW_MARK = "<!-- pr-reviewer-state "
 
@@ -126,8 +128,10 @@ def api(method, path, token=None, body=None):
             return json.loads(data) if data else {}
     except urllib.error.HTTPError as e:
         try:
-            message = json.load(e).get("message", e.reason)
-        except ValueError:
+            got = json.load(e)
+            # A 422's message is only "Validation Failed"; errors says what failed.
+            message = "; ".join([str(got.get("message", e.reason))] + [str(x) for x in got.get("errors") or []])
+        except (ValueError, AttributeError):
             message = e.reason
         raise GitHubError(e.code, message) from None
 
@@ -324,20 +328,38 @@ def reconcile_ruleset(tok, app_id, want=True):
     standard ruleset (want), or none (an excluded repo, whose PRs get no
     status, so a required check would hold them all). Adds it where it's
     missing, puts it back where it was edited or disabled, and deletes any
-    second one of that name. Returns what it changed, or None."""
+    second one of that name. Where GitHub refuses the bypass Apps (422: one
+    isn't installed there), the ruleset without them is the standard one; the
+    full one is tried again each round, so installing the App adds it. Returns
+    what it changed, or None."""
     have = [r for r in pages(tok, "/rulesets?includes_parents=false") if r.get("name") == HUMAN_REVIEW]
     done = []
     for r in have[1 if want else 0:]:
         tok("DELETE", f"/rulesets/{int(r['id'])}")
         done.append(f"deleted ruleset {r['id']}")
     if want:
-        rs = ruleset(app_id)
+        full, bare = ruleset(app_id), ruleset(app_id, bypass_apps=False)
         if not have:
-            made = tok("POST", "/rulesets", rs)
-            done.append(f"added ruleset {made.get('id')}")
-        elif not matches(rs, tok("GET", f"/rulesets/{int(have[0]['id'])}")):
-            tok("PUT", f"/rulesets/{int(have[0]['id'])}", rs)
-            done.append(f"restored ruleset {have[0]['id']}")
+            try:
+                made, note = tok("POST", "/rulesets", full), ""
+            except GitHubError as e:
+                if e.code != 422 or full == bare:
+                    raise
+                made, note = tok("POST", "/rulesets", bare), f" without the bypass Apps ({e})"
+            done.append(f"added ruleset {made.get('id')}{note}")
+        else:
+            path = f"/rulesets/{int(have[0]['id'])}"
+            got = tok("GET", path)
+            if not matches(full, got):
+                try:
+                    tok("PUT", path, full)
+                    done.append(f"restored ruleset {have[0]['id']}")
+                except GitHubError as e:
+                    if e.code != 422 or full == bare:
+                        raise
+                    if not matches(bare, got):
+                        tok("PUT", path, bare)
+                        done.append(f"restored ruleset {have[0]['id']} without the bypass Apps ({e})")
     return "; ".join(done) or None
 
 
