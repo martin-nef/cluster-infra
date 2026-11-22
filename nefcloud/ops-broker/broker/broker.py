@@ -32,8 +32,10 @@ One verb isn't an action but a sign-off (README, "Human review required"):
                         the ruleset that requires the check itself.
 
 The broker checks the target exists and marks the request Pending. Requests
-are grouped by requester and spec.workstream, the requester's own label for
-what it's working on. Notifications are debounced (announce): one ntfy summary
+are grouped by spec.session, the requester's own label for the session that
+asked, titled by its latest spec.workstream (the theme) and the requesters
+that named it; without a session, by requester and workstream. Within a group, only
+the newest request per subject shows (subject). Notifications are debounced (announce): one ntfy summary
 of everything new, by group, linking to each group's page, PUBLIC_URL/g/<id>,
 which lists its requests, PUBLIC_URL/r/<name>. The pages are behind Traefik's
 oauth2-proxy (Google) login; the broker runs the action only when someone in
@@ -120,6 +122,9 @@ REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  #
 # its request on the ops page. Yours; never an agent's.
 HUMAN_REVIEWERS = {r.strip() for r in os.environ.get("HUMAN_REVIEWERS", GITHUB_OWNER).split(",") if r.strip()}
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
+# Requesters whose spec.session is a claude.ai Remote Control session: their
+# groups link to it.
+CLAUDE_AI_SESSIONS = {r.strip() for r in os.environ.get("CLAUDE_AI_SESSIONS", "").split(",") if r.strip()}
 # The one list of changes that always need a human (code-triggers.json, README
 # "Code triggers"), read on every pass. Unreadable holds every PR.
 CODE_TRIGGERS = os.environ.get("CODE_TRIGGERS", os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -250,11 +255,51 @@ def requester(req):
     return req["spec"].get("requester", "")
 
 
+def session(req):
+    """The requester's session: the Claude session for claude-remote, the
+    workstream's session for the night shift. Its requests are one group."""
+    return req["spec"].get("session", "")
+
+
 def group_key(req):
-    """(requester, workstream): the page and the notifications group by it.
-    The workstream is the requester's own label for what it's working on, so
-    an agent doing several things keeps them apart; none is a group too."""
+    """The group a request files itself under: (None, session), or without a
+    session (older clients), (requester, workstream). A session's group is the
+    session alone: its work spans requesters (the agent, the broker's flags for
+    it), and each request shows its own."""
+    if session(req):
+        return None, session(req)
     return requester(req), req["spec"].get("workstream", "")
+
+
+# A request's subject, by verb: a group shows only the newest request per
+# subject. Not listed: a GitHub verb's subject is its repo, a cluster verb's its
+# target. A new verb only adds a line here if its subject is something else.
+SUBJECTS = {
+    "github-human-review": lambda s: ("PR", s["github"]["repo"], s["github"]["pr"]),
+    "github-commit-workflows": lambda s: ("branch", s["github"]["repo"], s["github"].get("branch")),
+}
+
+
+def subject(req):
+    s = req["spec"]
+    if s["verb"] in SUBJECTS:
+        return SUBJECTS[s["verb"]](s)
+    if s["verb"] in GITHUB_VERBS:
+        return "repo", s["github"]["repo"]
+    t = s["target"]
+    return t["kind"], t["namespace"], t["name"]
+
+
+def group_keys(items):
+    """{request name: its group key}. What the broker files itself (code
+    triggers, the reviewer's flags) joins the session that last filed a request
+    for the same subject (the PR); unmatched, its own group."""
+    owner = {}
+    for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"]):
+        if session(r) and requester(r) != SELF:
+            owner[subject(r)] = group_key(r)
+    return {r["metadata"]["name"]: owner.get(subject(r), group_key(r)) if requester(r) == SELF else group_key(r)
+            for r in items}
 
 
 def group_id(key):
@@ -271,17 +316,71 @@ def agent_name(who):
     return who or "unknown requester"
 
 
-def group_title(key):
-    who, workstream = key
-    return agent_name(who) + (f" · {workstream}" if workstream else "")
+def theme(key, reqs):
+    """What the group is about: its workstream, or a session's latest one
+    (reqs newest first). Not from what the broker filed into it."""
+    if key[0] is not None:
+        return key[1]
+    return next((r["spec"]["workstream"] for r in reqs
+                 if session(r) == key[1] and r["spec"].get("workstream")), "")
 
 
-def groups(items):
-    """{group key: its requests, newest first}."""
+def workers(key, reqs):
+    """Who the group's work is from: its requester, or the requesters that
+    named the session, newest first. More than one shows: the session is the
+    agents' own label, and the stamped requesters are what can't be faked."""
+    if key[0] is not None:
+        return [key[0]]
+    return list(dict.fromkeys(requester(r) for r in reqs if session(r) == key[1]))
+
+
+def group_title(key, reqs):
+    """<theme> - <worker>, or the worker alone."""
+    t, w = theme(key, reqs), ", ".join(agent_name(who) for who in workers(key, reqs))
+    return f"{t} - {w}" if t else w
+
+
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+TAGGED = re.compile(rf"(?:session|cse)_(01[{BASE58}]{{22}})")
+
+
+def session_url(key, reqs):
+    """A claude.ai Remote Control session's page, for a session named by a
+    requester in CLAUDE_AI_SESSIONS; else None. Built here from the id, never
+    taken from the request. claude.ai's id, session_01<base58>, is the same 128
+    bits as the session's own CLAUDE_CODE_SESSION_ID (a UUID): either works."""
+    if key[0] is not None or not CLAUDE_AI_SESSIONS & set(workers(key, reqs)):
+        return None
+    sid = key[1]
+    if m := TAGGED.fullmatch(sid):
+        return f"https://claude.ai/code/session_{m.group(1)}"
+    if not UUID.fullmatch(sid):
+        return None
+    n, out = int(sid.replace("-", ""), 16), ""
+    for _ in range(22):
+        n, d = divmod(n, 58)
+        out = BASE58[d] + out
+    return f"https://claude.ai/code/session_01{out}"
+
+
+def groups(items, keys=None):
+    """{group key: its requests, newest first}. keys: group_keys of every
+    request, when items is only some of them."""
+    keys = keys or group_keys(items)
     out = {}
     for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"], reverse=True):
-        out.setdefault(group_key(r), []).append(r)
+        out.setdefault(keys[r["metadata"]["name"]], []).append(r)
     return out
+
+
+def by_subject(reqs):
+    """reqs (newest first) by subject: one list per subject, newest first,
+    in the order of each subject's newest request."""
+    out = {}
+    for r in reqs:
+        out.setdefault(json.dumps(subject(r)), []).append(r)
+    return list(out.values())
 
 
 def ttl(req):
@@ -669,35 +768,41 @@ SUMMARY_ITEMS = 4
 SUMMARY_GROUPS = 6
 
 
-def notify(new, waiting):
-    """One summary for the requests not announced yet (new), grouped by agent
-    and workstream, each group with a link to its page; then the groups that
-    are only still waiting. waiting: every Pending request, new ones too."""
+def notify(new, waiting, items):
+    """One summary for the requests not announced yet (new), grouped by
+    session, each group with a link to its page; then the groups that are only
+    still waiting. waiting: every Pending request, new ones too; items: every
+    request, for the groups' keys and titles. A newer request for the same
+    subject stands for the earlier ones."""
     if not NTFY_URL:
         return
     new_names = {r["metadata"]["name"] for r in new}
-    all_groups = groups(waiting)
+    keys = group_keys(items)
+    titles = {k: group_title(k, rs) for k, rs in groups(items, keys).items()}
+    all_groups = groups(waiting, keys)
     fresh = sorted((k for k, rs in all_groups.items() if any(r["metadata"]["name"] in new_names for r in rs)),
                    key=lambda k: -sum(r["metadata"]["name"] in new_names for r in all_groups[k]))
     lines = []
     for key in fresh[:SUMMARY_GROUPS]:
         reqs = all_groups[key]
-        added = [r for r in reqs if r["metadata"]["name"] in new_names]
-        older = len(reqs) - len(added)
-        head = f"**{md(group_title(key))}**: {len(added)} new" + (f", {older} still waiting" if older else "")
+        added = by_subject([r for r in reqs if r["metadata"]["name"] in new_names])
+        n = sum(map(len, added))
+        older = len(reqs) - n
+        head = f"**{md(titles[key])}**: {n} new" + (f", {older} still waiting" if older else "")
         head += f", first expires {local(min(expires(r) for r in reqs))}"
-        lines += [head, *(f"- {md(describe(r))}: {md(r['spec']['reason'][:140])}" for r in added[:SUMMARY_ITEMS])]
+        lines += [head, *(f"- {md(describe(rs[0]))}: {md(rs[0]['spec']['reason'][:140])}"
+                          + (f" ({len(rs) - 1} earlier)" if len(rs) > 1 else "") for rs in added[:SUMMARY_ITEMS])]
         if len(added) > SUMMARY_ITEMS:
             lines.append(f"- and {len(added) - SUMMARY_ITEMS} more")
-        lines += [f"[Open {md(group_title(key))}]({PUBLIC_URL}/g/{group_id(key)})", ""]
+        lines += [f"[Open {md(titles[key])}]({PUBLIC_URL}/g/{group_id(key)})", ""]
     if len(fresh) > SUMMARY_GROUPS:
         lines += [f"…and {plural(len(fresh) - SUMMARY_GROUPS, 'more group')} with new requests.", ""]
     still = [k for k in all_groups if k not in fresh]
     if still:
-        lines.append("Still waiting: " + ", ".join(f"{md(group_title(k))} ({len(all_groups[k])})" for k in still))
+        lines.append("Still waiting: " + ", ".join(f"{md(titles[k])} ({len(all_groups[k])})" for k in still))
     agents = sorted({agent_name(requester(r)) for r in new})
     url = f"{PUBLIC_URL}/g/{group_id(fresh[0])}" if len(fresh) == 1 else f"{PUBLIC_URL}/"
-    actions = [{"action": "view", "label": f"Open {group_title(k)}"[:40], "url": f"{PUBLIC_URL}/g/{group_id(k)}",
+    actions = [{"action": "view", "label": f"Open {titles[k]}"[:40], "url": f"{PUBLIC_URL}/g/{group_id(k)}",
                 "clear": True} for k in fresh[:2]] if len(fresh) > 1 else []
     actions.append({"action": "view", "label": "Review" if len(fresh) == 1 else "All requests", "url": url,
                     "clear": True})
@@ -796,7 +901,8 @@ def admit(req, pending, checked):
         return False
     set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid, expiresAt=stamp(expires(req)),
                message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
-    audit("pending", req, reason=req["spec"]["reason"], workstream=group_key(req)[1])
+    audit("pending", req, reason=req["spec"]["reason"], workstream=req["spec"].get("workstream", ""),
+          session=session(req))
     return True
 
 
@@ -819,7 +925,7 @@ def announce(items):
     each(new, mark)
     if marked:
         audit("notified", marked[0], requests=[r["metadata"]["name"] for r in marked])
-        notify(marked, waiting)
+        notify(marked, waiting, items)
 
 
 def announce_at(new, items):
@@ -1030,6 +1136,7 @@ pre{{overflow-x:auto;font-size:.85rem;background:#8881;padding:.5rem}} .add{{col
 details.group{{border:1px solid #8884;border-radius:.5rem;margin:.6rem 0;padding:.2rem .7rem}}
 details.group>summary{{cursor:pointer;padding:.5rem 0;list-style-position:outside}}
 .badge{{display:inline-block;background:#bf8700;color:#fff;border-radius:1rem;padding:0 .55rem;font-size:.85rem;margin-left:.3rem}}
+details.earlier{{margin:0 0 .4rem 1rem}} details.earlier>summary{{cursor:pointer;color:#888;font-size:.9rem}}
 .item{{border-top:1px solid #8883;padding:.6rem 0}}
 .item .reason{{margin:.3rem 0}}
 .clamp{{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}}
@@ -1043,9 +1150,10 @@ def e(s):
     return html.escape(str(s), quote=True)
 
 
-def group_link(req):
-    key = group_key(req)
-    return f'<a href="/g/{group_id(key)}">{e(group_title(key))}</a>'
+def group_link(req, items):
+    """A link to the group req is in; items: every request."""
+    key = group_keys(items)[req["metadata"]["name"]]
+    return f'<a href="/g/{group_id(key)}">{e(group_title(key, groups(items)[key]))}</a>'
 
 
 def decision_forms(req, can_approve=True):
@@ -1064,7 +1172,8 @@ def decision_forms(req, can_approve=True):
         for d in ("approve", "deny") if d == "deny" or can_approve)
 
 
-def request_page(req):
+def request_page(req, items):
+    """items: every request, for its group."""
     s, st = req["spec"], req.get("status", {})
     github = s["verb"] in GITHUB_VERBS
     if github:
@@ -1074,7 +1183,7 @@ def request_page(req):
         target = f"<code>{e(t['kind'])} {e(t['namespace'])}/{e(t['name'])}</code>"
     rows = [("Verb", f"<code>{e(s['verb'])}</code>"),
             ("Target", target),
-            ("Group", group_link(req)),
+            ("Group", group_link(req, items)),
             ("Phase", f'<span class="phase {e(st.get("phase", ""))}">{e(st.get("phase", "new"))}</span>'),
             ("Status", e(st.get("message", ""))),
             ("Requester", e(s.get("requester") or "unknown (made without the admission policy)")),
@@ -1103,7 +1212,17 @@ def request_page(req):
         body += "<h2>What it asked for</h2>" + githubops.asked(GITHUB_OWNER, s)
     if st.get("phase") == "Pending":
         body += decision_forms(req, can_approve)
-    return body + f'<p><a href="/g/{group_id(group_key(req))}">Its group</a> · <a href="/">All requests</a></p>'
+    return body + f'<p><a href="/g/{group_id(group_keys(items)[req["metadata"]["name"]])}">Its group</a>' \
+        ' · <a href="/">All requests</a></p>'
+
+
+def filed_by(req):
+    """Who filed it, for its line in a group: the stamped requester, and for the
+    broker's own flags whose they are (its workstream, which only it sets)."""
+    who = agent_name(requester(req))
+    if requester(req) == SELF and req["spec"].get("workstream"):
+        return f"{who}: {req['spec']['workstream']}"
+    return who
 
 
 def item(req, clamp=False, actions=False):
@@ -1114,7 +1233,7 @@ def item(req, clamp=False, actions=False):
     when = f"expires {local(expires(req))}" if p == "Pending" else f"{p.lower() or 'new'}, " + local(
         parse_time(st.get("finishedAt") or req["metadata"]["creationTimestamp"]))
     out = (f'<div class=item><a href="/r/{name}"><code>{e(describe(req))}</code></a> '
-           f'<span class="phase {e(p)}">{e(p or "new")}</span> <span class=muted>{e(when)}</span>'
+           f'<span class="phase {e(p)}">{e(p or "new")}</span> <span class=muted>{e(when)} · {e(filed_by(req))}</span>'
            f'<div class="reason{" clamp" if clamp else ""}">{e(req["spec"]["reason"])}</div>')
     if p != "Pending" and st.get("message"):
         out += f"<div class=muted>{e(st['message'])}</div>"
@@ -1128,6 +1247,27 @@ def item(req, clamp=False, actions=False):
     return out + "</div>"
 
 
+def subjects(rows, limit, **kw):
+    """Each subject's newest request, the earlier ones folded under it: the
+    newest limit of them, and every waiting one. rows: by_subject lists."""
+    out = []
+    for newest, *earlier in rows:
+        out.append(item(newest, **kw))
+        if earlier:
+            shown = [r for i, r in enumerate(earlier) if i < limit or phase(r) == "Pending"]
+            n = sum(phase(r) == "Pending" for r in earlier)
+            out.append(f"<details class=earlier><summary>{len(earlier)} earlier" + (f", {n} waiting" if n else "")
+                       + "</summary>" + "".join(item(r, **kw) for r in shown) + "</details>")
+    return "".join(out)
+
+
+def split(reqs):
+    """(subjects with a request waiting, the rest), each as by_subject lists."""
+    rows = by_subject(reqs)
+    waiting = [rs for rs in rows if any(phase(r) == "Pending" for r in rs)]
+    return waiting, [rs for rs in rows if rs not in waiting]
+
+
 def group_summary(key, reqs):
     waiting = [r for r in reqs if phase(r) == "Pending"]
     others = len(reqs) - len(waiting)
@@ -1135,15 +1275,14 @@ def group_summary(key, reqs):
     meta = (f"first expires {local(min(expires(r) for r in waiting))}" if waiting else
             f"latest {local(parse_time(reqs[0]['metadata']['creationTimestamp']))}")
     meta += f" · {others} decided or closed" if others else ""
-    who, workstream = key
-    return (f"<b>{e(agent_name(who))}</b>" + (f" · {e(workstream)}" if workstream else "")
-            + f"{badge}<br><span class=muted>{e(meta)}</span>")
+    return f"<b>{e(group_title(key, reqs))}</b>{badge}<br><span class=muted>{e(meta)}</span>"
 
 
 def index_page(items):
-    """Groups (requester, workstream), those with requests waiting first and
-    open, then the GROUPS_SHOWN most recent others, closed. Each opens into its
-    requests: every waiting one, and the newest ITEMS_SHOWN of the rest."""
+    """Groups (one per session), those with requests waiting first and open,
+    then the GROUPS_SHOWN most recent others, closed. Each opens into its
+    subjects, newest request each: every subject with one waiting, and the
+    newest ITEMS_SHOWN of the rest."""
     by = groups(items)
     waiting = sorted((k for k, rs in by.items() if any(phase(r) == "Pending" for r in rs)),
                      key=lambda k: min(expires(r) for r in by[k] if phase(r) == "Pending"))
@@ -1151,9 +1290,10 @@ def index_page(items):
     out = []
     for key in waiting + rest:
         reqs = by[key]
-        shown = [r for r in reqs if phase(r) == "Pending"] + [r for r in reqs if phase(r) != "Pending"][:ITEMS_SHOWN]
+        live, done = split(reqs)
+        shown = live + done[:ITEMS_SHOWN]
         out.append(f'<details class=group{" open" if key in waiting else ""}><summary>{group_summary(key, reqs)}'
-                   "</summary>" + "".join(item(r, clamp=True) for r in shown)
+                   "</summary>" + subjects(shown, ITEMS_SHOWN, clamp=True)
                    + f'<p><a href="/g/{group_id(key)}">Open the group</a>'
                    + (f" ({len(reqs)} requests)" if len(reqs) > len(shown) else "") + "</p></details>")
     n = sum(phase(r) == "Pending" for r in items)
@@ -1164,25 +1304,26 @@ def index_page(items):
 
 
 GROUPS_SHOWN = 20  # decided groups on the index
-ITEMS_SHOWN = 5  # decided requests per group on the index
-GROUP_ITEMS = 100  # decided requests on a group's page
+ITEMS_SHOWN = 5  # decided subjects per group, and earlier requests per subject, on the index
+GROUP_ITEMS = 100  # decided subjects, and earlier requests per subject, on a group's page
 
 
 def group_page(gid, items):
-    """One group's requests: every waiting one, with its buttons, then the
-    newest GROUP_ITEMS others. None if no request is in the group."""
+    """One group's subjects: those with a request waiting, with its buttons,
+    then the newest GROUP_ITEMS others. None if no request is in the group."""
     for key, reqs in groups(items).items():
         if group_id(key) != gid:
             continue
-        waiting = [r for r in reqs if phase(r) == "Pending"]
-        done = [r for r in reqs if phase(r) != "Pending"][:GROUP_ITEMS]
-        who, workstream = key
-        return (f"<h1>{e(agent_name(who))}</h1>"
-                + (f"<p><b>Workstream:</b> {e(workstream)}</p>" if workstream else "")
-                + f"<p class=muted>{e(who or 'no requester recorded')}</p>"
-                + (f"<h2>Waiting ({len(waiting)})</h2>" + "".join(item(r, actions=True) for r in waiting)
-                   if waiting else "<p>Nothing waiting.</p>")
-                + (f"<h2>Decided or closed</h2>" + "".join(item(r) for r in done) if done else "")
+        live, done = split(reqs)
+        url = session_url(key, reqs)
+        about = (f"<p class=muted>{e(', '.join(w or 'no requester recorded' for w in workers(key, reqs)))}"
+                 + (f" · session <code>{e(key[1])}</code>" if key[0] is None else "") + "</p>")
+        if url:
+            about += f'<p><a href="{e(url)}">Open the session on claude.ai</a></p>'
+        return (f"<h1>{e(group_title(key, reqs))}</h1>{about}"
+                + (f"<h2>Waiting ({sum(phase(r) == 'Pending' for r in reqs)})</h2>"
+                   + subjects(live, GROUP_ITEMS, actions=True) if live else "<p>Nothing waiting.</p>")
+                + ("<h2>Decided or closed</h2>" + subjects(done[:GROUP_ITEMS], GROUP_ITEMS) if done else "")
                 + '<p><a href="/">All requests</a></p>')
     return None
 
@@ -1307,8 +1448,8 @@ def finish_authorize(approver, code, state):
 def result_page(name, message):
     """What a decision did, with the way back to the request and its group."""
     try:
-        group = f' · <a href="/g/{group_id(group_key(k8s("GET", f"{REQUESTS}/{name}")))}">Its group</a>'
-    except K8sError:
+        group = f' · <a href="/g/{group_id(group_keys(list_requests())[name])}">Its group</a>'
+    except (K8sError, KeyError):
         group = ""
     return f'<p>{e(message)}</p><p><a href="/r/{e(name)}">The request</a>{group} · <a href="/">All requests</a></p>'
 
@@ -1342,7 +1483,8 @@ class Handler(BaseHTTPRequestHandler):
                                             query.get("state", [""])[0])
                 return self.reply(status, page, html_page=True)
             if self.path.startswith("/r/"):
-                return self.reply(200, request_page(k8s("GET", f"{REQUESTS}/{self.request_name()}")), html_page=True)
+                return self.reply(200, request_page(k8s("GET", f"{REQUESTS}/{self.request_name()}"),
+                                                       list_requests()), html_page=True)
             if GROUP.fullmatch(url.path):
                 page = group_page(url.path[len("/g/"):], list_requests())
                 if page is None:
