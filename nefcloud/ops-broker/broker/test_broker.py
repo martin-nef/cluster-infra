@@ -1760,6 +1760,20 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         self.assertEqual(self.status(), "success")
 
+    def test_a_denied_flag_fails_the_check(self):
+        self.flag()
+        broker.scan()
+        code, _ = broker.decide("hr1", "deny", self.api.status("hr1")["specHash"], APPROVER)
+        self.assertEqual((code, self.api.status("hr1")["phase"]), (200, "Denied"))
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "failure")  # red, not waiting for you
+        self.assertIn("denied by", self.gh.statuses[HEAD][0]["description"])
+        # Changed your mind: approving the head on GitHub still signs it off.
+        self.approve_on_github()
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
     def test_the_sign_off_approves_the_pr_on_github(self):
         self.flag()
         broker.scan()
@@ -1801,7 +1815,7 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(state(phase="Pending")[0::2], ("pending", True))
         self.assertEqual(state(phase="Succeeded", decidedBy="boss"), ("success", "signed off by boss", True))
         self.assertEqual(state(phase="Succeeded", head="o" * 40)[0], "pending")  # pushed since
-        self.assertEqual(state(phase="Denied")[0], "pending")
+        self.assertEqual(state(phase="Denied")[0::2], ("failure", True))  # red, not waiting
         self.assertEqual(state(phase="Expired")[0::2], ("pending", False))  # the reviewer's flag is filed again
         self.assertEqual(state(phase="Rejected")[0::2], ("pending", True))  # not refiled: no loop
 
