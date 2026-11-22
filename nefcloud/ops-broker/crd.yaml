@@ -31,6 +31,7 @@ spec:
         - {name: Repo, type: string, jsonPath: .spec.github.repo}
         - {name: Requester, type: string, jsonPath: .spec.requester, priority: 1}
         - {name: Workstream, type: string, jsonPath: .spec.workstream, priority: 1}
+        - {name: Session, type: string, jsonPath: .spec.session, priority: 1}
         - {name: Phase, type: string, jsonPath: .status.phase}
         - {name: Expires, type: date, jsonPath: .status.expiresAt, priority: 1}
         - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
@@ -188,11 +189,20 @@ spec:
                     admission policy, whatever the request said; don't set it.
                   type: string
                   maxLength: 253
+                session:
+                  description: >-
+                    The requester's session: the Claude session id for claude-remote (CLAUDE_CODE_SESSION_ID),
+                    the workstream's session for the night shift. A session's requests are one group on the ops
+                    page and in the notification. Optional; without it, requests group by workstream.
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  pattern: ^[A-Za-z0-9_.:-]+$
                 workstream:
                   description: >-
-                    The requester's own label for what this is part of (a task, a PR, a topic), so its
-                    requests are grouped with the rest of that work on the ops page and in the notification.
-                    Optional; requests without one share their requester's ungrouped group.
+                    The theme: a short name for what the session is doing, the same for every request of it
+                    (the latest one names the group). Without a session, it groups the requester's requests.
+                    Optional.
                   type: string
                   minLength: 1
                   maxLength: 80

@@ -42,6 +42,8 @@ os.environ.update(
 import broker  # noqa: E402  (reads the environment above at import)
 import minter  # noqa: E402
 
+NOTIFY = broker.notify  # Base mocks it
+
 APPROVER = "boss@example.test"
 
 
@@ -755,7 +757,7 @@ class TestHTTP(Served, Base):
         self.assertIn("3 requests waiting, in 2 groups.", body)
         self.assertEqual(body.count("<details class=group open>"), 2)
         self.assertEqual(body.count("<details class=group>"), 1)  # nothing waiting: closed
-        self.assertIn("<b>claude-remote</b> · fix valheim<span class=badge>2 waiting</span>", body)
+        self.assertIn("<b>fix valheim - claude-remote</b><span class=badge>2 waiting</span>", body)
         self.assertLess(body.index("fix valheim"), body.index("roadmap-42"))
         for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
             self.assertIn(f'href="/g/{broker.group_id(key)}"', body)
@@ -1262,7 +1264,7 @@ class TestAsync(Base):
     def test_page_shows_requester_and_expiry(self):
         self.add("r1", NIGHT, ttl=3600)
         broker.scan()
-        page = broker.request_page(self.api.requests["r1"])
+        page = broker.request_page(self.api.requests["r1"], list(self.api.requests.values()))
         self.assertIn(NIGHT, page)
         self.assertIn(self.api.status("r1")["expiresAt"], page)
         self.assertIn("night-worker", broker.index_page(list(self.api.requests.values())))
@@ -1283,10 +1285,10 @@ class TestNotify(unittest.TestCase):
         return {"metadata": {"name": name, "creationTimestamp": "2026-11-01T02:00:00Z"}, "spec": spec,
                 "status": {"phase": "Pending"}}
 
-    def sent(self, new, waiting):
+    def sent(self, new, waiting, items=None):
         with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
                 mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify(new, waiting)
+            broker.notify(new, waiting, items or waiting)
         sent = urlopen.call_args[0][0]
         self.assertEqual(sent.full_url, "https://ntfy.example.test")
         return json.loads(sent.data)
@@ -1298,7 +1300,7 @@ class TestNotify(unittest.TestCase):
         self.assertEqual({a["action"] for a in body["actions"]}, {"view"})
         gid = broker.group_id((AGENT, "fix valheim"))
         self.assertEqual(body["click"], f"https://ops.example.test/g/{gid}")  # one group: straight to it
-        self.assertIn("claude-remote · fix valheim", body["message"])
+        self.assertIn("fix valheim - claude-remote", body["message"])
 
     def test_one_summary_grouped_by_agent_and_workstream(self):
         a = [self.req(f"a{i}", AGENT, "fix valheim") for i in range(6)]
@@ -1312,7 +1314,7 @@ class TestNotify(unittest.TestCase):
         self.assertIn("and 2 more", msg)  # SUMMARY_ITEMS per group
         for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
             self.assertIn(f"(https://ops.example.test/g/{broker.group_id(key)})", msg)
-        self.assertIn("Still waiting: night-shift/night-worker · older (1)", msg)
+        self.assertIn("Still waiting: older - night-shift/night-worker (1)", msg)
         self.assertEqual(body["click"], "https://ops.example.test/")
         self.assertTrue(body["markdown"])
         self.assertEqual(len(body["actions"]), 3)
@@ -1326,8 +1328,117 @@ class TestNotify(unittest.TestCase):
 
     def test_off_without_url(self):
         with mock.patch.object(broker, "NTFY_URL", ""), mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify([], [])
+            broker.notify([], [], [])
         urlopen.assert_not_called()
+
+
+SESSION = "b1b3da34-05d3-461e-8ad8-c05f03d16ef2"  # claude.ai's session_01Nwipye4RvcaycGKTP4dbr1
+
+
+class TestSessions(Served, Base):
+    """One group per agent session, titled <theme> - <worker>, one row per subject."""
+
+    def flag(self, name, who, pr, session=None, workstream=None, age=0, **status):
+        spec = {"verb": "github-human-review", "requester": who, "reason": f"because {name}",
+                "github": {"repo": "web", "pr": pr, "headSHA": BASE}}
+        spec.update({k: v for k, v in (("session", session), ("workstream", workstream)) if v})
+        self.api.requests[name] = {
+            "metadata": {"name": name, "resourceVersion": "1",
+                         "creationTimestamp": broker.stamp(broker.now() - timedelta(seconds=age))},
+            "spec": spec, "status": {"phase": "Pending", "specHash": "h", **status}}
+
+    def restart(self, name, who, session=None, workstream=None, age=0, target="web", **status):
+        self.api.add(name, "rollout-restart", "Deployment", "app", target, age=age, **status)
+        spec = self.api.requests[name]["spec"]
+        spec["requester"] = who
+        spec.update({k: v for k, v in (("session", session), ("workstream", workstream)) if v})
+
+    def keys(self):
+        return broker.group_keys(list(self.api.requests.values()))
+
+    def test_a_session_is_one_group_titled_by_its_latest_theme(self):
+        self.restart("a1", AGENT, "s1", "ops page", age=30, phase="Succeeded")
+        self.restart("a2", AGENT, "s1", "ops page groups", age=20, target="api", phase="Succeeded")
+        self.restart("a3", AGENT, "s1", age=10, target="db", phase="Succeeded")  # no theme: keeps the last
+        self.restart("b1", AGENT, "s2", "other", phase="Succeeded")
+        self.restart("n1", NIGHT, "s1", "night", phase="Succeeded")  # same label, another worker
+        keys = self.keys()
+        self.assertEqual({keys["a1"], keys["a2"], keys["a3"]}, {(AGENT, "session", "s1")})
+        self.assertEqual(len(set(keys.values())), 3)
+        body = self.request("GET", "/")[1]
+        self.assertIn("<b>ops page groups - claude-remote</b>", body)
+        self.assertIn("<b>night - night-shift/night-worker</b>", body)
+        self.assertNotIn("<b>ops page - claude-remote</b>", body)
+
+    def test_without_a_session_groups_as_before(self):
+        self.restart("a1", AGENT, workstream="fix valheim", phase="Succeeded")
+        self.assertEqual(self.keys()["a1"], (AGENT, "fix valheim"))
+        self.assertIn("<b>fix valheim - claude-remote</b>", self.request("GET", "/")[1])
+
+    def test_the_brokers_flags_join_the_session_of_their_pr(self):
+        self.flag("mine", AGENT, 5, "s1", "ops page", age=30)
+        self.flag("later", AGENT, 5, "s2", "rework", age=20)
+        self.flag("trigger", broker.SELF, 5, workstream="Code triggers", age=10)
+        self.flag("other", broker.SELF, 6, workstream="Code triggers")
+        keys = self.keys()
+        self.assertEqual(keys["trigger"], (AGENT, "session", "s2"))  # the session that last filed for it
+        self.assertEqual(keys["other"], (broker.SELF, "Code triggers"))
+        body = self.request("GET", f"/g/{broker.group_id(keys['trigger'])}")[1]
+        self.assertIn("<h1>rework - claude-remote</h1>", body)  # the broker's workstream isn't the theme
+        self.assertIn("/r/trigger", body)
+        self.assertIn("Code triggers - ops-broker", self.request("GET", "/")[1])
+        self.assertIn(f'href="/g/{broker.group_id(keys["trigger"])}">Its group', self.request("GET", "/r/trigger")[1])
+
+    def test_one_row_per_subject_the_rest_folded_under_it(self):
+        self.flag("old", AGENT, 5, "s1", age=30, phase="Expired")
+        self.flag("mid", AGENT, 5, "s1", age=20)
+        self.flag("new", AGENT, 5, "s1", age=10)
+        self.flag("pr6", AGENT, 6, "s1")
+        body = self.request("GET", f"/g/{broker.group_id((AGENT, 'session', 's1'))}")[1]
+        self.assertEqual(body.count("<details class=earlier>"), 1)
+        self.assertIn("<summary>2 earlier, 1 waiting</summary>", body)
+        self.assertLess(body.index("/r/new"), body.index("2 earlier"))
+        self.assertLess(body.index("2 earlier"), body.index("/r/mid"))
+        self.assertLess(body.index("/r/pr6"), body.index("/r/new"))  # the newest subject first
+        self.assertIn("Waiting (3)", body)  # each request is still decided on its own
+        self.assertEqual(body.count('class="button review"'), 3)
+
+    def test_subjects(self):
+        def subject(verb, **spec):
+            return broker.subject({"spec": {"verb": verb, **spec}})
+        gh = {"repo": "web", "pr": 5, "branch": "b", "headSHA": BASE}
+        self.assertEqual(subject("github-human-review", github=gh), ("PR", "web", 5))
+        self.assertEqual(subject("github-commit-workflows", github=gh), ("branch", "web", "b"))
+        self.assertEqual(subject("github-protect-branch", github=gh), ("repo", "web"))
+        t = {"kind": "Kustomization", "namespace": "flux-system", "name": "web"}
+        self.assertEqual(subject("flux-suspend", target=t), subject("flux-resume", target=t))
+
+    def test_a_claude_ai_session_links_to_it(self):
+        url = "https://claude.ai/code/session_01Nwipye4RvcaycGKTP4dbr1"
+        with mock.patch.object(broker, "CLAUDE_AI_SESSIONS", {AGENT}):
+            self.assertEqual(broker.session_url((AGENT, "session", SESSION)), url)
+            self.assertEqual(broker.session_url((AGENT, "session", "cse_01Nwipye4RvcaycGKTP4dbr1")), url)
+            for bad in ("s1", "session_01Nwipye4Rv", "https://evil.test/", SESSION.upper()):
+                self.assertIsNone(broker.session_url((AGENT, "session", bad)), bad)
+            self.assertIsNone(broker.session_url((NIGHT, "session", SESSION)))  # not a claude.ai requester
+            self.assertIsNone(broker.session_url((AGENT, "fix valheim")))
+            self.restart("a1", AGENT, SESSION, "ops page")
+            body = self.request("GET", f"/g/{broker.group_id((AGENT, 'session', SESSION))}")[1]
+        self.assertIn(f'<a href="{url}">Open the session on claude.ai</a>', body)
+        self.assertEqual(broker.session_url((AGENT, "session", SESSION)), None)  # CLAUDE_AI_SESSIONS empty
+
+    def test_the_summary_shows_the_newest_per_subject(self):
+        self.flag("mid", AGENT, 5, "s1", "ops page", age=20)
+        self.flag("new", AGENT, 5, "s1", age=10)
+        self.flag("trigger", broker.SELF, 5, workstream="Code triggers")
+        items = list(self.api.requests.values())
+        with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            NOTIFY(items, items, items)
+        msg = json.loads(urlopen.call_args[0][0].data)["message"]
+        self.assertIn("**ops page - claude-remote**: 3 new", msg)
+        self.assertIn("because trigger (2 earlier)", msg)
+        self.assertNotIn("because mid", msg)
 
 
 class TestDebounce(Base):
