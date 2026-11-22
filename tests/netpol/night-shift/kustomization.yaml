@@ -1,4 +1,5 @@
-# nefcloud/night-shift/networkpolicy.yaml, from the components.
+# nefcloud/night-shift/networkpolicy.yaml, from the components. networkpolicy-patch.yaml
+# narrows the policies that don't cover every pod.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: night-shift
@@ -8,8 +9,4 @@ components:
   - ../../../nefcloud/components/netpol/apiserver
   - ../../../nefcloud/components/netpol/internet-https
 patches:
-  - target: {kind: NetworkPolicy, name: allow-apiserver}
-    patch: |-
-      - op: replace
-        path: /spec/podSelector
-        value: {matchLabels: {app.kubernetes.io/name: night-shift-runner}}
+  - path: networkpolicy-patch.yaml

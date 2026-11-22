@@ -1,0 +1,10 @@
+# The approval page trusts X-Auth-Request-Email, which only Traefik's oauth2-proxy
+# forwardAuth sets, so only Traefik may connect, and only to the broker.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-traefik
+spec:
+  podSelector:
+    matchLabels:
+      app: ops-broker

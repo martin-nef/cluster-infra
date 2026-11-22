@@ -1,0 +1,18 @@
+# Only the receiver manages Jobs (apiserver) and takes GitHub's webhooks (Traefik).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apiserver
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: receiver
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-traefik
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: receiver
