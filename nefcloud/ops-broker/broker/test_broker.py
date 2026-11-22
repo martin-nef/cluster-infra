@@ -513,6 +513,26 @@ class TestScan(Base):
         self.assertEqual(sorted(self.api.requests), ["recent", "recent-junk"])
 
 
+    def flag(self, name, pr, head, age, **status):
+        self.api.add(name, "github-human-review", "Pod", "app", "x", age=age, **status)
+        spec = self.api.requests[name]["spec"]
+        del spec["target"]
+        spec["github"] = {"repo": "web", "pr": pr, "headSHA": head}
+
+    def test_a_newer_flag_for_the_same_pr_expires_the_waiting_one(self):
+        self.flag("old", 5, BASE, 20, phase="Pending", expiresAt=broker.stamp(broker.now() + timedelta(hours=1)))
+        self.flag("unadmitted", 5, BASE, 15)
+        self.flag("new", 5, MOVED, 10, phase="Succeeded")
+        self.flag("other-pr", 6, BASE, 30, phase="Pending")
+        broker.scan()
+        for name in ("old", "unadmitted"):
+            st = self.api.status(name)
+            self.assertEqual(st["phase"], "Expired")
+            self.assertIn("superseded by new (head bbbbbbbbbbbb)", st["message"])
+        self.assertEqual(self.api.status("new")["phase"], "Succeeded")
+        self.assertEqual(self.api.status("other-pr")["phase"], "Pending")
+
+
 class TestDecide(Base):
     def pending(self, verb="rollout-restart", kind="Deployment", ns="app", name="web"):
         self.admit("r1", verb, kind, ns, name)
