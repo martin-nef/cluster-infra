@@ -691,7 +691,8 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
     numbers, the GitHub approvals: [(pr number, head sha, login)]).
     triggers(tok, pr) is code_trigger's answer for an unflagged head.
     desired returns (state, description, flagged), flagged meaning a request
-    covers this head. recheck(pr number, head sha) is asked again, from fresh
+    covers this head; state None leaves the head's status as it is (a sign-off
+    is running). recheck(pr number, head sha) is asked again, from fresh
     requests, before a success is turned pending: a sign-off may have landed
     since desired's were read. link(pr number, head sha) is the status's
     target_url (the request's ops page), or None. Reads with a read-only token;
@@ -703,6 +704,8 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
             number, head = pr["number"], pr["head"]["sha"]
             numbers.add(number)
             state, description, flagged = desired(number, head)
+            if state is None:
+                continue
             reason = None
             # Already signed off, or nothing to look at: no reviews read.
             reviews = pages(tok, f"/pulls/{number}/reviews") if state == "pending" or not flagged else []
@@ -734,6 +737,8 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
             mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
             if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
                 state, description, _ = recheck(number, head)
+                if state is None:
+                    continue
             url = link(number, head) if link else None
             if not mine or ((mine[0].get("state"), mine[0].get("description"), mine[0].get("target_url") or None)
                             != (state, description[:140], url)):
