@@ -122,11 +122,11 @@ REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  #
 # its request on the ops page. Yours; never an agent's.
 HUMAN_REVIEWERS = {r.strip() for r in os.environ.get("HUMAN_REVIEWERS", GITHUB_OWNER).split(",") if r.strip()}
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
-# The one list of changes that always need a human (code-triggers.json, README
-# "Code triggers"), read on every pass. Unreadable holds every PR.
 # Requesters whose spec.session is a claude.ai Remote Control session: their
 # groups link to it.
 CLAUDE_AI_SESSIONS = {r.strip() for r in os.environ.get("CLAUDE_AI_SESSIONS", "").split(",") if r.strip()}
+# The one list of changes that always need a human (code-triggers.json, README
+# "Code triggers"), read on every pass. Unreadable holds every PR.
 CODE_TRIGGERS = os.environ.get("CODE_TRIGGERS", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                              "code-triggers.json"))
 # (repo, head sha) -> code_trigger's answer: a head's files and commits don't change.
