@@ -19,7 +19,7 @@ JSON reply:
   {"op": "user-action", "verb", "code", "github"} -> {"message": "..."}
 
 Errors are {"error": {"code", "message"}}, with GitHub's status code where
-there is one. A token request names a verb and a step ("check" or "run"), not
+there is one. A token request names a verb and a step ("check", "run", "decide"...), not
 permissions: the permissions come from TOKENS, so the broker can't ask for more
 than a verb needs. The broker revokes each token itself when its step ends.
 
@@ -107,6 +107,23 @@ TOKENS = {
                             "write": {"statuses": "write"},
                             "ruleset": {"administration": "write"}},
 }
+
+
+def union(*steps):
+    """The permissions of several steps in one: write wherever any step writes."""
+    out = {}
+    for perms in steps:
+        for k, v in perms.items():
+            out[k] = "write" if "write" in (v, out.get(k)) else v
+    return out
+
+
+# decide: one token for a whole approval (the check again, the run and, for
+# human-review, the approve), instead of one per step. It lives only while you
+# approve, and saves a mint and a revoke per step.
+for _steps in TOKENS.values():
+    if "run" in _steps:
+        _steps["decide"] = union(*(_steps[s] for s in ("check", "run", "approve") if s in _steps))
 # Verbs whose check token isn't scoped to the request's repo (it doesn't exist).
 ACCOUNT_CHECKS = {"github-create-repo"}
 # Steps whose token covers every repo, asked for with no repo. Only listing
@@ -240,22 +257,38 @@ class App:
         """An installation token for one repo (every repo, if None) with only
         these permissions."""
         jwt = self.jwt()
+        key = (self.app_id, self.owner)
+        cached = INSTALLATIONS.get(key)
+        installation = cached or self.installation(jwt)
         try:
-            installation = api("GET", f"/users/{q(self.owner)}/installation", jwt)
+            minted = api("POST", f"/app/installations/{installation}/access_tokens", jwt,
+                         {"permissions": permissions, **({"repositories": [repo]} if repo else {})})
+        except GitHubError as e:
+            if e.code == 404 and cached:
+                # Uninstalled or installed again since it was cached: look it up once more.
+                INSTALLATIONS.pop(key, None)
+                return self.token(repo, permissions)
+            if e.code == 422:
+                raise GitHubError(422, f"{self.slug} can't get {permissions} on {self.owner}/{repo} "
+                                       f"(not installed there, or the repo doesn't exist): {e}") from None
+            raise
+        INSTALLATIONS[key] = installation
+        return minted["token"]
+
+    def installation(self, jwt):
+        try:
+            return api("GET", f"/users/{q(self.owner)}/installation", jwt)["id"]
         except GitHubError as e:
             if e.code == 404:
                 raise GitHubError(404, f"{self.slug} isn't installed on {self.owner}: "
                                        f"https://github.com/apps/{self.slug}/installations/new") from None
             raise
-        try:
-            minted = api("POST", f"/app/installations/{installation['id']}/access_tokens", jwt,
-                         {"permissions": permissions, **({"repositories": [repo]} if repo else {})})
-        except GitHubError as e:
-            if e.code == 422:
-                raise GitHubError(422, f"{self.slug} can't get {permissions} on {self.owner}/{repo} "
-                                       f"(not installed there, or the repo doesn't exist): {e}") from None
-            raise
-        return minted["token"]
+
+
+# (app id, owner) -> the App's installation id there. It only changes when the
+# App is installed again, and a mint then fails with 404 and drops it. Saves a
+# call to GitHub per token.
+INSTALLATIONS = {}
 
 
 # The App and OAuth client this process set up, until the Secret volumes show them.
