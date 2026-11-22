@@ -68,6 +68,7 @@ It is never run late or retried.
 Stdlib only, so it runs on a stock python image from a ConfigMap.
 """
 import base64
+import contextlib
 import hashlib
 import html
 import itertools
@@ -364,12 +365,13 @@ def target_path(spec):
     return KINDS[t["kind"]].format(ns=t["namespace"], name=t["name"])
 
 
-def check(req):
+def check(req, tok=None):
     """Look the target up. Returns (why it can't be run or None, the target's
-    UID). Raises on transient API errors, so the next scan tries again."""
+    UID). Raises on transient API errors, so the next scan tries again.
+    tok: an approval's own GitHub token (decide_token)."""
     spec = req.get("spec", {})
     if spec.get("verb") in GITHUB_VERBS:
-        return check_github(spec), None
+        return check_github(spec, tok), None
     target = spec.get("target", {})
     if target.get("kind") not in VERBS.get(spec.get("verb"), ()):
         return f"verb {spec.get('verb')!r} can't target kind {target.get('kind')!r}", None
@@ -393,7 +395,7 @@ def check(req):
     return None, obj["metadata"].get("uid")
 
 
-def check_github(spec):
+def check_github(spec, tok=None):
     if not isinstance(spec.get("github"), dict) or "target" in spec:
         return "GitHub verbs take spec.github, not spec.target"
     try:
@@ -406,18 +408,18 @@ def check_github(spec):
             # Fully automatic: nothing would hold the PR while you looked, so
             # you're not asked, and the agent learns that at once.
             return f"{repo} is in HUMAN_REVIEW_EXCLUDE: its PRs merge without human review, so nobody is asked"
-        return githubops.check(MINTER, spec)
+        return githubops.check(MINTER, spec, tok)
     except githubops.GitHubError as e:
         if e.transient:
             raise
         return f"GitHub: {e}"
 
 
-def run(req, code=None):
+def run(req, code=None, tok=None):
     """Run the action. Returns a message for the status. Raises K8sError when
     the API server refused it, Unknown when it may have taken effect."""
     try:
-        return act(req["spec"], req["status"].get("targetUID"), code)
+        return act(req["spec"], req["status"].get("targetUID"), code, tok)
     except (K8sError, githubops.GitHubError) as e:
         if e.transient:
             raise Unknown(str(e)) from None
@@ -426,9 +428,9 @@ def run(req, code=None):
         raise Unknown(repr(e)) from None
 
 
-def act(spec, uid, code=None):
+def act(spec, uid, code=None, tok=None):
     if spec["verb"] in GITHUB_VERBS:
-        return githubops.act(MINTER, spec, code)
+        return githubops.act(MINTER, spec, code, tok)
     verb, path = spec["verb"], target_path(spec)
     if verb == "create-sops-age-key":
         return create_sops_age_key(spec["target"]["name"])
@@ -753,11 +755,11 @@ def pr_closed(req):
     return seen is not None and int(g.get("pr") or 0) not in seen
 
 
-def admit(req, pending):
-    """Check a new request and either reject it or make it Pending. pending
-    counts the Pending requests per pool (pending_cap). Returns whether it is
-    now Pending."""
-    problem, uid = check(req)
+def admit(req, pending, checked):
+    """Reject a new request or make it Pending, given what check(req) said.
+    pending counts the Pending requests per pool (pending_cap). Returns
+    whether it is now Pending."""
+    problem, uid = checked
     pool, cap = pending_cap(requester(req))
     if problem is None and pending.get(pool, 0) >= cap:
         problem = (f"{cap} requests from {pool} already wait for a decision" if pool else
@@ -821,10 +823,25 @@ def each(items, fn):
 
 def scan():
     """One pass over the queue: expire, recover and delete old requests first,
-    so stale ones never take a pending slot, then admit new ones."""
+    so stale ones never take a pending slot, then admit new ones.
+
+    The checks of new requests call GitHub and can take seconds, so they run
+    outside the lock, and an approval doesn't wait for them. That's safe: a
+    check only reads, and a request's spec can't change. The writes happen
+    under the lock again, from a fresh list (the pending counts too), and each
+    is conditional on the version just read, so a request that changed in
+    between is left for the next scan."""
+    with lock:
+        items = list_requests()
+        each(items, tidy)
+        new = [r for r in items if phase(r) == ""]
+    checked = {}
+
+    def check_new(req):
+        checked[req["metadata"]["name"]] = check(req)
+    each(new, check_new)
     with lock:
         items = sorted(list_requests(), key=lambda r: r["metadata"]["creationTimestamp"])
-        each(items, tidy)
         pending = {}
         for r in items:
             if phase(r) == "Pending":
@@ -832,7 +849,8 @@ def scan():
                 pending[pool] = pending.get(pool, 0) + 1
 
         def admit_new(req):
-            if phase(req) == "" and admit(req, pending):
+            name = req["metadata"]["name"]
+            if phase(req) == "" and name in checked and admit(req, pending, checked[name]):
                 pool = pending_cap(requester(req))[0]
                 pending[pool] = pending.get(pool, 0) + 1
         each(items, admit_new)
@@ -855,6 +873,16 @@ def decidable(name, seen_hash):
     return req, None
 
 
+def decide_token(req):
+    """One GitHub token for a whole approval: the check again, the run and the
+    approve, instead of a mint and a revoke for each. None for a verb that
+    isn't run with an installation token. Raises GitHubError."""
+    verb = req["spec"]["verb"]
+    if verb not in githubops.VERBS or verb in USER_VERBS:
+        return None
+    return MINTER.token(req["spec"]["github"]["repo"], verb, "decide")
+
+
 def decide(name, decision, seen_hash, approver, code=None):
     """Approve (and run) or deny one request. Returns (http status, message).
     code: GitHub's OAuth code, which a USER_VERBS approval needs."""
@@ -864,44 +892,56 @@ def decide(name, decision, seen_hash, approver, code=None):
             return refused
         if decision == "approve" and req["spec"]["verb"] in USER_VERBS and not code:
             return 400, "this one needs you to sign in to GitHub; approve it from its page"
+        tok = None
         if decision == "approve":
-            # The world may have moved on since it was admitted, hours ago for a
-            # night agent's request: check again, and never act on a replaced
-            # target or a branch that has moved.
             try:
-                problem, uid = check(req)
-            except (K8sError, githubops.GitHubError) as e:
+                tok = decide_token(req)
+            except githubops.GitHubError as e:
                 return 502, f"couldn't check the target again ({e}); try again"
-            if problem is None and uid != req["status"].get("targetUID"):
-                problem = "the target was replaced since the request (its UID changed)"
-            if problem:
-                try:
-                    set_status(req, phase="Rejected", finishedAt=stamp(),
-                               message=f"not run, the target changed since the request: {problem}")
-                except K8sError as e:
-                    return (409 if e.code == 409 else 502), f"not recorded: {e}"
-                audit("rejected", req, reason=problem, by=approver)
-                return 409, f"Not run: the target changed since the request: {problem}"
-        # The claim is conditional on the version just read: if another broker
-        # pod decided it in the meantime, this one stops here.
+        with tok or contextlib.nullcontext():
+            return decided(req, decision, approver, code, tok)
+
+
+def decided(req, decision, approver, code, tok):
+    """decide, from a request that can still be decided, under the lock."""
+    if decision == "approve":
+        # The world may have moved on since it was admitted, hours ago for a
+        # night agent's request: check again, and never act on a replaced
+        # target or a branch that has moved.
         try:
-            if decision == "deny":
-                set_status(req, phase="Denied", decidedBy=approver, decidedAt=stamp(),
-                           finishedAt=stamp(), message=f"denied by {approver}")
-                audit("denied", req, by=approver)
-                return 200, "Denied."
-            set_status(req, phase="Approved", decidedBy=approver, decidedAt=stamp(), message="running")
-        except K8sError as e:
-            return (409 if e.code == 409 else 502), f"not recorded: {e}"
-        audit("approved", req, by=approver)
-        try:
-            result = run(req, code)
-        except Unknown as e:
-            return finish(req, "Unknown", f"may or may not have taken effect ({e}); check the target",
-                          502, "Approved, but the outcome is unknown")
-        except Exception as e:
-            return finish(req, "Failed", str(e), 502, "Approved, but it failed")
-        return finish(req, "Succeeded", result, 200, "Done")
+            problem, uid = check(req, tok)
+        except (K8sError, githubops.GitHubError) as e:
+            return 502, f"couldn't check the target again ({e}); try again"
+        if problem is None and uid != req["status"].get("targetUID"):
+            problem = "the target was replaced since the request (its UID changed)"
+        if problem:
+            try:
+                set_status(req, phase="Rejected", finishedAt=stamp(),
+                           message=f"not run, the target changed since the request: {problem}")
+            except K8sError as e:
+                return (409 if e.code == 409 else 502), f"not recorded: {e}"
+            audit("rejected", req, reason=problem, by=approver)
+            return 409, f"Not run: the target changed since the request: {problem}"
+    # The claim is conditional on the version just read: if another broker
+    # pod decided it in the meantime, this one stops here.
+    try:
+        if decision == "deny":
+            set_status(req, phase="Denied", decidedBy=approver, decidedAt=stamp(),
+                       finishedAt=stamp(), message=f"denied by {approver}")
+            audit("denied", req, by=approver)
+            return 200, "Denied."
+        set_status(req, phase="Approved", decidedBy=approver, decidedAt=stamp(), message="running")
+    except K8sError as e:
+        return (409 if e.code == 409 else 502), f"not recorded: {e}"
+    audit("approved", req, by=approver)
+    try:
+        result = run(req, code, tok)
+    except Unknown as e:
+        return finish(req, "Unknown", f"may or may not have taken effect ({e}); check the target",
+                      502, "Approved, but the outcome is unknown")
+    except Exception as e:
+        return finish(req, "Failed", str(e), 502, "Approved, but it failed")
+    return finish(req, "Succeeded", result, 200, "Done")
 
 
 def finish(req, final, message, code, summary):

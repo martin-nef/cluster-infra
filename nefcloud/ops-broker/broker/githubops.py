@@ -34,6 +34,7 @@ code GitHub returns to the minter, which takes the action with your token and
 revokes it. This process never sees that token either.
 """
 import base64
+import contextlib
 import difflib
 import html
 import json
@@ -234,9 +235,11 @@ def describe(owner, spec):
     return f"{verb} {where}"
 
 
-def check(minter, spec):
+def check(minter, spec, tok=None):
     """Why the request can't be run, or None. Raises GitHubError (transient
-    ones mean: try again on the next scan)."""
+    ones mean: try again on the next scan). tok: the approval's own token
+    (step "decide"), used and left for the caller to revoke; else one is
+    minted for the check."""
     g = spec["github"]
     if not REPO_NAME.fullmatch(g.get("repo", "")) or g["repo"] in (".", ".."):
         return f"{g.get('repo')!r} isn't a repo name"
@@ -244,9 +247,8 @@ def check(minter, spec):
         if minter.oauth() is None:
             return "creating a repo needs the App's OAuth client, which isn't set up; see /github"
         return None if existing(minter, g) is None else f"{minter.owner}/{g['repo']} already exists"
-    with minter.token(g["repo"], spec["verb"], "check") as tok:
-        repo = tok("GET")
-        return CHECKS[spec["verb"]](tok, repo, g)
+    with contextlib.nullcontext(tok) if tok else minter.token(g["repo"], spec["verb"], "check") as t:
+        return CHECKS[spec["verb"]](t, t("GET"), g)
 
 
 def existing(minter, g):
@@ -393,24 +395,28 @@ def protection(tok, branch):
         raise
 
 
-def act(minter, spec, code=None):
+def act(minter, spec, code=None, tok=None):
     """Run an approved request; returns a message for the status. Raises
     GitHubError when GitHub refused it (transient: it may have taken effect)
     and NothingChanged when it failed before changing anything. code: GitHub's
-    OAuth code, for USER_VERBS."""
+    OAuth code, for USER_VERBS. tok: the approval's own token (step
+    "decide"), which the caller revokes; else each step mints its own."""
     g = spec["github"]
     if spec["verb"] in USER_VERBS:
         if not code:
             raise NothingChanged("needs you to sign in to GitHub; approve it from the page")
         return minter.user_action(spec["verb"], code, g)
-    try:
-        tok = minter.token(g["repo"], spec["verb"], "run")
-    except GitHubError as e:
-        raise NothingChanged(f"no token: {e}") from None
-    with tok:
-        done = ACTS[spec["verb"]](tok, g)
+    if tok is None:
+        try:
+            run = minter.token(g["repo"], spec["verb"], "run")
+        except GitHubError as e:
+            raise NothingChanged(f"no token: {e}") from None
+    else:
+        run = contextlib.nullcontext(tok)
+    with run as t:
+        done = ACTS[spec["verb"]](t, g)
     if spec["verb"] == "github-human-review":
-        done += approve_pr(minter, g)
+        done += approve_pr(minter, g, tok)
     return done
 
 
@@ -462,15 +468,16 @@ def act_human_review(tok, g):
     return f"signed off #{g['pr']} at {g['headSHA'][:12]}"
 
 
-def approve_pr(minter, g):
+def approve_pr(minter, g, tok=None):
     """After a sign-off, approve the PR on GitHub as the ops App, so the one
     approval GitHub requires is there too: a PR the reviewer flagged gets a
     comment from it, not an Approve, and its author can't approve its own.
-    A separate token and step: the sign-off (the status) stands even if this
-    fails, e.g. before the App has pull_requests: write. Returns a note."""
+    A separate call: the sign-off (the status) stands even if this fails,
+    e.g. a review GitHub refuses. Returns a note.
+    tok: the approval's own token, else one is minted for this step."""
     try:
-        with minter.token(g["repo"], "github-human-review", "approve") as tok:
-            tok("POST", f"/pulls/{int(g['pr'])}/reviews",
+        with contextlib.nullcontext(tok) if tok else minter.token(g["repo"], "github-human-review", "approve") as t:
+            t("POST", f"/pulls/{int(g['pr'])}/reviews",
                 {"commit_id": g["headSHA"], "event": "APPROVE",
                  "body": "Human review signed off on the ops page, for exactly this commit."})
     except GitHubError as e:

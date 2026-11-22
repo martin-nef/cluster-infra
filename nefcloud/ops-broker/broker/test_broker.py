@@ -347,7 +347,8 @@ class MinterBase(unittest.TestCase):
                   mock.patch.object(minter, "created", None),
                   mock.patch.object(minter, "created_oauth", None),
                   mock.patch.object(minter, "OAUTH_DIR", os.path.join(d, "oauth")),
-                  mock.patch.object(minter, "audit", mock.Mock())):
+                  mock.patch.object(minter, "audit", mock.Mock()),
+                  mock.patch.dict(minter.INSTALLATIONS, clear=True)):
             p.start()
             self.addCleanup(p.stop)
         server = minter.serve(sock)
@@ -434,6 +435,41 @@ class TestScan(Base):
         self.assertEqual([self.api.status(f"r{i}")["phase"] for i in range(3)], ["Pending", "Pending", "Rejected"])
         self.notify.assert_called_once()  # one summary of both
         self.assertEqual([r["metadata"]["name"] for r in self.notify.call_args[0][0]], ["r0", "r1"])
+
+    def during_check(self, fn):
+        """broker.check as usual, after fn() runs where the check runs."""
+        real = broker.check
+
+        def check(req, *args):
+            fn()
+            return real(req, *args)
+        return mock.patch.object(broker, "check", check)
+
+    def test_checks_run_outside_the_lock(self):
+        # So an approval never waits for a scan's calls to GitHub.
+        held = []
+        with self.during_check(lambda: held.append(broker.lock.locked())):
+            st = self.admit("r1", "rollout-restart", "Deployment", "app", "web")
+        self.assertEqual((held, st["phase"]), ([False], "Pending"))
+
+    def test_a_slot_taken_during_the_checks_counts(self):
+        self.admit("old", "flux-reconcile", "Kustomization", "flux-system", "web")
+
+        def another():  # MAX_PENDING=2: this takes the last slot
+            self.api.add("other", "flux-reconcile", "Kustomization", "flux-system", "web", phase="Pending")
+        with self.during_check(another):
+            st = self.admit("new", "flux-reconcile", "Kustomization", "flux-system", "web")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("already wait", st["message"])
+
+    def test_a_request_changed_during_its_check_is_left_alone(self):
+        def change():
+            req = self.api.requests["r1"]
+            req["status"] = {"phase": "Expired"}
+            req["metadata"]["resourceVersion"] = str(next(self.api.versions))
+        with self.during_check(change):
+            st = self.admit("r1", "rollout-restart", "Deployment", "app", "web")
+        self.assertEqual(st["phase"], "Expired")
 
     def test_stale_new_requests_expire_before_taking_slots(self):
         # After a broker outage: three stale unadmitted requests and a fresh one.
@@ -851,7 +887,8 @@ class TestGitHubScan(GitHubBase):
 
 class TestGitHubDecide(GitHubBase):
     def assertWrites(self, permissions):
-        """The approval re-checks with read tokens, then runs with one write token."""
+        """The scan checks with read tokens; the approval re-checks and runs with
+        one token of its own (step decide)."""
         *checks, run = self.gh.tokens
         self.assertEqual(run, (["web"], permissions))
         for repos, perms in checks:
@@ -875,7 +912,7 @@ class TestGitHubDecide(GitHubBase):
              "content": COMMIT["files"][0]["content"]}]})
         self.assertEqual(commit[2]["parents"], [BASE])
         self.assertEqual(ref[2], {"sha": "c" * 40, "force": False})
-        self.assertEqual(len(self.gh.revoked), 3)  # every token: the checks' on admission and approval, and the run's
+        self.assertEqual(len(self.gh.revoked), 2)  # every token: the check's on admission, and the approval's
 
     def test_delete_is_a_null_sha(self):
         self.approve("github-commit-workflows", **{**COMMIT, "files": [{"path": ".github/workflows/ci.yml", "delete": True}]})
@@ -935,7 +972,7 @@ class TestGitHubDecide(GitHubBase):
         self.assertEqual(st["phase"], "Succeeded")
         self.assertEqual(self.gh.writes(), [("POST", f"{REPO}/actions/workflows/image.yml/dispatches",
                                              {"ref": "main", "inputs": {"tag": "1.2"}})])
-        self.assertWrites({"actions": "write"})
+        self.assertWrites({"actions": "write", "contents": "read"})
 
 
 class TestGitHubHTTP(Served, GitHubBase):
@@ -1590,8 +1627,9 @@ class TestHumanReview(Served, GitHubBase):
         self.assertIn("approved on GitHub", self.api.status("hr1")["message"])
         approve = [b for m, p, b in self.gh.writes() if p.endswith("/pulls/5/reviews")]
         self.assertEqual([(b["commit_id"], b["event"]) for b in approve], [(HEAD, "APPROVE")])
-        # With its own token, pull_requests: write and nothing else.
-        self.assertIn((["web"], {"pull_requests": "write"}), self.gh.tokens)
+        # With the approval's one token: the re-check, the status and the approve.
+        self.assertEqual(self.gh.tokens[-1], (["web"], {"pull_requests": "write", "statuses": "write"}))
+        self.assertEqual(len(self.gh.revoked), len(self.gh.tokens))
 
     def test_a_failed_approve_leaves_the_sign_off(self):
         self.flag()
