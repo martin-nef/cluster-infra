@@ -215,11 +215,9 @@
 
 # Ubuntu ships /etc/apparmor.d/runc, an unconfined-mode profile whose only job
 # is to let runc create user namespaces under Ubuntu's userns restriction.
-# Since the apparmor update installed by unattended-upgrades on 2026-11-18
-# (...24.04.5 -> .9; most likely .8, LP: #2162134, which changed how
-# unconfined profiles are compiled), containerd's container profile is
-# stacked onto it, so every container process gets the label
-# cri-containerd.apparmor.d//&unconfined. containerd's profile only allows
+# Since the release upgrade to 26.04 on 2026-11-18 (AppArmor 5.0.2),
+# containerd's container profile is stacked onto it, so every container
+# process gets the label cri-containerd.apparmor.d//&unconfined. containerd's profile only allows
 # signals from peers with exactly its own label, so signals inside containers
 # are denied: valheim's bootstrap hung on rsync, tini could not forward
 # SIGTERM, Mono could not suspend its threads (valheim#10). The runc profile
