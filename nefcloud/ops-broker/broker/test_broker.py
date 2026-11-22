@@ -1361,14 +1361,21 @@ class TestSessions(Served, Base):
         self.restart("a2", AGENT, "s1", "ops page groups", age=20, target="api", phase="Succeeded")
         self.restart("a3", AGENT, "s1", age=10, target="db", phase="Succeeded")  # no theme: keeps the last
         self.restart("b1", AGENT, "s2", "other", phase="Succeeded")
-        self.restart("n1", NIGHT, "s1", "night", phase="Succeeded")  # same label, another worker
         keys = self.keys()
-        self.assertEqual({keys["a1"], keys["a2"], keys["a3"]}, {(AGENT, "session", "s1")})
-        self.assertEqual(len(set(keys.values())), 3)
+        self.assertEqual({keys["a1"], keys["a2"], keys["a3"]}, {(None, "s1")})
+        self.assertEqual(len(set(keys.values())), 2)
         body = self.request("GET", "/")[1]
         self.assertIn("<b>ops page groups - claude-remote</b>", body)
-        self.assertIn("<b>night - night-shift/night-worker</b>", body)
         self.assertNotIn("<b>ops page - claude-remote</b>", body)
+        self.assertIn("succeeded, ", body)
+        self.assertIn(" · claude-remote</span>", body)  # each request shows who filed it
+
+    def test_a_session_is_one_group_whoever_files_in_it(self):
+        self.restart("a1", AGENT, "s1", "ops page", age=10, phase="Succeeded")
+        self.restart("n1", NIGHT, "s1", phase="Succeeded")
+        self.assertEqual(self.keys()["n1"], (None, "s1"))
+        # Every requester that named the session shows in its title, newest first.
+        self.assertIn("<b>ops page - night-shift/night-worker, claude-remote</b>", self.request("GET", "/")[1])
 
     def test_without_a_session_groups_as_before(self):
         self.restart("a1", AGENT, workstream="fix valheim", phase="Succeeded")
@@ -1381,11 +1388,12 @@ class TestSessions(Served, Base):
         self.flag("trigger", broker.SELF, 5, workstream="Code triggers", age=10)
         self.flag("other", broker.SELF, 6, workstream="Code triggers")
         keys = self.keys()
-        self.assertEqual(keys["trigger"], (AGENT, "session", "s2"))  # the session that last filed for it
+        self.assertEqual(keys["trigger"], (None, "s2"))  # the session that last filed for it
         self.assertEqual(keys["other"], (broker.SELF, "Code triggers"))
         body = self.request("GET", f"/g/{broker.group_id(keys['trigger'])}")[1]
         self.assertIn("<h1>rework - claude-remote</h1>", body)  # the broker's workstream isn't the theme
         self.assertIn("/r/trigger", body)
+        self.assertIn(" · ops-broker: Code triggers</span>", body)  # the broker's flag, in the agent's group
         self.assertIn("Code triggers - ops-broker", self.request("GET", "/")[1])
         self.assertIn(f'href="/g/{broker.group_id(keys["trigger"])}">Its group', self.request("GET", "/r/trigger")[1])
 
@@ -1394,7 +1402,7 @@ class TestSessions(Served, Base):
         self.flag("mid", AGENT, 5, "s1", age=20)
         self.flag("new", AGENT, 5, "s1", age=10)
         self.flag("pr6", AGENT, 6, "s1")
-        body = self.request("GET", f"/g/{broker.group_id((AGENT, 'session', 's1'))}")[1]
+        body = self.request("GET", f"/g/{broker.group_id((None, 's1'))}")[1]
         self.assertEqual(body.count("<details class=earlier>"), 1)
         self.assertIn("<summary>2 earlier, 1 waiting</summary>", body)
         self.assertLess(body.index("/r/new"), body.index("2 earlier"))
@@ -1416,16 +1424,18 @@ class TestSessions(Served, Base):
     def test_a_claude_ai_session_links_to_it(self):
         url = "https://claude.ai/code/session_01Nwipye4RvcaycGKTP4dbr1"
         with mock.patch.object(broker, "CLAUDE_AI_SESSIONS", {AGENT}):
-            self.assertEqual(broker.session_url((AGENT, "session", SESSION)), url)
-            self.assertEqual(broker.session_url((AGENT, "session", "cse_01Nwipye4RvcaycGKTP4dbr1")), url)
+            def link(sid, who=AGENT):
+                return broker.session_url((None, sid), [{"spec": {"requester": who, "session": sid}}])
+            self.assertEqual(link(SESSION), url)
+            self.assertEqual(link("cse_01Nwipye4RvcaycGKTP4dbr1"), url)
             for bad in ("s1", "session_01Nwipye4Rv", "https://evil.test/", SESSION.upper()):
-                self.assertIsNone(broker.session_url((AGENT, "session", bad)), bad)
-            self.assertIsNone(broker.session_url((NIGHT, "session", SESSION)))  # not a claude.ai requester
-            self.assertIsNone(broker.session_url((AGENT, "fix valheim")))
+                self.assertIsNone(link(bad), bad)
+            self.assertIsNone(link(SESSION, NIGHT))  # not a claude.ai requester
+            self.assertIsNone(broker.session_url((AGENT, "fix valheim"), []))
             self.restart("a1", AGENT, SESSION, "ops page")
-            body = self.request("GET", f"/g/{broker.group_id((AGENT, 'session', SESSION))}")[1]
+            body = self.request("GET", f"/g/{broker.group_id((None, SESSION))}")[1]
         self.assertIn(f'<a href="{url}">Open the session on claude.ai</a>', body)
-        self.assertEqual(broker.session_url((AGENT, "session", SESSION)), None)  # CLAUDE_AI_SESSIONS empty
+        self.assertIsNone(link(SESSION))  # CLAUDE_AI_SESSIONS empty
 
     def test_the_summary_shows_the_newest_per_subject(self):
         self.flag("mid", AGENT, 5, "s1", "ops page", age=20)

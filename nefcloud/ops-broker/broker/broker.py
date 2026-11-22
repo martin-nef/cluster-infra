@@ -32,9 +32,9 @@ One verb isn't an action but a sign-off (README, "Human review required"):
                         the ruleset that requires the check itself.
 
 The broker checks the target exists and marks the request Pending. Requests
-are grouped by session: spec.requester and spec.session, the requester's own
-label for the session that asked, titled by its latest spec.workstream (the
-theme); without a session, by requester and workstream. Within a group, only
+are grouped by spec.session, the requester's own label for the session that
+asked, titled by its latest spec.workstream (the theme) and the requesters
+that named it; without a session, by requester and workstream. Within a group, only
 the newest request per subject shows (subject). Notifications are debounced (announce): one ntfy summary
 of everything new, by group, linking to each group's page, PUBLIC_URL/g/<id>,
 which lists its requests, PUBLIC_URL/r/<name>. The pages are behind Traefik's
@@ -262,12 +262,12 @@ def session(req):
 
 
 def group_key(req):
-    """The group a request files itself under: (requester, "session", session),
-    or without a session (older clients), (requester, workstream). The
-    requester is stamped by admission; session and workstream are the agent's
-    own labels, so they only group its own requests."""
+    """The group a request files itself under: (None, session), or without a
+    session (older clients), (requester, workstream). A session's group is the
+    session alone: its work spans requesters (the agent, the broker's flags for
+    it), and each request shows its own."""
     if session(req):
-        return requester(req), "session", session(req)
+        return None, session(req)
     return requester(req), req["spec"].get("workstream", "")
 
 
@@ -319,16 +319,25 @@ def agent_name(who):
 def theme(key, reqs):
     """What the group is about: its workstream, or a session's latest one
     (reqs newest first). Not from what the broker filed into it."""
-    if len(key) == 2:
+    if key[0] is not None:
         return key[1]
     return next((r["spec"]["workstream"] for r in reqs
-                 if requester(r) == key[0] and r["spec"].get("workstream")), "")
+                 if session(r) == key[1] and r["spec"].get("workstream")), "")
+
+
+def workers(key, reqs):
+    """Who the group's work is from: its requester, or the requesters that
+    named the session, newest first. More than one shows: the session is the
+    agents' own label, and the stamped requesters are what can't be faked."""
+    if key[0] is not None:
+        return [key[0]]
+    return list(dict.fromkeys(requester(r) for r in reqs if session(r) == key[1]))
 
 
 def group_title(key, reqs):
     """<theme> - <worker>, or the worker alone."""
-    t = theme(key, reqs)
-    return f"{t} - {agent_name(key[0])}" if t else agent_name(key[0])
+    t, w = theme(key, reqs), ", ".join(agent_name(who) for who in workers(key, reqs))
+    return f"{t} - {w}" if t else w
 
 
 BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -336,14 +345,14 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 TAGGED = re.compile(rf"(?:session|cse)_(01[{BASE58}]{{22}})")
 
 
-def session_url(key):
-    """A claude.ai Remote Control session's page, for a group of a requester in
-    CLAUDE_AI_SESSIONS; else None. Built here from the id, never taken from the
-    request. claude.ai's id, session_01<base58>, is the same 128 bits as the
-    session's own CLAUDE_CODE_SESSION_ID (a UUID): either is accepted."""
-    if len(key) != 3 or key[0] not in CLAUDE_AI_SESSIONS:
+def session_url(key, reqs):
+    """A claude.ai Remote Control session's page, for a session named by a
+    requester in CLAUDE_AI_SESSIONS; else None. Built here from the id, never
+    taken from the request. claude.ai's id, session_01<base58>, is the same 128
+    bits as the session's own CLAUDE_CODE_SESSION_ID (a UUID): either works."""
+    if key[0] is not None or not CLAUDE_AI_SESSIONS & set(workers(key, reqs)):
         return None
-    sid = key[2]
+    sid = key[1]
     if m := TAGGED.fullmatch(sid):
         return f"https://claude.ai/code/session_{m.group(1)}"
     if not UUID.fullmatch(sid):
@@ -1185,6 +1194,15 @@ def request_page(req, items):
         ' · <a href="/">All requests</a></p>'
 
 
+def filed_by(req):
+    """Who filed it, for its line in a group: the stamped requester, and for the
+    broker's own flags whose they are (its workstream, which only it sets)."""
+    who = agent_name(requester(req))
+    if requester(req) == SELF and req["spec"].get("workstream"):
+        return f"{who}: {req['spec']['workstream']}"
+    return who
+
+
 def item(req, clamp=False, actions=False):
     """One request in a list: what, its phase, why; with actions, the buttons
     a Pending one can be decided with from the list."""
@@ -1193,7 +1211,7 @@ def item(req, clamp=False, actions=False):
     when = f"expires {local(expires(req))}" if p == "Pending" else f"{p.lower() or 'new'}, " + local(
         parse_time(st.get("finishedAt") or req["metadata"]["creationTimestamp"]))
     out = (f'<div class=item><a href="/r/{name}"><code>{e(describe(req))}</code></a> '
-           f'<span class="phase {e(p)}">{e(p or "new")}</span> <span class=muted>{e(when)}</span>'
+           f'<span class="phase {e(p)}">{e(p or "new")}</span> <span class=muted>{e(when)} · {e(filed_by(req))}</span>'
            f'<div class="reason{" clamp" if clamp else ""}">{e(req["spec"]["reason"])}</div>')
     if p != "Pending" and st.get("message"):
         out += f"<div class=muted>{e(st['message'])}</div>"
@@ -1275,9 +1293,9 @@ def group_page(gid, items):
         if group_id(key) != gid:
             continue
         live, done = split(reqs)
-        who, url = key[0], session_url(key)
-        about = (f"<p class=muted>{e(who or 'no requester recorded')}"
-                 + (f" · session <code>{e(key[2])}</code>" if len(key) == 3 else "") + "</p>")
+        url = session_url(key, reqs)
+        about = (f"<p class=muted>{e(', '.join(w or 'no requester recorded' for w in workers(key, reqs)))}"
+                 + (f" · session <code>{e(key[1])}</code>" if key[0] is None else "") + "</p>")
         if url:
             about += f'<p><a href="{e(url)}">Open the session on claude.ai</a></p>'
         return (f"<h1>{e(group_title(key, reqs))}</h1>{about}"
