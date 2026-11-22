@@ -662,6 +662,7 @@ def sync_human_review(rulesets=False):
     for repo, open_count in repos:
         if not open_count:
             OPEN_PRS[repo] = set()  # no open issues or PRs: nothing to set, and no token minted for it
+            clean = end_closed_flags(repo, items) and clean
             continue
         reqs = human_review_requests(items, repo)
 
@@ -690,10 +691,52 @@ def sync_human_review(rulesets=False):
         except (githubops.GitHubError, K8sError, OSError) as e:
             clean = False
             print(f"human-review sync {repo}: {e}", flush=True)
+            continue
+        clean = end_closed_flags(repo, items) and clean
     # Only after a pass that set every status it had to: a required check the
     # broker can't set (a missing permission) would hold every PR.
     if rulesets and clean:
         reconcile_rulesets([r for r, _ in installed])
+
+
+def end_closed_flags(repo, items):
+    """End the flags still waiting on a PR that has been closed or merged, so
+    they leave the page and free their slot: Rejected, as an approval of one
+    would be. Candidates are the waiting flags on PRs this pass didn't see
+    open; GitHub confirms each PR is closed (one read per PR, outside the
+    lock), since a PR opened after the pass listed them isn't in OPEN_PRS
+    either. The writes are under the lock, on a fresh list, conditional on
+    the version just read. Returns False if it couldn't finish."""
+    seen = OPEN_PRS.get(repo)
+    waiting = [r for reqs in human_review_requests(items, repo).values() for r in reqs
+               if phase(r) in ("", "Pending")]
+    numbers = {int(r["spec"]["github"]["pr"]) for r in waiting} - (seen or set())
+    if seen is None or not numbers:
+        return True
+    closed = {}
+    try:
+        with MINTER.token(repo, "github-human-review", "check") as tok:
+            for n in sorted(numbers):
+                pr = tok("GET", f"/pulls/{n}")
+                if pr["state"] != "open":
+                    closed[n] = "merged" if pr.get("merged") else "closed"
+    except (githubops.GitHubError, OSError) as e:
+        print(f"human-review {repo}: closed PRs: {e}", flush=True)
+        return False
+    with lock:
+        for req in human_review_requests(list_requests(), repo).values():
+            for r in req:
+                n = int(r["spec"]["github"]["pr"])
+                if n not in closed or phase(r) not in ("", "Pending"):
+                    continue
+                message = f"#{n} was {closed[n]}, so there is nothing to sign off"
+                try:
+                    set_status(r, phase="Rejected", finishedAt=stamp(), message=message)
+                except K8sError as e:
+                    print(f"ending {r['metadata']['name']}: {e}", flush=True)  # the next pass tries again
+                    continue
+                audit("rejected", r, reason=message)
+    return True
 
 
 def reconcile_rulesets(repos):

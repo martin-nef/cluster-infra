@@ -1939,6 +1939,31 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(self.status(), "success")
         self.assertIn("signed off by", self.description())
 
+    def test_a_flag_on_a_merged_pr_is_ended(self):
+        self.flag()
+        broker.scan()
+        self.gh.pulls[5].update(state="closed", merged=True)
+        broker.sync_human_review()
+        st = self.api.status("hr1")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("#5 was merged", st["message"])
+
+    def test_a_flag_is_ended_where_nothing_is_open_any_more(self):
+        self.flag()
+        broker.scan()
+        self.gh.pulls[5]["state"] = "closed"
+        self.gh.installed = [{"name": "web", "open_issues_count": 0}]
+        broker.sync_human_review()
+        self.assertIn("#5 was closed", self.api.status("hr1")["message"])
+
+    def test_a_pr_the_pass_didnt_list_is_asked_about_before_its_flag_ends(self):
+        # Opened after the pass listed the open PRs: GitHub says open, so it's kept.
+        self.flag()
+        broker.scan()
+        with mock.patch.dict(broker.OPEN_PRS, {"web": set()}):
+            self.assertTrue(broker.end_closed_flags("web", list(self.api.requests.values())))
+        self.assertEqual(self.api.status("hr1")["phase"], "Pending")
+
     def test_page_shows_the_pr_escaped(self):
         self.flag()
         broker.scan()
