@@ -1,9 +1,9 @@
 # Default deny, then one policy per exception, as in claude-remote/. Nothing
 # here needs the internet. VictoriaMetrics' HTTP API has no auth (anyone who
 # reaches it can write or delete series), so only the collector may reach it;
-# Grafana gets the same allow when it lands. No sender may reach the collector
-# yet: each one gets an ingress allow here and an egress allow in its own
-# namespace when it is wired up (claude-remote first).
+# Grafana gets the same allow when it lands. Any pod in the cluster may push to
+# the collector; a namespace with default-deny egress still needs its own
+# egress allow (README.md).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -68,3 +68,20 @@ spec:
               app.kubernetes.io/name: otel-collector
       ports:
         - {protocol: TCP, port: 8428}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-collector-from-cluster
+  namespace: observability
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  policyTypes: [Ingress]
+  ingress:
+    # Pods in any namespace; not host-network traffic or anything outside.
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: TCP, port: 4318}

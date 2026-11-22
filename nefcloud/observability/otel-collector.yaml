@@ -1,6 +1,5 @@
 # The OTLP endpoint for senders in other namespaces:
-# http://otel-collector.observability.svc.cluster.local:4318. No sender is
-# allowed in yet (see networkpolicy.yaml).
+# http://otel-collector.observability.svc.cluster.local:4318 (README.md).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

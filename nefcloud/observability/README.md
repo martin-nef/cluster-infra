@@ -42,7 +42,7 @@ flowchart LR
 |---|---|---|
 | Namespace | `namespace.yaml` | PodSecurity `restricted`. |
 | Quota, LimitRange | `quota.yaml` | Caps CPU, memory, ephemeral storage and the PVC, so the namespace cannot starve the game servers. |
-| NetworkPolicies | `networkpolicy.yaml` | Default deny. Allows DNS, and the collector to VictoriaMetrics on 8428. Nothing else. |
+| NetworkPolicies | `networkpolicy.yaml` | Default deny. Allows DNS, pods in any namespace to the collector on 4318, and the collector to VictoriaMetrics on 8428. Nothing else. |
 | VictoriaMetrics | `victoria-metrics.yaml` | Single-node v1.155.0, one replica, `Recreate`. 50m/128Mi requests, 500m/512Mi limits. Also scrapes its own metrics every 30 s. |
 | OTel collector | `otel-collector.yaml`, `otel-collector-config.yaml` | Core distribution 0.164.0, metrics pipeline only. 20m/64Mi requests, 200m/256Mi limits. |
 
@@ -51,39 +51,18 @@ Flux applies this directory from `main` through `nefcloud/kustomization.yaml`, a
 ## Design decisions
 
 - **A collector in front of the database.** VictoriaMetrics' HTTP API has no authentication: anyone who reaches it can write or delete series. So senders never reach it; only the collector does. The collector also lets us change the backend, or add processing, without a change in any sender.
-- **VictoriaMetrics, not Prometheus.** One small multi-arch binary with OTLP ingest built in. It uses less memory and disk than Prometheus for the same data.
-- **Push, not scrape.** Claude Code pushes OTLP. Pods with a short life (Jobs, the night-shift pod) also finish before a scraper sees them.
+- **VictoriaMetrics, not Prometheus.** One small multi-arch binary with OTLP ingest, retention and a query UI built in. VictoriaMetrics' own benchmarks show it uses less RAM and disk than Prometheus for the same series. At our size (a few hundred series) both are small, so that is not the main reason. Both need cumulative counters from OTLP senders (see *Cumulative temporality*): Prometheus' OTLP receiver also cannot use delta sums without an experimental flag. So that limit does not favour either one.
+- **Push first, scrape later.** Claude Code pushes OTLP, and pods with a short life (Jobs, the night-shift pod) finish before a scraper sees them. Scraping is not closed off: VictoriaMetrics can scrape Prometheus `/metrics` endpoints itself (`-promscrape.config`; it already scrapes itself). Nothing else is scraped yet. To scrape an app, add a scrape config and an egress allow from VictoriaMetrics to the app. Step 4 needs this for kube-state-metrics (pod states).
 - **local-path storage, not Longhorn.** The data is useful but not critical, so it gets no replicas. local-path pins the volume to the node where the pod first starts, so the pod prefers any node other than shitbox and its game servers.
-- **Cumulative temporality.** VictoriaMetrics stores delta sums as they come, and then `increase()` and `rate()` give wrong results. The core collector cannot convert delta to cumulative, so each sender must send cumulative.
+- **Cumulative temporality.** *Temporality* is not "temporary". It is how an OTel counter reports its value. *Cumulative* sends the total since the process started (10, 15, 22). *Delta* sends only the change since the last export (10, 5, 7). PromQL's `increase()` and `rate()` expect cumulative totals, and handle a reset to zero when the process restarts. VictoriaMetrics stores delta values as they come, and then those functions give wrong results. The core collector cannot convert delta to cumulative, so each sender must send cumulative. This is a permanent setting, not a stopgap. We can drop it only if we change to the contrib collector, whose `deltatocumulative` processor does the conversion.
 
 ## Send metrics from an app
 
-You need three changes. The first two are NetworkPolicy changes, so the ops broker holds `human-review` on them for the owner.
+You need at most two changes. Step 2 changes a NetworkPolicy, so the ops broker holds `human-review` on it for the owner.
 
-**1. Let the app in.** In cluster-infra, add an ingress allow to `networkpolicy.yaml` in this directory. Replace `<app-ns>` with the app's namespace:
+**1. Let the app in.** Nothing to do. `networkpolicy.yaml` lets pods in every namespace reach the collector on 4318. Only the collector can reach VictoriaMetrics.
 
-```yaml
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-collector-from-<app-ns>
-  namespace: observability
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: otel-collector
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: <app-ns>
-      ports:
-        - {protocol: TCP, port: 4318}
-```
-
-**2. Let the app out.** If the app's namespace has a default-deny egress policy, add an egress allow next to its other NetworkPolicies:
+**2. Let the app out.** Only if the app's namespace has a default-deny egress policy (today: claude-remote, night-shift, ops-broker, pr-reviewer). Add an egress allow next to its other NetworkPolicies:
 
 ```yaml
 ---
@@ -124,7 +103,10 @@ env:
 
 For Claude Code, also set `CLAUDE_CODE_ENABLE_TELEMETRY=1`. Its metrics are `claude_code.session.count`, `.token.usage`, `.cost.usage`, `.lines_of_code.count`, `.commit.count`, `.pull_request.count`, `.active_time.total` and `.code_edit_tool.decision`.
 
-Keep labels (attributes) low-cardinality: a model name or an outcome, never a session ID, user prompt or file path. Each new label value makes a new series.
+> [!WARNING]
+> **Keep labels (attributes) low-cardinality.** Use a model name or an outcome. Never use a session ID, user ID, prompt, file path or timestamp. Each new label value makes a new series, and each series costs memory and disk for 90 days. A label with an unbounded set of values can fill the 5Gi volume and the 512Mi memory limit.
+>
+> Claude Code adds `session.id` to every metric by default. Set `OTEL_METRICS_INCLUDE_SESSION_ID=false` on it.
 
 ## Check that data arrives
 
@@ -155,5 +137,5 @@ If nothing arrives, look at the collector's log (`kubectl -n observability logs 
 
 1. VictoriaMetrics and the collector (this directory).
 2. Grafana behind oauth2-proxy, with VictoriaMetrics as its datasource.
-3. claude-remote sends Claude Code's metrics (the steps in *Send metrics from an app*).
+3. claude-remote sends Claude Code's metrics (step 2 and 3 of *Send metrics from an app*).
 4. Alerts for setup wait, crash loops, and failed or `limited` agent runs.
