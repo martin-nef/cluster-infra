@@ -752,6 +752,27 @@ def tidy(req):
         k8s("DELETE", f"{REQUESTS}/{req['metadata']['name']}")
 
 
+def supersede(items):
+    """Expire every github-human-review request that still waits while a newer
+    one exists for the same PR (a flag for a later head, or the same one filed
+    again). Only the newest decides the PR's status (human_review_state), so an
+    older one only clutters the queue and takes a pending slot."""
+    newest = {}
+    for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"]):
+        g = r["spec"].get("github") or {}
+        if r["spec"].get("verb") == "github-human-review":
+            newest[(g.get("repo"), int(g.get("pr") or 0))] = r
+    stale = [r for r in items if r["spec"].get("verb") == "github-human-review" and phase(r) in ("", "Pending")
+             and newest[(r["spec"]["github"].get("repo"), int(r["spec"]["github"].get("pr") or 0))] is not r]
+
+    def expire(req):
+        n = newest[(req["spec"]["github"].get("repo"), int(req["spec"]["github"].get("pr") or 0))]
+        set_status(req, phase="Expired", finishedAt=stamp(),
+                   message=f"superseded by {n['metadata']['name']} (head {n['spec']['github']['headSHA'][:12]})")
+        audit("expired", req, reason="superseded", by=n["metadata"]["name"])
+    each(stale, expire)
+
+
 def pr_closed(req):
     """Whether the last sync saw this flag's repo, and its PR wasn't open. Not
     synced (yet, or the repo was excluded or uninstalled): kept, to be safe."""
@@ -837,8 +858,9 @@ def scan():
     is conditional on the version just read, so a request that changed in
     between is left for the next scan."""
     with lock:
+        each(list_requests(), tidy)
         items = list_requests()
-        each(items, tidy)
+        supersede(items)
         new = [r for r in items if phase(r) == ""]
     checked = {}
 
