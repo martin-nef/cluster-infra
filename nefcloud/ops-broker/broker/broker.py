@@ -473,7 +473,8 @@ def human_review_requests(items, repo):
 def human_review_state(head, reqs):
     """(status state, description, whether a request covers this head) for a PR
     head, from its human-review requests, oldest first. The newest decides:
-    only your sign-off of exactly this head clears it."""
+    only your sign-off of exactly this head clears it. State None: a sign-off
+    is running (Approved), which sets the status itself, so leave it as it is."""
     if not reqs:
         return "success", "not flagged", False
     last = reqs[-1]
@@ -484,7 +485,11 @@ def human_review_state(head, reqs):
         return "success", f"signed off by {last['status'].get('decidedBy', 'a human')}", True
     if p == "Denied":
         return "pending", f"denied by {last['status'].get('decidedBy', 'a human')}: change it and flag it again", True
-    if p in ("", "Pending", "Approved"):
+    if p == "Approved":
+        # The run sets success before the request is Succeeded: writing pending
+        # now would undo it (cluster-infra#67). tidy ends a stranded one as Unknown.
+        return None, "being signed off", True
+    if p in ("", "Pending"):
         return "pending", f"human review required: {reason}", True
     if p == "Expired":
         # Not covered any more, so the reviewer's flag, if it still stands, is filed again.

@@ -1780,6 +1780,24 @@ class TestHumanReview(Served, GitHubBase):
             broker.sync_human_review()
         self.assertEqual(self.status(), "success")
 
+    def test_a_sign_off_still_running_isnt_undone(self):
+        # cluster-infra#67: the run has set success, but the request is still
+        # Approved until it records Succeeded. A sync in that gap leaves it.
+        self.flag()
+        broker.scan()
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.api.requests["hr1"]["status"].update(phase="Approved", decidedBy=APPROVER, decidedAt=broker.stamp())
+        self.gh.statuses[HEAD].insert(0, {"context": "human-review", "state": "success",
+                                          "description": "signed off by a human on the ops page"})
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+        # Once it's recorded, the next pass words it as usual.
+        self.api.requests["hr1"]["status"].update(phase="Succeeded")
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+        self.assertIn("signed off by", self.description())
+
     def test_page_shows_the_pr_escaped(self):
         self.flag()
         broker.scan()
