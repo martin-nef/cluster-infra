@@ -40,6 +40,7 @@ An app is its own GitHub repo under `martin-nef/` with its manifests in `deploy/
 - **Secrets.** See *SOPS for a new app* below.
 - **Non-HTTP ports (game servers).** Add an entrypoint per port to `nefcloud/traefik/helmchartconfig.yaml` (`port`, `expose.default: true`, `exposedPort`, `protocol: TCP|UDP`), and reference it from an `IngressRoute`/`IngressRouteUDP` in the app's `deploy/`. Entrypoint names are at most 15 characters.
 - **HTTP.** A plain `Ingress` in the app's `deploy/` with host `<name>.nefcloud.top` is enough (see `smart-reviewer`).
+- **Metrics.** Push OTLP to the collector in `observability`. `nefcloud/observability/README.md` (*Send metrics from an app*) lists the NetworkPolicy allows and env vars.
 
 ### SOPS for a new app
 
