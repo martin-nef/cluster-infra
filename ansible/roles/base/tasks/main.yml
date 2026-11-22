@@ -213,15 +213,18 @@
 
 # --- AppArmor: keep Ubuntu's runc profile off ---
 
-# Ubuntu's apparmor update (4.0.1really4.0.1-0ubuntu0.24.04.9, installed by
-# unattended-upgrades on 2026-11-18) ships /etc/apparmor.d/runc, an
-# unconfined-mode profile. With runc running under it, containerd's container
-# profile is applied as a stack, so every container process gets the label
+# Ubuntu ships /etc/apparmor.d/runc, an unconfined-mode profile whose only job
+# is to let runc create user namespaces under Ubuntu's userns restriction.
+# Since the apparmor update installed by unattended-upgrades on 2026-11-18
+# (...24.04.5 -> .9; most likely .8, LP: #2162134, which changed how
+# unconfined profiles are compiled), containerd's container profile is
+# stacked onto it, so every container process gets the label
 # cri-containerd.apparmor.d//&unconfined. containerd's profile only allows
 # signals from peers with exactly its own label, so signals inside containers
 # are denied: valheim's bootstrap hung on rsync, tini could not forward
 # SIGTERM, Mono could not suspend its threads (valheim#10). The runc profile
-# confines nothing (unconfined mode), so disabling it loses no protection;
+# confines nothing (unconfined mode) and k3s runs runc as root, which the
+# userns restriction doesn't apply to, so disabling it loses no protection;
 # containers get the plain, enforced cri-containerd.apparmor.d profile again.
 # Containers started before this keep the stacked label until they restart.
 - name: Check for Ubuntu's runc AppArmor profile
