@@ -4,7 +4,7 @@ Important! Do not `kubectl apply`. Everything under nefcloud/ is managed through
 
 ## What goes where
 
-This repo holds cluster-wide config only: the nodes, cluster services every app shares (Flux, Traefik, Longhorn, Tailscale, the ops broker), and, for each Flux app, what Flux needs plus the app's limits:
+This repo holds cluster-wide config only: the nodes, cluster services every app shares (Flux, Traefik, Tailscale, the ops broker), and, for each Flux app, what Flux needs plus the app's limits:
 
 - `nefcloud/apps/<name>.yaml` (generated, see below) and its line in `flux-apps`;
 - `nefcloud/<name>/`: the namespace, ResourceQuota, RBAC (including what the app's deployer may manage) and NetworkPolicy. These are the limits on the app and its agents, so they stay out of the app's own reach.
