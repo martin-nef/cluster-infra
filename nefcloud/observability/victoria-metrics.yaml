@@ -1,5 +1,5 @@
-# local-path, as night-shift/pvc.yaml: no Longhorn replicas of data that is
-# only nice to have. It pins the volume to the node the pod first lands on, so
+# local-path, as night-shift/pvc.yaml: no replicas of data that is only nice
+# to have. It pins the volume to the node the pod first lands on, so
 # the Deployment prefers anything but shitbox and its game servers (as
 # claude-remote does). Claude Code's counters are a few hundred series, so 5Gi
 # holds the 90 days of retention below many times over.
