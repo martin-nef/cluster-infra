@@ -7,3 +7,21 @@
 # internet-adjacent pod. Drop that binding.
 clusterRoleBinding:
   create: false
+
+# Run as the image's unprivileged headlamp user with no way to gain privileges
+# back. Replaces the chart's default container securityContext (which only sets
+# the user and privileged: false).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 100
+  runAsGroup: 101
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 100
+  runAsGroup: 101
+  privileged: false
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]

@@ -1,8 +1,9 @@
 # Default deny, then one policy per exception, as in claude-remote/ and
-# pr-reviewer/. The task Jobs run an agent on repos' code, so they get the
-# internet over HTTPS (GitHub, Anthropic, package registries) and inside only
-# the metrics endpoints in observability: no LAN, tailnet, other cluster
-# services or API server. No ingress at all.
+# pr-reviewer/. The pod runs an agent on repos' code, so it gets the internet
+# over HTTPS (GitHub, Anthropic, package registries), the API server (the
+# worker's read-only kubectl) and the metrics endpoints in observability, and
+# nothing else inside: no LAN, tailnet or other cluster services. No ingress at
+# all.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -32,8 +33,8 @@ spec:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
 ---
-# The apiserver, for the runner only: it manages the Jobs and files OpsRequests. Endpoints are the
-# k3s servers' tailnet IPs (see claude-remote/networkpolicy.yaml).
+# The apiserver, for the night shift pod: only its worker container has a token (read-only, and
+# OpsRequests). Endpoints are the k3s servers' tailnet IPs (see claude-remote/networkpolicy.yaml).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

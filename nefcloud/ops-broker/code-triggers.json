@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "The one list of changes that always need a human, whoever opened the PR and whatever any reviewer said.",
+    "The ops broker applies it on every sync (README, 'Code triggers'): a PR head that matches keeps its",
+    "human-review status pending, and an agent's PR gets a flag filed for you. paths are Python regexes",
+    "matched against every path a PR touches (a rename's old one too). kinds are matched against the",
+    "kind: lines of every YAML file it touches, before and after. repos limits a rule to those repos,",
+    "and a rule without repos holds everywhere. trusted: who may author a PR or its commits without that",
+    "alone needing you; the PR reviewer and the ops App review and sign off, they don't author code.",
+    "This file is itself a trigger: changing it needs your sign-off."
+  ],
+  "trusted": [
+    "martin-nef",
+    "martin-nef-agent[bot]",
+    "nefcloud-agent[bot]",
+    "cv-agent[bot]",
+    "dependabot[bot]"
+  ],
+  "triggers": [
+    {"what": "CI or GitHub config (.github/)", "paths": ["^\\.github/"]},
+    {"what": "secrets or keys",
+     "paths": ["(^|/)\\.sops\\.yaml$", "\\.secrets?\\.ya?ml$", "(^|/)secrets?\\.ya?ml$", "\\.(agekey|pem|key)$"],
+     "kinds": ["Secret", "SealedSecret"]},
+    {"what": "RBAC, NetworkPolicy, admission or quota",
+     "paths": ["(^|/)(rbac|networkpolicy|network-?polic(y|ies)|admission|quota)[^/]*\\.ya?ml$"],
+     "kinds": ["Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding", "NetworkPolicy", "ResourceQuota",
+               "LimitRange", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding",
+               "MutatingAdmissionPolicy", "MutatingAdmissionPolicyBinding", "ValidatingWebhookConfiguration",
+               "MutatingWebhookConfiguration"]},
+    {"what": "an agent's sandbox or the ops broker", "repos": ["cluster-infra"],
+     "paths": ["^nefcloud/(claude-remote|ops-broker|pr-reviewer|night-shift)/"]},
+    {"what": "an agent's policy or merge gate", "repos": ["claude-remote"],
+     "paths": ["^deploy/policy/", "^image/bin/agent-pr$"]},
+    {"what": "an agent's profile or limits", "repos": ["agent-harness"],
+     "paths": ["^harness/(profile|paths|steps)\\.py$", "^profiles/"]},
+    {"what": "the PR reviewer (any change to it)", "repos": ["pr-reviewer"], "paths": ["."]}
+  ]
+}

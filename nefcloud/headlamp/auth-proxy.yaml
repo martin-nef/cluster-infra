@@ -17,6 +17,13 @@ spec:
       labels:
         app: headlamp-auth
     spec:
+      # nginx-unprivileged's own user.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: nginx
           image: nginxinc/nginx-unprivileged:1.27-alpine

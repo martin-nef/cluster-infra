@@ -28,12 +28,16 @@ One verb isn't an action but a sign-off (README, "Human review required"):
                         every open PR head of every repo the ops App is
                         installed on, but HUMAN_REVIEW_EXCLUDE (sync_loop).
   github-require-human-review
-                        Makes that check required on a repo, with the one
-                        standard ruleset. The broker files it for each
-                        covered repo that lacks one.
+                        Retired, rejected at admission: the broker keeps
+                        the ruleset that requires the check itself.
 
-The broker checks the target exists, marks the request Pending, and sends an
-ntfy notification linking to PUBLIC_URL/r/<name>. That page is behind Traefik's
+The broker checks the target exists and marks the request Pending. Requests
+are grouped by spec.session, the requester's own label for the session that
+asked, titled by its latest spec.workstream (the theme) and the requesters
+that named it; without a session, by requester and workstream. Within a group, only
+the newest request per subject shows (subject). Notifications are debounced (announce): one ntfy summary
+of everything new, by group, linking to each group's page, PUBLIC_URL/g/<id>,
+which lists its requests, PUBLIC_URL/r/<name>. The pages are behind Traefik's
 oauth2-proxy (Google) login; the broker runs the action only when someone in
 ALLOWED_APPROVERS presses Approve there. Nothing in the notification can
 approve anything, so it doesn't matter who else reads the topic: the agent can
@@ -52,7 +56,7 @@ Requests from agents that run while you sleep (README, "Async requesters"):
 - Each requester named in PENDING_CAPS has its own pending slots; everyone else
   shares MAX_PENDING. So a night agent can't take the interactive agent's slots.
 - During QUIET_HOURS, a request that will still be waiting when they end isn't
-  announced; one digest lists them all when they end.
+  announced; the first summary after them lists them all.
 - Approving checks the target again, so a request approved hours later never
   acts on a target that has since been replaced or moved on.
 
@@ -66,6 +70,7 @@ It is never run late or retried.
 Stdlib only, so it runs on a stock python image from a ConfigMap.
 """
 import base64
+import contextlib
 import hashlib
 import html
 import itertools
@@ -99,6 +104,11 @@ PENDING_CAPS = {u.strip(): int(n) for u, _, n in
                 (c.rpartition("=") for c in os.environ.get("PENDING_CAPS", "").split(",") if c.strip())}
 QUIET_HOURS = os.environ.get("QUIET_HOURS", "")  # "22:00-07:00" in QUIET_TZ; empty: never quiet
 QUIET_TZ = os.environ.get("QUIET_TZ", "UTC")
+# Notifications are debounced: a new request waits NOTIFY_DEBOUNCE seconds for
+# others to join it, and one summary goes out at most every NOTIFY_INTERVAL,
+# unless waiting that long would cost a request half of the time it has left.
+NOTIFY_DEBOUNCE = int(os.environ.get("NOTIFY_DEBOUNCE", "120"))
+NOTIFY_INTERVAL = int(os.environ.get("NOTIFY_INTERVAL", "900"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 SHORT_RETENTION_DAYS = int(os.environ.get("SHORT_RETENTION_DAYS", "7"))
 NTFY_URL = os.environ.get("NTFY_URL", "")  # https://ntfy.sh/<topic>; empty: no notifications
@@ -112,11 +122,19 @@ REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "martin-nef-reviewer[bot]")  #
 # its request on the ops page. Yours; never an agent's.
 HUMAN_REVIEWERS = {r.strip() for r in os.environ.get("HUMAN_REVIEWERS", GITHUB_OWNER).split(",") if r.strip()}
 SYNC_EVERY = int(os.environ.get("HUMAN_REVIEW_SYNC_SECONDS", "60"))
-# Every this many passes, the sync also looks for repos without the ruleset.
+# Requesters whose spec.session is a claude.ai Remote Control session: their
+# groups link to it.
+CLAUDE_AI_SESSIONS = {r.strip() for r in os.environ.get("CLAUDE_AI_SESSIONS", "").split(",") if r.strip()}
+# The one list of changes that always need a human (code-triggers.json, README
+# "Code triggers"), read on every pass. Unreadable holds every PR.
+CODE_TRIGGERS = os.environ.get("CODE_TRIGGERS", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                             "code-triggers.json"))
+# (repo, head sha) -> code_trigger's answer: a head's files and commits don't change.
+TRIGGER_CACHE = {}
+# The broker's own requests, for its pending slots (PENDING_CAPS).
+SELF = f"system:serviceaccount:{os.environ.get('POD_NAMESPACE', 'ops-broker')}:ops-broker"
+# Every this many passes, the sync also puts each repo's ruleset right.
 RULESET_EVERY = 10
-# At most this many github-require-human-review requests wait at once, so the
-# broker's pending slots stay free for flags.
-RULESET_BATCH = 5
 # repo -> its open PR numbers, as the last sync saw them. tidy keeps a
 # github-human-review request while its PR may still be open: deleting it
 # would make the PR read as never flagged.
@@ -135,6 +153,7 @@ POLL = 5  # seconds between scans of the queue
 # (running takes seconds); younger ones may still be running in another pod.
 STRANDED_AFTER = 60
 NAME = re.compile(r"[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?")
+GROUP = re.compile(r"/g/[0-9a-f]{12}")
 
 # Where each target kind lives in the API.
 KINDS = {
@@ -161,7 +180,7 @@ VERBS = {
     "create-sops-age-key": {"Secret"},
 }
 SOPS_KEY = re.compile(r"[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?-sops-age")
-GITHUB_VERBS = set(githubops.VERBS)
+GITHUB_VERBS = set(githubops.VERBS) | set(githubops.RETIRED)
 USER_VERBS = set(githubops.USER_VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
 POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
@@ -236,6 +255,134 @@ def requester(req):
     return req["spec"].get("requester", "")
 
 
+def session(req):
+    """The requester's session: the Claude session for claude-remote, the
+    workstream's session for the night shift. Its requests are one group."""
+    return req["spec"].get("session", "")
+
+
+def group_key(req):
+    """The group a request files itself under: (None, session), or without a
+    session (older clients), (requester, workstream). A session's group is the
+    session alone: its work spans requesters (the agent, the broker's flags for
+    it), and each request shows its own."""
+    if session(req):
+        return None, session(req)
+    return requester(req), req["spec"].get("workstream", "")
+
+
+# A request's subject, by verb: a group shows only the newest request per
+# subject. Not listed: a GitHub verb's subject is its repo, a cluster verb's its
+# target. A new verb only adds a line here if its subject is something else.
+SUBJECTS = {
+    "github-human-review": lambda s: ("PR", s["github"]["repo"], s["github"]["pr"]),
+    "github-commit-workflows": lambda s: ("branch", s["github"]["repo"], s["github"].get("branch")),
+}
+
+
+def subject(req):
+    s = req["spec"]
+    if s["verb"] in SUBJECTS:
+        return SUBJECTS[s["verb"]](s)
+    if s["verb"] in GITHUB_VERBS:
+        return "repo", s["github"]["repo"]
+    t = s["target"]
+    return t["kind"], t["namespace"], t["name"]
+
+
+def group_keys(items):
+    """{request name: its group key}. What the broker files itself (code
+    triggers, the reviewer's flags) joins the session that last filed a request
+    for the same subject (the PR); unmatched, its own group."""
+    owner = {}
+    for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"]):
+        if session(r) and requester(r) != SELF:
+            owner[subject(r)] = group_key(r)
+    return {r["metadata"]["name"]: owner.get(subject(r), group_key(r)) if requester(r) == SELF else group_key(r)
+            for r in items}
+
+
+def group_id(key):
+    """A short, URL-safe name for a group: /g/<id>."""
+    return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:12]
+
+
+def agent_name(who):
+    """A requester as people say it: system:serviceaccount:night-shift:runner
+    is night-shift/runner, and claude-remote:claude-remote is claude-remote."""
+    if who.startswith("system:serviceaccount:"):
+        ns, _, sa = who[len("system:serviceaccount:"):].partition(":")
+        return ns if ns == sa else f"{ns}/{sa}"
+    return who or "unknown requester"
+
+
+def theme(key, reqs):
+    """What the group is about: its workstream, or a session's latest one
+    (reqs newest first). Not from what the broker filed into it."""
+    if key[0] is not None:
+        return key[1]
+    return next((r["spec"]["workstream"] for r in reqs
+                 if session(r) == key[1] and r["spec"].get("workstream")), "")
+
+
+def workers(key, reqs):
+    """Who the group's work is from: its requester, or the requesters that
+    named the session, newest first. More than one shows: the session is the
+    agents' own label, and the stamped requesters are what can't be faked."""
+    if key[0] is not None:
+        return [key[0]]
+    return list(dict.fromkeys(requester(r) for r in reqs if session(r) == key[1]))
+
+
+def group_title(key, reqs):
+    """<theme> - <worker>, or the worker alone."""
+    t, w = theme(key, reqs), ", ".join(agent_name(who) for who in workers(key, reqs))
+    return f"{t} - {w}" if t else w
+
+
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+TAGGED = re.compile(rf"(?:session|cse)_(01[{BASE58}]{{22}})")
+
+
+def session_url(key, reqs):
+    """A claude.ai Remote Control session's page, for a session named by a
+    requester in CLAUDE_AI_SESSIONS; else None. Built here from the id, never
+    taken from the request. claude.ai's id, session_01<base58>, is the same 128
+    bits as the session's own CLAUDE_CODE_SESSION_ID (a UUID): either works."""
+    if key[0] is not None or not CLAUDE_AI_SESSIONS & set(workers(key, reqs)):
+        return None
+    sid = key[1]
+    if m := TAGGED.fullmatch(sid):
+        return f"https://claude.ai/code/session_{m.group(1)}"
+    if not UUID.fullmatch(sid):
+        return None
+    n, out = int(sid.replace("-", ""), 16), ""
+    for _ in range(22):
+        n, d = divmod(n, 58)
+        out = BASE58[d] + out
+    return f"https://claude.ai/code/session_01{out}"
+
+
+def groups(items, keys=None):
+    """{group key: its requests, newest first}. keys: group_keys of every
+    request, when items is only some of them."""
+    keys = keys or group_keys(items)
+    out = {}
+    for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"], reverse=True):
+        out.setdefault(keys[r["metadata"]["name"]], []).append(r)
+    return out
+
+
+def by_subject(reqs):
+    """reqs (newest first) by subject: one list per subject, newest first,
+    in the order of each subject's newest request."""
+    out = {}
+    for r in reqs:
+        out.setdefault(json.dumps(subject(r)), []).append(r)
+    return list(out.values())
+
+
 def ttl(req):
     """Seconds it may wait for a decision: the requester's choice, capped."""
     return min(int(req["spec"].get("ttlSeconds") or REQUEST_TTL), MAX_TTL)
@@ -283,7 +430,7 @@ def quiet_until(t=None):
 
 
 def held(req, t=None):
-    """Whether to save its notification for the digest: it's quiet now, and the
+    """Whether to save its notification for after the quiet hours: it's quiet now, and the
     request will still be waiting when it stops being quiet. One that would
     expire before then is announced now, since it's only worth anything now."""
     until = quiet_until(t)
@@ -317,12 +464,13 @@ def target_path(spec):
     return KINDS[t["kind"]].format(ns=t["namespace"], name=t["name"])
 
 
-def check(req):
+def check(req, tok=None):
     """Look the target up. Returns (why it can't be run or None, the target's
-    UID). Raises on transient API errors, so the next scan tries again."""
+    UID). Raises on transient API errors, so the next scan tries again.
+    tok: an approval's own GitHub token (decide_token)."""
     spec = req.get("spec", {})
     if spec.get("verb") in GITHUB_VERBS:
-        return check_github(spec), None
+        return check_github(spec, tok), None
     target = spec.get("target", {})
     if target.get("kind") not in VERBS.get(spec.get("verb"), ()):
         return f"verb {spec.get('verb')!r} can't target kind {target.get('kind')!r}", None
@@ -346,32 +494,31 @@ def check(req):
     return None, obj["metadata"].get("uid")
 
 
-def check_github(spec):
+def check_github(spec, tok=None):
     if not isinstance(spec.get("github"), dict) or "target" in spec:
         return "GitHub verbs take spec.github, not spec.target"
     try:
         if MINTER.status() is None:
             return f"the GitHub verbs need the ops App, which isn't set up: {PUBLIC_URL}/github"
         repo = spec["github"].get("repo")
-        if spec.get("verb") == "github-require-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
-            # Its PRs get no status, so a required check would hold them all.
-            return f"{repo} is in HUMAN_REVIEW_EXCLUDE: the broker sets no human-review status there"
+        if spec.get("verb") == "github-require-human-review":
+            return "retired: the broker keeps the human-review ruleset on every repo itself, every 10 minutes"
         if spec.get("verb") == "github-human-review" and repo in HUMAN_REVIEW_EXCLUDE:
             # Fully automatic: nothing would hold the PR while you looked, so
             # you're not asked, and the agent learns that at once.
             return f"{repo} is in HUMAN_REVIEW_EXCLUDE: its PRs merge without human review, so nobody is asked"
-        return githubops.check(MINTER, spec)
+        return githubops.check(MINTER, spec, tok)
     except githubops.GitHubError as e:
         if e.transient:
             raise
         return f"GitHub: {e}"
 
 
-def run(req, code=None):
+def run(req, code=None, tok=None):
     """Run the action. Returns a message for the status. Raises K8sError when
     the API server refused it, Unknown when it may have taken effect."""
     try:
-        return act(req["spec"], req["status"].get("targetUID"), code)
+        return act(req["spec"], req["status"].get("targetUID"), code, tok)
     except (K8sError, githubops.GitHubError) as e:
         if e.transient:
             raise Unknown(str(e)) from None
@@ -380,9 +527,9 @@ def run(req, code=None):
         raise Unknown(repr(e)) from None
 
 
-def act(spec, uid, code=None):
+def act(spec, uid, code=None, tok=None):
     if spec["verb"] in GITHUB_VERBS:
-        return githubops.act(MINTER, spec, code)
+        return githubops.act(MINTER, spec, code, tok)
     verb, path = spec["verb"], target_path(spec)
     if verb == "create-sops-age-key":
         return create_sops_age_key(spec["target"]["name"])
@@ -425,7 +572,8 @@ def human_review_requests(items, repo):
 def human_review_state(head, reqs):
     """(status state, description, whether a request covers this head) for a PR
     head, from its human-review requests, oldest first. The newest decides:
-    only your sign-off of exactly this head clears it."""
+    only your sign-off of exactly this head clears it. State None: a sign-off
+    is running (Approved), which sets the status itself, so leave it as it is."""
     if not reqs:
         return "success", "not flagged", False
     last = reqs[-1]
@@ -435,8 +583,13 @@ def human_review_state(head, reqs):
     if p == "Succeeded":
         return "success", f"signed off by {last['status'].get('decidedBy', 'a human')}", True
     if p == "Denied":
-        return "pending", f"denied by {last['status'].get('decidedBy', 'a human')}: change it and flag it again", True
-    if p in ("", "Pending", "Approved"):
+        # failure, not pending: the check shows red, and agent-pr reports it blocked, not settling.
+        return "failure", f"denied by {last['status'].get('decidedBy', 'a human')}: change it and flag it again", True
+    if p == "Approved":
+        # The run sets success before the request is Succeeded: writing pending
+        # now would undo it (cluster-infra#67). tidy ends a stranded one as Unknown.
+        return None, "being signed off", True
+    if p in ("", "Pending"):
         return "pending", f"human review required: {reason}", True
     if p == "Expired":
         # Not covered any more, so the reviewer's flag, if it still stands, is filed again.
@@ -446,14 +599,23 @@ def human_review_state(head, reqs):
     return "pending", f"flag {p.lower()} without a sign-off: flag it again", True
 
 
-def file_human_review(repo, pr, head, reason):
-    """File a request for the reviewer's flag. The admission policy stamps this
-    broker as the requester; the reason says whose flag it is."""
+def review_url(reqs):
+    """The ops page of a PR's newest human-review request, or None if it has
+    none: the human-review check's Details link."""
+    return f"{PUBLIC_URL}/r/{reqs[-1]['metadata']['name']}" if reqs else None
+
+
+def file_human_review(repo, pr, head, reason, whose="reviewer"):
+    """File a request for the reviewer's flag or a code trigger. The admission
+    policy stamps this broker as the requester; the reason says whose flag it is."""
+    by, workstream = ((REVIEWER_LOGIN, "PR reviewer's flags") if whose == "reviewer"
+                      else ("code trigger", "Code triggers"))
     k8s("POST", REQUESTS, {
         "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
         "metadata": {"generateName": "github-human-review-", "namespace": NAMESPACE},
         "spec": {"verb": "github-human-review", "github": {"repo": repo, "pr": pr, "headSHA": head},
-                 "reason": f"{REVIEWER_LOGIN}: {reason}"[:2000], "ttlSeconds": MAX_TTL},
+                 "reason": f"{by}: {reason}"[:1000], "ttlSeconds": MAX_TTL,
+                 "workstream": workstream},
     }, content_type="application/json")
     print(json.dumps({"time": stamp(), "event": "filed", "action": f"github-human-review {GITHUB_OWNER}/{repo}#{pr}",
                       "reason": reason}), flush=True)
@@ -476,77 +638,127 @@ def signed_off_on_github(repo, pr, head, login):
             audit("succeeded", req, by=f"{login} (GitHub review)")
 
 
-def file_require(repo):
-    k8s("POST", REQUESTS, {
-        "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
-        "metadata": {"generateName": "github-require-human-review-", "namespace": NAMESPACE},
-        "spec": {"verb": "github-require-human-review", "github": {"repo": repo},
-                 "reason": (f"{repo} has no human-review ruleset, so a PR an agent flags there can still be "
-                            "merged. Approving adds the standard one."), "ttlSeconds": MAX_TTL},
-    }, content_type="application/json")
-    print(json.dumps({"time": stamp(), "event": "filed",
-                      "action": f"github-require-human-review {GITHUB_OWNER}/{repo}"}), flush=True)
-
-
 def sync_human_review(rulesets=False):
     """One pass over every repo the ops App is installed on, but
     HUMAN_REVIEW_EXCLUDE: every open PR head gets its human-review status, and
-    reviewer flags with no request yet get one. rulesets: also file a
-    github-require-human-review request for repos without the ruleset."""
+    reviewer flags with no request yet get one. rulesets: also put every
+    installed repo's human-review ruleset right (reconcile_rulesets)."""
     if MINTER.status() is None:
         return
     items = list_requests()
     clean = True
+    try:
+        rules = githubops.load_triggers(CODE_TRIGGERS)
+    except (OSError, ValueError, KeyError, TypeError, re.error) as e:
+        rules = None  # fail closed: every PR but yours waits for you
+        print(f"code triggers: can't read {CODE_TRIGGERS}: {e!r}; holding every PR", flush=True)
+    if len(TRIGGER_CACHE) > 5000:
+        TRIGGER_CACHE.clear()
+    # Filed flags count against the broker's own slots: when they're full, a
+    # flag waits for a later pass instead of being rejected for good.
+    room = [pending_cap(SELF)[1] - sum(1 for r in items if requester(r) == SELF and phase(r) in ("", "Pending"))]
     with MINTER.token(None, "github-human-review", "list") as tok:
-        repos = [(r, n) for r, n in githubops.installed(tok) if r not in HUMAN_REVIEW_EXCLUDE]
+        installed = githubops.installed(tok)
+    repos = [(r, n) for r, n in installed if r not in HUMAN_REVIEW_EXCLUDE]
     for repo, open_count in repos:
         if not open_count:
             OPEN_PRS[repo] = set()  # no open issues or PRs: nothing to set, and no token minted for it
+            clean = end_closed_flags(repo, items) and clean
             continue
         reqs = human_review_requests(items, repo)
 
         def recheck(pr, head, repo=repo):
             return human_review_state(head, human_review_requests(list_requests(), repo).get(pr, []))
+
+        def triggers(tok, pr, repo=repo):
+            key = (repo, pr["head"]["sha"])
+            if rules is None:
+                return githubops.code_trigger(tok, repo, pr, None, HUMAN_REVIEWERS)
+            if key not in TRIGGER_CACHE:
+                TRIGGER_CACHE[key] = githubops.code_trigger(tok, repo, pr, rules, HUMAN_REVIEWERS)
+            return TRIGGER_CACHE[key]
         try:
             to_file, OPEN_PRS[repo], approved = githubops.sync(
                 MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck,
-                HUMAN_REVIEWERS)
-            for pr, head, reason in to_file:
-                file_human_review(repo, pr, head, reason)
+                HUMAN_REVIEWERS, link=lambda pr, head: review_url(reqs.get(pr, [])), triggers=triggers)
+            for pr, head, reason, whose in to_file:
+                if room[0] <= 0:
+                    print(f"human-review {repo}#{pr}: no free slot; filed on a later pass", flush=True)
+                    continue
+                file_human_review(repo, pr, head, reason, whose)
+                room[0] -= 1
             for pr, head, login in approved:
                 signed_off_on_github(repo, pr, head, login)
         except (githubops.GitHubError, K8sError, OSError) as e:
             clean = False
             print(f"human-review sync {repo}: {e}", flush=True)
+            continue
+        clean = end_closed_flags(repo, items) and clean
     # Only after a pass that set every status it had to: a required check the
     # broker can't set (a missing permission) would hold every PR.
     if rulesets and clean:
-        file_rulesets([r for r, _ in repos], items)
+        reconcile_rulesets([r for r, _ in installed])
 
 
-def file_rulesets(repos, items):
-    """File github-require-human-review for repos without the ruleset, up to
-    RULESET_BATCH waiting at once. A repo with any such request already, in
-    any phase, isn't asked again until retention deletes it: a Denied one
-    means no for RETENTION_DAYS (HUMAN_REVIEW_EXCLUDE says it for good)."""
-    asked = {(r["spec"].get("github") or {}).get("repo"): phase(r) for r in items
-             if r["spec"].get("verb") == "github-require-human-review"}
-    room = RULESET_BATCH - sum(1 for p in asked.values() if p in ("", "Pending"))
-    for repo in repos:
-        if room <= 0:
-            return
-        if repo in asked:
-            continue
-        try:
-            # Proof the App can set the check there: the mint fails without statuses: write.
-            with MINTER.token(repo, "github-human-review", "write"):
-                pass
-            with MINTER.token(repo, "github-require-human-review", "check") as tok:
-                if githubops.has_ruleset(tok):
+def end_closed_flags(repo, items):
+    """End the flags still waiting on a PR that has been closed or merged, so
+    they leave the page and free their slot: Rejected, as an approval of one
+    would be. Candidates are the waiting flags on PRs this pass didn't see
+    open; GitHub confirms each PR is closed (one read per PR, outside the
+    lock), since a PR opened after the pass listed them isn't in OPEN_PRS
+    either. The writes are under the lock, on a fresh list, conditional on
+    the version just read. Returns False if it couldn't finish."""
+    seen = OPEN_PRS.get(repo)
+    waiting = [r for reqs in human_review_requests(items, repo).values() for r in reqs
+               if phase(r) in ("", "Pending")]
+    numbers = {int(r["spec"]["github"]["pr"]) for r in waiting} - (seen or set())
+    if seen is None or not numbers:
+        return True
+    closed = {}
+    try:
+        with MINTER.token(repo, "github-human-review", "check") as tok:
+            for n in sorted(numbers):
+                pr = tok("GET", f"/pulls/{n}")
+                if pr["state"] != "open":
+                    closed[n] = "merged" if pr.get("merged") else "closed"
+    except (githubops.GitHubError, OSError) as e:
+        print(f"human-review {repo}: closed PRs: {e}", flush=True)
+        return False
+    with lock:
+        for req in human_review_requests(list_requests(), repo).values():
+            for r in req:
+                n = int(r["spec"]["github"]["pr"])
+                if n not in closed or phase(r) not in ("", "Pending"):
                     continue
-            file_require(repo)
-            room -= 1
-        except (githubops.GitHubError, K8sError, OSError) as e:
+                message = f"#{n} was {closed[n]}, so there is nothing to sign off"
+                try:
+                    set_status(r, phase="Rejected", finishedAt=stamp(), message=message)
+                except K8sError as e:
+                    print(f"ending {r['metadata']['name']}: {e}", flush=True)  # the next pass tries again
+                    continue
+                audit("rejected", r, reason=message)
+    return True
+
+
+def reconcile_rulesets(repos):
+    """Every installed repo's human-review ruleset back to the standard one,
+    or gone where HUMAN_REVIEW_EXCLUDE says so. No request and no skips: an
+    edited, disabled or deleted ruleset is put back on the next round. Only
+    where the App can set the status, or the check would hold every PR."""
+    app_id = MINTER.status()["app_id"]
+    for repo in repos:
+        want = repo not in HUMAN_REVIEW_EXCLUDE
+        try:
+            if want:
+                # Proof the App can set the check there: the mint fails without statuses: write.
+                with MINTER.token(repo, "github-human-review", "write"):
+                    pass
+            with MINTER.token(repo, "github-human-review", "ruleset") as tok:
+                done = githubops.reconcile_ruleset(tok, app_id, want)
+            if done:
+                print(json.dumps({"time": stamp(), "event": "ruleset", "repo": f"{GITHUB_OWNER}/{repo}",
+                                  "action": done}), flush=True)
+        except (githubops.GitHubError, OSError) as e:
             print(f"human-review ruleset {repo}: {e}", flush=True)
 
 
@@ -579,30 +791,73 @@ def create_sops_age_key(name):
     return f"created flux-system/{name}; its public key, for the app's .sops.yaml: {public}"
 
 
-def notify(req):
+def local(t):
+    """A time as you'd read it on the phone: 14:05, in QUIET_TZ."""
+    return t.astimezone(QUIET_ZONE).strftime("%H:%M")
+
+
+def md(s):
+    """Text the requester wrote, safe in ntfy's markdown: no links or
+    formatting of its own, so the only links are the ones the broker adds."""
+    # ":" too, so a URL in a reason isn't made a link either.
+    return re.sub(r"([\\`*_\[\]()<>|~:])", r"\\\1", " ".join(str(s).split()))
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+# How much of each group the summary shows; the rest is a link away.
+SUMMARY_ITEMS = 4
+SUMMARY_GROUPS = 6
+
+
+def notify(new, waiting, items):
+    """One summary for the requests not announced yet (new), grouped by
+    session, each group with a link to its page; then the groups that are only
+    still waiting. waiting: every Pending request, new ones too; items: every
+    request, for the groups' keys and titles. A newer request for the same
+    subject stands for the earlier ones."""
     if not NTFY_URL:
         return
-    url = f"{PUBLIC_URL}/r/{req['metadata']['name']}"
+    new_names = {r["metadata"]["name"] for r in new}
+    keys = group_keys(items)
+    titles = {k: group_title(k, rs) for k, rs in groups(items, keys).items()}
+    all_groups = groups(waiting, keys)
+    fresh = sorted((k for k, rs in all_groups.items() if any(r["metadata"]["name"] in new_names for r in rs)),
+                   key=lambda k: -sum(r["metadata"]["name"] in new_names for r in all_groups[k]))
+    lines = []
+    for key in fresh[:SUMMARY_GROUPS]:
+        reqs = all_groups[key]
+        added = by_subject([r for r in reqs if r["metadata"]["name"] in new_names])
+        n = sum(map(len, added))
+        older = len(reqs) - n
+        head = f"**{md(titles[key])}**: {n} new" + (f", {older} still waiting" if older else "")
+        head += f", first expires {local(min(expires(r) for r in reqs))}"
+        lines += [head, *(f"- {md(describe(rs[0]))}: {md(rs[0]['spec']['reason'][:140])}"
+                          + (f" ({len(rs) - 1} earlier)" if len(rs) > 1 else "") for rs in added[:SUMMARY_ITEMS])]
+        if len(added) > SUMMARY_ITEMS:
+            lines.append(f"- and {len(added) - SUMMARY_ITEMS} more")
+        lines += [f"[Open {md(titles[key])}]({PUBLIC_URL}/g/{group_id(key)})", ""]
+    if len(fresh) > SUMMARY_GROUPS:
+        lines += [f"…and {plural(len(fresh) - SUMMARY_GROUPS, 'more group')} with new requests.", ""]
+    still = [k for k in all_groups if k not in fresh]
+    if still:
+        lines.append("Still waiting: " + ", ".join(f"{md(titles[k])} ({len(all_groups[k])})" for k in still))
+    agents = sorted({agent_name(requester(r)) for r in new})
+    url = f"{PUBLIC_URL}/g/{group_id(fresh[0])}" if len(fresh) == 1 else f"{PUBLIC_URL}/"
+    actions = [{"action": "view", "label": f"Open {titles[k]}"[:40], "url": f"{PUBLIC_URL}/g/{group_id(k)}",
+                "clear": True} for k in fresh[:2]] if len(fresh) > 1 else []
+    actions.append({"action": "view", "label": "Review" if len(fresh) == 1 else "All requests", "url": url,
+                    "clear": True})
     send({
-        "title": f"Approve? {describe(req)}",
-        "message": req["spec"]["reason"][:300],
+        "title": f"{plural(len(new), 'ops request')} to approve, from {', '.join(agents)}"[:200],
+        "message": "\n".join(lines).strip()[:3800],
+        "markdown": True,
         "priority": 4,
-        "tags": ["rotating_light"],
+        "tags": ["inbox_tray"],
         "click": url,
-        "actions": [{"action": "view", "label": "Review", "url": url, "clear": True}],
-    })
-
-
-def notify_digest(reqs):
-    """One notification for the requests held through the quiet hours."""
-    lines = [f"{describe(r)} ({requester(r) or 'unknown requester'}), until {stamp(expires(r))}" for r in reqs]
-    send({
-        "title": f"{len(reqs)} ops request{'s' if len(reqs) != 1 else ''} waiting since the night",
-        "message": "\n".join(lines)[:1000],
-        "priority": 3,
-        "tags": ["sunrise"],
-        "click": f"{PUBLIC_URL}/",
-        "actions": [{"action": "view", "label": "Review", "url": f"{PUBLIC_URL}/", "clear": True}],
+        "actions": actions,
     })
 
 
@@ -646,6 +901,27 @@ def tidy(req):
         k8s("DELETE", f"{REQUESTS}/{req['metadata']['name']}")
 
 
+def supersede(items):
+    """Expire every github-human-review request that still waits while a newer
+    one exists for the same PR (a flag for a later head, or the same one filed
+    again). Only the newest decides the PR's status (human_review_state), so an
+    older one only clutters the queue and takes a pending slot."""
+    newest = {}
+    for r in sorted(items, key=lambda r: r["metadata"]["creationTimestamp"]):
+        g = r["spec"].get("github") or {}
+        if r["spec"].get("verb") == "github-human-review":
+            newest[(g.get("repo"), int(g.get("pr") or 0))] = r
+    stale = [r for r in items if r["spec"].get("verb") == "github-human-review" and phase(r) in ("", "Pending")
+             and newest[(r["spec"]["github"].get("repo"), int(r["spec"]["github"].get("pr") or 0))] is not r]
+
+    def expire(req):
+        n = newest[(req["spec"]["github"].get("repo"), int(req["spec"]["github"].get("pr") or 0))]
+        set_status(req, phase="Expired", finishedAt=stamp(),
+                   message=f"superseded by {n['metadata']['name']} (head {n['spec']['github']['headSHA'][:12]})")
+        audit("expired", req, reason="superseded", by=n["metadata"]["name"])
+    each(stale, expire)
+
+
 def pr_closed(req):
     """Whether the last sync saw this flag's repo, and its PR wasn't open. Not
     synced (yet, or the repo was excluded or uninstalled): kept, to be safe."""
@@ -654,11 +930,11 @@ def pr_closed(req):
     return seen is not None and int(g.get("pr") or 0) not in seen
 
 
-def admit(req, pending):
-    """Check a new request and either reject it or make it Pending. pending
-    counts the Pending requests per pool (pending_cap). Returns whether it is
-    now Pending."""
-    problem, uid = check(req)
+def admit(req, pending, checked):
+    """Reject a new request or make it Pending, given what check(req) said.
+    pending counts the Pending requests per pool (pending_cap). Returns
+    whether it is now Pending."""
+    problem, uid = checked
     pool, cap = pending_cap(requester(req))
     if problem is None and pending.get(pool, 0) >= cap:
         problem = (f"{cap} requests from {pool} already wait for a decision" if pool else
@@ -667,34 +943,48 @@ def admit(req, pending):
         set_status(req, phase="Rejected", message=problem, finishedAt=stamp())
         audit("rejected", req, reason=problem)
         return False
-    hold = held(req)
-    status = {"phase": "Pending", "specHash": spec_hash(req), "targetUID": uid, "expiresAt": stamp(expires(req)),
-              "message": f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}"
-                         + (" (announced when the quiet hours end)" if hold else "")}
-    if not hold:
-        status["notifiedAt"] = stamp()
-    set_status(req, **status)
-    audit("pending", req, reason=req["spec"]["reason"], held=hold)
-    if not hold:
-        notify(req)
+    set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid, expiresAt=stamp(expires(req)),
+               message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
+    audit("pending", req, reason=req["spec"]["reason"], workstream=req["spec"].get("workstream", ""),
+          session=session(req))
     return True
 
 
-def digest(items):
-    """Once the quiet hours are over, announce what they held, in one message.
-    Each is marked first: a lost digest only costs time, a repeated one is noise."""
-    if quiet_until() is not None:
+def announce(items):
+    """One notification for the Pending requests not announced yet, once they
+    are due (announce_at). Each is marked first: a lost summary only costs
+    time, a repeated one is noise. The last announcement is read back from the
+    requests (status.notifiedAt), so a restart doesn't send an early one."""
+    t = now()
+    waiting = [r for r in items if phase(r) == "Pending"]
+    # During the quiet hours, only those that won't last until they end.
+    new = [r for r in waiting if not r["status"].get("notifiedAt") and not held(r, t)]
+    if not new or t < announce_at(new, items):
         return
-    waiting = [r for r in items if phase(r) == "Pending" and not r["status"].get("notifiedAt")]
     marked = []
 
     def mark(req):
-        set_status(req, notifiedAt=stamp())
+        set_status(req, notifiedAt=stamp(t))
         marked.append(req)
-    each(waiting, mark)
+    each(new, mark)
     if marked:
-        audit("digest", marked[0], requests=[r["metadata"]["name"] for r in marked])
-        notify_digest(marked)
+        audit("notified", marked[0], requests=[r["metadata"]["name"] for r in marked])
+        notify(marked, waiting, items)
+
+
+def announce_at(new, items):
+    """When the unannounced requests are due: NOTIFY_DEBOUNCE after the oldest
+    of them, so a burst goes in one message, and NOTIFY_INTERVAL after the last
+    one. A request that would lose half its remaining time to the interval
+    skips it: it's only worth anything soon."""
+    t = now()
+    due = min(parse_time(r["metadata"]["creationTimestamp"]) for r in new) + timedelta(seconds=NOTIFY_DEBOUNCE)
+    sent = [parse_time(r["status"]["notifiedAt"]) for r in items if r.get("status", {}).get("notifiedAt")]
+    if sent:
+        paced = max(due, max(sent) + timedelta(seconds=NOTIFY_INTERVAL))
+        if not any(paced - t > (expires(r) - t) / 2 for r in new):
+            due = paced
+    return due
 
 
 def each(items, fn):
@@ -709,10 +999,26 @@ def each(items, fn):
 
 def scan():
     """One pass over the queue: expire, recover and delete old requests first,
-    so stale ones never take a pending slot, then admit new ones."""
+    so stale ones never take a pending slot, then admit new ones.
+
+    The checks of new requests call GitHub and can take seconds, so they run
+    outside the lock, and an approval doesn't wait for them. That's safe: a
+    check only reads, and a request's spec can't change. The writes happen
+    under the lock again, from a fresh list (the pending counts too), and each
+    is conditional on the version just read, so a request that changed in
+    between is left for the next scan."""
+    with lock:
+        each(list_requests(), tidy)
+        items = list_requests()
+        supersede(items)
+        new = [r for r in items if phase(r) == ""]
+    checked = {}
+
+    def check_new(req):
+        checked[req["metadata"]["name"]] = check(req)
+    each(new, check_new)
     with lock:
         items = sorted(list_requests(), key=lambda r: r["metadata"]["creationTimestamp"])
-        each(items, tidy)
         pending = {}
         for r in items:
             if phase(r) == "Pending":
@@ -720,11 +1026,12 @@ def scan():
                 pending[pool] = pending.get(pool, 0) + 1
 
         def admit_new(req):
-            if phase(req) == "" and admit(req, pending):
+            name = req["metadata"]["name"]
+            if phase(req) == "" and name in checked and admit(req, pending, checked[name]):
                 pool = pending_cap(requester(req))[0]
                 pending[pool] = pending.get(pool, 0) + 1
         each(items, admit_new)
-        digest(items)
+        announce(items)
 
 
 def decidable(name, seen_hash):
@@ -743,6 +1050,16 @@ def decidable(name, seen_hash):
     return req, None
 
 
+def decide_token(req):
+    """One GitHub token for a whole approval: the check again, the run and the
+    approve, instead of a mint and a revoke for each. None for a verb that
+    isn't run with an installation token. Raises GitHubError."""
+    verb = req["spec"]["verb"]
+    if verb not in githubops.VERBS or verb in USER_VERBS:
+        return None
+    return MINTER.token(req["spec"]["github"]["repo"], verb, "decide")
+
+
 def decide(name, decision, seen_hash, approver, code=None):
     """Approve (and run) or deny one request. Returns (http status, message).
     code: GitHub's OAuth code, which a USER_VERBS approval needs."""
@@ -752,44 +1069,56 @@ def decide(name, decision, seen_hash, approver, code=None):
             return refused
         if decision == "approve" and req["spec"]["verb"] in USER_VERBS and not code:
             return 400, "this one needs you to sign in to GitHub; approve it from its page"
+        tok = None
         if decision == "approve":
-            # The world may have moved on since it was admitted, hours ago for a
-            # night agent's request: check again, and never act on a replaced
-            # target or a branch that has moved.
             try:
-                problem, uid = check(req)
-            except (K8sError, githubops.GitHubError) as e:
+                tok = decide_token(req)
+            except githubops.GitHubError as e:
                 return 502, f"couldn't check the target again ({e}); try again"
-            if problem is None and uid != req["status"].get("targetUID"):
-                problem = "the target was replaced since the request (its UID changed)"
-            if problem:
-                try:
-                    set_status(req, phase="Rejected", finishedAt=stamp(),
-                               message=f"not run, the target changed since the request: {problem}")
-                except K8sError as e:
-                    return (409 if e.code == 409 else 502), f"not recorded: {e}"
-                audit("rejected", req, reason=problem, by=approver)
-                return 409, f"Not run: the target changed since the request: {problem}"
-        # The claim is conditional on the version just read: if another broker
-        # pod decided it in the meantime, this one stops here.
+        with tok or contextlib.nullcontext():
+            return decided(req, decision, approver, code, tok)
+
+
+def decided(req, decision, approver, code, tok):
+    """decide, from a request that can still be decided, under the lock."""
+    if decision == "approve":
+        # The world may have moved on since it was admitted, hours ago for a
+        # night agent's request: check again, and never act on a replaced
+        # target or a branch that has moved.
         try:
-            if decision == "deny":
-                set_status(req, phase="Denied", decidedBy=approver, decidedAt=stamp(),
-                           finishedAt=stamp(), message=f"denied by {approver}")
-                audit("denied", req, by=approver)
-                return 200, "Denied."
-            set_status(req, phase="Approved", decidedBy=approver, decidedAt=stamp(), message="running")
-        except K8sError as e:
-            return (409 if e.code == 409 else 502), f"not recorded: {e}"
-        audit("approved", req, by=approver)
-        try:
-            result = run(req, code)
-        except Unknown as e:
-            return finish(req, "Unknown", f"may or may not have taken effect ({e}); check the target",
-                          502, "Approved, but the outcome is unknown")
-        except Exception as e:
-            return finish(req, "Failed", str(e), 502, "Approved, but it failed")
-        return finish(req, "Succeeded", result, 200, "Done")
+            problem, uid = check(req, tok)
+        except (K8sError, githubops.GitHubError) as e:
+            return 502, f"couldn't check the target again ({e}); try again"
+        if problem is None and uid != req["status"].get("targetUID"):
+            problem = "the target was replaced since the request (its UID changed)"
+        if problem:
+            try:
+                set_status(req, phase="Rejected", finishedAt=stamp(),
+                           message=f"not run, the target changed since the request: {problem}")
+            except K8sError as e:
+                return (409 if e.code == 409 else 502), f"not recorded: {e}"
+            audit("rejected", req, reason=problem, by=approver)
+            return 409, f"Not run: the target changed since the request: {problem}"
+    # The claim is conditional on the version just read: if another broker
+    # pod decided it in the meantime, this one stops here.
+    try:
+        if decision == "deny":
+            set_status(req, phase="Denied", decidedBy=approver, decidedAt=stamp(),
+                       finishedAt=stamp(), message=f"denied by {approver}")
+            audit("denied", req, by=approver)
+            return 200, "Denied."
+        set_status(req, phase="Approved", decidedBy=approver, decidedAt=stamp(), message="running")
+    except K8sError as e:
+        return (409 if e.code == 409 else 502), f"not recorded: {e}"
+    audit("approved", req, by=approver)
+    try:
+        result = run(req, code, tok)
+    except Unknown as e:
+        return finish(req, "Unknown", f"may or may not have taken effect ({e}); check the target",
+                      502, "Approved, but the outcome is unknown")
+    except Exception as e:
+        return finish(req, "Failed", str(e), 502, "Approved, but it failed")
+    return finish(req, "Succeeded", result, 200, "Done")
 
 
 def finish(req, final, message, code, summary):
@@ -812,25 +1141,83 @@ def scan_loop():
         time.sleep(POLL)
 
 
+# Feedback the moment a form is sent: approving a GitHub action can take a few
+# seconds, and the reply only comes when it's done. Also stops a second tap from
+# sending a second decision. The CSP allows exactly this script, by its hash.
+SCRIPT = """document.addEventListener("submit", function (ev) {
+  if (document.body.classList.contains("busy")) { ev.preventDefault(); return; }
+  document.body.classList.add("busy");
+  var b = ev.target.querySelector("button");
+  document.querySelectorAll("button").forEach(function (x) { x.dataset.label = x.textContent; x.disabled = true; });
+  if (b) { b.textContent = b.dataset.busy || "Working…"; b.classList.add("working"); }
+});
+window.addEventListener("pageshow", function (ev) {
+  if (!ev.persisted) return;
+  document.body.classList.remove("busy");
+  document.querySelectorAll("button").forEach(function (x) {
+    x.disabled = false; x.classList.remove("working"); if (x.dataset.label) x.textContent = x.dataset.label;
+  });
+});"""
+SCRIPT_HASH = base64.b64encode(hashlib.sha256(SCRIPT.encode()).digest()).decode()
+
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Ops broker</title>
 <style>
 body{{font:16px/1.4 system-ui,sans-serif;margin:0 auto;max-width:40rem;padding:1rem;color:#1b1b1b;background:#fafafa}}
 @media(prefers-color-scheme:dark){{body{{color:#e8e8e8;background:#161616}}a{{color:#8ab4f8}}}}
-code{{font-size:1.05em}} table{{border-collapse:collapse;width:100%}} td{{padding:.3rem .5rem .3rem 0;vertical-align:top}}
-.reason{{white-space:pre-wrap;border-left:3px solid #888;padding-left:.6rem}}
-form{{display:inline}} button{{font-size:1.1rem;padding:.7rem 1.4rem;margin:.6rem .6rem 0 0;border:0;border-radius:.4rem;color:#fff}}
-.approve{{background:#1a7f37}} .deny{{background:#b42318}}
+code{{font-size:1.05em;overflow-wrap:anywhere}} table{{border-collapse:collapse;width:100%}} td{{padding:.3rem .5rem .3rem 0;vertical-align:top}}
+.reason{{white-space:pre-wrap;overflow-wrap:anywhere;border-left:3px solid #888;padding-left:.6rem}}
+form{{display:inline}} button,.button{{font-size:1.1rem;padding:.7rem 1.4rem;margin:.6rem .6rem 0 0;border:0;border-radius:.4rem;color:#fff;
+display:inline-block;text-decoration:none;font-family:inherit}}
+.approve{{background:#1a7f37}} .deny{{background:#b42318}} .review{{background:#0969da}}
+button:disabled{{opacity:.6}} button.working{{opacity:1}}
+button.working::after{{content:"";display:inline-block;width:.9em;height:.9em;margin-left:.5em;vertical-align:-.1em;
+border:2px solid #fff8;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}}
+@keyframes spin{{to{{transform:rotate(1turn)}}}}
 pre{{overflow-x:auto;font-size:.85rem;background:#8881;padding:.5rem}} .add{{color:#1a7f37}} .del{{color:#b42318}} .hunk{{color:#888}}
 .warn{{border-left:3px solid #b42318;padding-left:.6rem}}
-</style></head><body>{body}</body></html>"""
+.muted{{color:#888;font-size:.9rem}}
+details.group{{border:1px solid #8884;border-radius:.5rem;margin:.6rem 0;padding:.2rem .7rem}}
+details.group>summary{{cursor:pointer;padding:.5rem 0;list-style-position:outside}}
+.badge{{display:inline-block;background:#bf8700;color:#fff;border-radius:1rem;padding:0 .55rem;font-size:.85rem;margin-left:.3rem}}
+details.earlier{{margin:0 0 .4rem 1rem}} details.earlier>summary{{cursor:pointer;color:#888;font-size:.9rem}}
+.item{{border-top:1px solid #8883;padding:.6rem 0}}
+.item .reason{{margin:.3rem 0}}
+.clamp{{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}}
+.phase{{font-size:.85rem;padding:0 .4rem;border-radius:.3rem;background:#8882}}
+.phase.Pending{{background:#bf8700;color:#fff}} .phase.Succeeded{{background:#1a7f37;color:#fff}}
+.phase.Failed,.phase.Unknown,.phase.Denied{{background:#b42318;color:#fff}}
+</style></head><body>{body}<script>{script}</script></body></html>"""
 
 
 def e(s):
     return html.escape(str(s), quote=True)
 
 
-def request_page(req):
+def group_link(req, items):
+    """A link to the group req is in; items: every request."""
+    key = group_keys(items)[req["metadata"]["name"]]
+    return f'<a href="/g/{group_id(key)}">{e(group_title(key, groups(items)[key]))}</a>'
+
+
+def decision_forms(req, can_approve=True):
+    """Approve and Deny for a Pending request: one form each, so the decision
+    is a hidden field the script can't drop by disabling its button."""
+    s, st = req["spec"], req.get("status", {})
+    h = e(st.get("specHash", ""))
+    name = e(req["metadata"]["name"])
+    # A USER_VERBS approval goes through GitHub's sign-in first.
+    signin = '<input type=hidden name=signin value=github>' if s["verb"] in USER_VERBS else ""
+    busy = {"approve": "Opening GitHub…" if signin else "Approving…", "deny": "Denying…"}
+    return "".join(
+        f'<form method=post action="/r/{name}"><input type=hidden name=hash value="{h}">'
+        f'<input type=hidden name=decision value={d}>{signin if d == "approve" else ""}'
+        f'<button class={d} data-busy="{busy[d]}">{d.capitalize()}</button></form>'
+        for d in ("approve", "deny") if d == "deny" or can_approve)
+
+
+def request_page(req, items):
+    """items: every request, for its group."""
     s, st = req["spec"], req.get("status", {})
     github = s["verb"] in GITHUB_VERBS
     if github:
@@ -840,50 +1227,149 @@ def request_page(req):
         target = f"<code>{e(t['kind'])} {e(t['namespace'])}/{e(t['name'])}</code>"
     rows = [("Verb", f"<code>{e(s['verb'])}</code>"),
             ("Target", target),
-            ("Phase", e(st.get("phase", "new"))),
+            ("Group", group_link(req, items)),
+            ("Phase", f'<span class="phase {e(st.get("phase", ""))}">{e(st.get("phase", "new"))}</span>'),
             ("Status", e(st.get("message", ""))),
             ("Requester", e(s.get("requester") or "unknown (made without the admission policy)")),
             ("Created", e(req["metadata"]["creationTimestamp"])),
             ("Expires", e(stamp(expires(req))))]
     if st.get("decidedBy"):
         rows.append(("Decided by", e(st["decidedBy"])))
-    body = (f"<h1>{e(req['metadata']['name'])}</h1><table>"
+    body = (f"<h1>{e(describe(req))}</h1><p class=muted>{e(req['metadata']['name'])}</p><table>"
             + "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
             + "</table><p>The requester's reason (their claim, not checked):</p>"
             + f"<p class=reason>{e(s['reason'])}</p>")
     can_approve = True
     if github and st.get("phase") == "Pending":
         # What approving does, read live, so the page shows what will run: for a
-        # commit, the diff against the exact commit it will sit on. Decided
-        # requests skip it; their status says what happened.
+        # commit, the diff against the exact commit it will sit on.
         try:
             body += "<h2>What it does</h2>" + githubops.details(MINTER, s)
         except Exception as err:
             body += (f"<p class=warn>Couldn't show what this does ({e(err)}), so it can't be approved "
                      "from here. Reload, or deny it.</p>")
             can_approve = False
+    elif github:
+        # Decided: the live view would describe today's GitHub, not what was
+        # asked (a repo that now exists, a rule that's now there), so show the
+        # request itself. Its status says what happened.
+        body += "<h2>What it asked for</h2>" + githubops.asked(GITHUB_OWNER, s)
     if st.get("phase") == "Pending":
-        h = e(st.get("specHash", ""))
-        # A USER_VERBS approval goes through GitHub's sign-in first.
-        signin = '<input type=hidden name=signin value=github>' if s["verb"] in USER_VERBS else ""
-        body += "".join(
-            f'<form method=post><input type=hidden name=hash value="{h}">{signin if d == "approve" else ""}'
-            f'<button class={d} name=decision value={d}>{d.capitalize()}</button></form>'
-            for d in ("approve", "deny") if d == "deny" or can_approve)
-    return body + '<p><a href="/">All requests</a></p>'
+        body += decision_forms(req, can_approve)
+    return body + f'<p><a href="/g/{group_id(group_keys(items)[req["metadata"]["name"]])}">Its group</a>' \
+        ' · <a href="/">All requests</a></p>'
+
+
+def filed_by(req):
+    """Who filed it, for its line in a group: the stamped requester, and for the
+    broker's own flags whose they are (its workstream, which only it sets)."""
+    who = agent_name(requester(req))
+    if requester(req) == SELF and req["spec"].get("workstream"):
+        return f"{who}: {req['spec']['workstream']}"
+    return who
+
+
+def item(req, clamp=False, actions=False):
+    """One request in a list: what, its phase, why; with actions, the buttons
+    a Pending one can be decided with from the list."""
+    st, name = req.get("status", {}), e(req["metadata"]["name"])
+    p = st.get("phase", "")
+    when = f"expires {local(expires(req))}" if p == "Pending" else f"{p.lower() or 'new'}, " + local(
+        parse_time(st.get("finishedAt") or req["metadata"]["creationTimestamp"]))
+    out = (f'<div class=item><a href="/r/{name}"><code>{e(describe(req))}</code></a> '
+           f'<span class="phase {e(p)}">{e(p or "new")}</span> <span class=muted>{e(when)} · {e(filed_by(req))}</span>'
+           f'<div class="reason{" clamp" if clamp else ""}">{e(req["spec"]["reason"])}</div>')
+    if p != "Pending" and st.get("message"):
+        out += f"<div class=muted>{e(st['message'])}</div>"
+    if actions and p == "Pending":
+        if req["spec"]["verb"] in GITHUB_VERBS:
+            # Its page shows what approving does, read live (a diff, a PR): it's
+            # approved there, after you've seen it.
+            out += f'<a class="button review" href="/r/{name}">Review and approve</a>' + decision_forms(req, False)
+        else:
+            out += decision_forms(req)
+    return out + "</div>"
+
+
+def subjects(rows, limit, **kw):
+    """Each subject's newest request, the earlier ones folded under it: the
+    newest limit of them, and every waiting one. rows: by_subject lists."""
+    out = []
+    for newest, *earlier in rows:
+        out.append(item(newest, **kw))
+        if earlier:
+            shown = [r for i, r in enumerate(earlier) if i < limit or phase(r) == "Pending"]
+            n = sum(phase(r) == "Pending" for r in earlier)
+            out.append(f"<details class=earlier><summary>{len(earlier)} earlier" + (f", {n} waiting" if n else "")
+                       + "</summary>" + "".join(item(r, **kw) for r in shown) + "</details>")
+    return "".join(out)
+
+
+def split(reqs):
+    """(subjects with a request waiting, the rest), each as by_subject lists."""
+    rows = by_subject(reqs)
+    waiting = [rs for rs in rows if any(phase(r) == "Pending" for r in rs)]
+    return waiting, [rs for rs in rows if rs not in waiting]
+
+
+def group_summary(key, reqs):
+    waiting = [r for r in reqs if phase(r) == "Pending"]
+    others = len(reqs) - len(waiting)
+    badge = f"<span class=badge>{len(waiting)} waiting</span>" if waiting else ""
+    meta = (f"first expires {local(min(expires(r) for r in waiting))}" if waiting else
+            f"latest {local(parse_time(reqs[0]['metadata']['creationTimestamp']))}")
+    meta += f" · {others} decided or closed" if others else ""
+    return f"<b>{e(group_title(key, reqs))}</b>{badge}<br><span class=muted>{e(meta)}</span>"
 
 
 def index_page(items):
-    """Every request waiting for a decision, then the 30 newest others."""
-    items = sorted(items, key=lambda r: r["metadata"]["creationTimestamp"], reverse=True)
-    items = [r for r in items if phase(r) == "Pending"] + [r for r in items if phase(r) != "Pending"][:30]
-    rows = "".join(
-        f'<tr><td><a href="/r/{e(r["metadata"]["name"])}">{e(r["metadata"]["name"])}</a></td>'
-        f"<td><code>{e(describe(r))}</code></td><td>{e(requester(r).rpartition(':')[2] or '?')}</td>"
-        f"<td>{e(phase(r) or 'new')}</td></tr>"
-        for r in items)
-    return (f"<h1>Ops requests</h1><table>{rows or '<tr><td>None yet.</td></tr>'}</table>"
+    """Groups (one per session), those with requests waiting first and open,
+    then the GROUPS_SHOWN most recent others, closed. Each opens into its
+    subjects, newest request each: every subject with one waiting, and the
+    newest ITEMS_SHOWN of the rest."""
+    by = groups(items)
+    waiting = sorted((k for k, rs in by.items() if any(phase(r) == "Pending" for r in rs)),
+                     key=lambda k: min(expires(r) for r in by[k] if phase(r) == "Pending"))
+    rest = [k for k in by if k not in waiting][:GROUPS_SHOWN]  # groups() is newest first
+    out = []
+    for key in waiting + rest:
+        reqs = by[key]
+        live, done = split(reqs)
+        shown = live + done[:ITEMS_SHOWN]
+        out.append(f'<details class=group{" open" if key in waiting else ""}><summary>{group_summary(key, reqs)}'
+                   "</summary>" + subjects(shown, ITEMS_SHOWN, clamp=True)
+                   + f'<p><a href="/g/{group_id(key)}">Open the group</a>'
+                   + (f" ({len(reqs)} requests)" if len(reqs) > len(shown) else "") + "</p></details>")
+    n = sum(phase(r) == "Pending" for r in items)
+    lead = (f"<p>{plural(n, 'request')} waiting, in {plural(len(waiting), 'group')}.</p>" if n else
+            "<p>Nothing waiting.</p>")
+    return (f"<h1>Ops requests</h1>{lead}{''.join(out) or '<p>None yet.</p>'}"
             '<p><a href="/github">GitHub App</a></p>')
+
+
+GROUPS_SHOWN = 20  # decided groups on the index
+ITEMS_SHOWN = 5  # decided subjects per group, and earlier requests per subject, on the index
+GROUP_ITEMS = 100  # decided subjects, and earlier requests per subject, on a group's page
+
+
+def group_page(gid, items):
+    """One group's subjects: those with a request waiting, with its buttons,
+    then the newest GROUP_ITEMS others. None if no request is in the group."""
+    for key, reqs in groups(items).items():
+        if group_id(key) != gid:
+            continue
+        live, done = split(reqs)
+        url = session_url(key, reqs)
+        about = (f"<p class=muted>{e(', '.join(w or 'no requester recorded' for w in workers(key, reqs)))}"
+                 + (f" · session <code>{e(key[1])}</code>" if key[0] is None else "") + "</p>")
+        if url:
+            about += f'<p><a href="{e(url)}">Open the session on claude.ai</a></p>'
+        return (f"<h1>{e(group_title(key, reqs))}</h1>{about}"
+                + (f"<h2>Waiting ({sum(phase(r) == 'Pending' for r in reqs)})</h2>"
+                   + subjects(live, GROUP_ITEMS, actions=True) if live else "<p>Nothing waiting.</p>")
+                + ("<h2>Decided or closed</h2>" + subjects(done[:GROUP_ITEMS], GROUP_ITEMS) if done else "")
+                + '<p><a href="/">All requests</a></p>')
+    return None
 
 
 # Started App setups: state -> (approver, deadline). In memory: the broker is
@@ -1000,7 +1486,16 @@ def finish_authorize(approver, code, state):
         return 400, "<p>This sign-in wasn't started from an approval by you, or took too long. Approve it again.</p>"
     _, name, seen_hash, _ = started
     status, message = decide(name, "approve", seen_hash, approver, code=code)
-    return status, f'<p>{e(message)}</p><p><a href="/r/{e(name)}">Back</a></p>'
+    return status, result_page(name, message)
+
+
+def result_page(name, message):
+    """What a decision did, with the way back to the request and its group."""
+    try:
+        group = f' · <a href="/g/{group_id(group_keys(list_requests())[name])}">Its group</a>'
+    except (K8sError, KeyError):
+        group = ""
+    return f'<p>{e(message)}</p><p><a href="/r/{e(name)}">The request</a>{group} · <a href="/">All requests</a></p>'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1032,7 +1527,13 @@ class Handler(BaseHTTPRequestHandler):
                                             query.get("state", [""])[0])
                 return self.reply(status, page, html_page=True)
             if self.path.startswith("/r/"):
-                return self.reply(200, request_page(k8s("GET", f"{REQUESTS}/{self.request_name()}")), html_page=True)
+                return self.reply(200, request_page(k8s("GET", f"{REQUESTS}/{self.request_name()}"),
+                                                       list_requests()), html_page=True)
+            if GROUP.fullmatch(url.path):
+                page = group_page(url.path[len("/g/"):], list_requests())
+                if page is None:
+                    return self.reply(404, "no requests in this group (retention may have deleted them)")
+                return self.reply(200, page, html_page=True)
         except K8sError as err:
             return self.reply(404 if err.code == 404 else 502, str(err))
         self.reply(404, "not found")
@@ -1079,7 +1580,7 @@ class Handler(BaseHTTPRequestHandler):
         if decision == "approve" and form.get("signin", [""])[0] == "github":
             return self.reply(*start_authorize(name, form.get("hash", [""])[0], approver), html_page=True)
         status, message = decide(name, decision, form.get("hash", [""])[0], approver)
-        self.reply(status, f"<p>{e(message)}</p><p><a href=\"{e(self.path)}\">Back</a></p>", html_page=True)
+        self.reply(status, result_page(name, message), html_page=True)
 
     def form(self):
         """The posted form, or None if it has no length or is too large."""
@@ -1099,13 +1600,14 @@ class Handler(BaseHTTPRequestHandler):
         return name
 
     def reply(self, status, content, html_page=False, form_action="'self'"):
-        data = (PAGE.format(body=content) if html_page else content + "\n").encode()
+        data = (PAGE.format(body=content, script=SCRIPT) if html_page else content + "\n").encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8" if html_page else "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}")
+        self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{SCRIPT_HASH}'; "
+                         f"form-action {form_action}")
         self.end_headers()
         self.wfile.write(data)
 

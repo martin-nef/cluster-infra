@@ -16,12 +16,12 @@ with a third App (the "ops" App) whose key only the token minter holds:
   github-create-repo        Create a repo under the owner's account (USER_VERBS).
   github-human-review       Sign off a PR that an agent flagged as needing a
                             human: the human-review status on its head turns
-                            success. Until then sync() keeps it pending, and a
-                            required human-review check keeps the PR unmerged.
+                            success. Until then sync() keeps it pending (failure
+                            once denied), and a required human-review check
+                            keeps the PR unmerged.
   github-require-human-review
-                            Add the standard human-review ruleset (RULESET) to
-                            a repo that has none, which makes the check
-                            required there. The broker files these itself.
+                            Retired: the broker keeps the ruleset itself
+                            (reconcile_ruleset). RETIRED.
 
 Every call uses an installation token for one repo with only the permissions
 that step needs (listing the installed repos: metadata on every repo), asked of the minter sidecar (minter.py) by verb and step and
@@ -35,6 +35,7 @@ code GitHub returns to the minter, which takes the action with your token and
 revokes it. This process never sees that token either.
 """
 import base64
+import contextlib
 import difflib
 import html
 import json
@@ -48,7 +49,11 @@ GITHUB_API = "https://api.github.com"
 
 # The verbs this module runs. Their tokens' permissions are minter.TOKENS.
 VERBS = ("github-commit-workflows", "github-protect-branch", "github-rerun-workflow", "github-dispatch-workflow",
-         "github-create-repo", "github-human-review", "github-require-human-review")
+         "github-create-repo", "github-human-review")
+# Verbs no longer run, kept so the requests already made still show; admission
+# rejects new ones. github-require-human-review: drop it from here and the CRD
+# once retention has deleted the last one (by 2027-02-21).
+RETIRED = ("github-require-human-review",)
 # Run by the minter with the owner's own token (minter.USER_ACTIONS).
 USER_VERBS = ("github-create-repo",)
 # The one rule github-protect-branch applies: changes reach the branch only
@@ -68,19 +73,29 @@ RERUNNABLE = {"failure", "cancelled", "timed_out", "startup_failure"}
 # is installed on, made a required check by RULESET, pinned to the ops App: only
 # this broker sets it.
 HUMAN_REVIEW = "human-review"
+# GitHub Apps the human-review ruleset doesn't hold (CI that pushes to default
+# branches itself), by name for the reader: their App ids.
+RULESET_BYPASS_APPS = {"martin-nef-ci": 5855882}
 
 
-def ruleset(app_id):
+def ruleset(app_id, bypass_apps=True):
     """The one human-review ruleset, the same on every repo: the check is
     required on the default branch, from the ops App only, so no other App or
-    user can set it. Repo admins (you) bypass it, so you can always merge.
-    Beside the branch rule, not in it: it adds a check without rewriting it."""
+    user can set it. The broker keeps it so on every covered repo
+    (reconcile_ruleset). Repo admins (you, martin-nef, as the owner) and
+    RULESET_BYPASS_APPS bypass it. Rulesets on a personal account's repos can't
+    name a user, so you're in by your admin role. GitHub refuses an App as a
+    bypass actor where it isn't installed: bypass_apps=False is the ruleset for
+    those repos. Beside the branch rule, not in it: it adds a check without
+    rewriting it."""
     return {"name": HUMAN_REVIEW, "target": "branch", "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [{"type": "required_status_checks", "parameters": {
                 "strict_required_status_checks_policy": False,
                 "required_status_checks": [{"context": HUMAN_REVIEW, "integration_id": int(app_id)}]}}],
-            "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
+            "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+            + [{"actor_id": i, "actor_type": "Integration", "bypass_mode": "always"}
+               for i in (RULESET_BYPASS_APPS.values() if bypass_apps else ())]}
 # The marker the PR reviewer ends each review with (pr-reviewer job.py STATE_MARK).
 REVIEW_MARK = "<!-- pr-reviewer-state "
 
@@ -115,8 +130,10 @@ def api(method, path, token=None, body=None):
             return json.loads(data) if data else {}
     except urllib.error.HTTPError as e:
         try:
-            message = json.load(e).get("message", e.reason)
-        except ValueError:
+            got = json.load(e)
+            # A 422's message is only "Validation Failed"; errors says what failed.
+            message = "; ".join([str(got.get("message", e.reason))] + [str(x) for x in got.get("errors") or []])
+        except (ValueError, AttributeError):
             message = e.reason
         raise GitHubError(e.code, message) from None
 
@@ -219,9 +236,11 @@ def describe(owner, spec):
     return f"{verb} {where}"
 
 
-def check(minter, spec):
+def check(minter, spec, tok=None):
     """Why the request can't be run, or None. Raises GitHubError (transient
-    ones mean: try again on the next scan)."""
+    ones mean: try again on the next scan). tok: the approval's own token
+    (step "decide"), used and left for the caller to revoke; else one is
+    minted for the check."""
     g = spec["github"]
     if not REPO_NAME.fullmatch(g.get("repo", "")) or g["repo"] in (".", ".."):
         return f"{g.get('repo')!r} isn't a repo name"
@@ -229,9 +248,8 @@ def check(minter, spec):
         if minter.oauth() is None:
             return "creating a repo needs the App's OAuth client, which isn't set up; see /github"
         return None if existing(minter, g) is None else f"{minter.owner}/{g['repo']} already exists"
-    with minter.token(g["repo"], spec["verb"], "check") as tok:
-        repo = tok("GET")
-        return CHECKS[spec["verb"]](tok, repo, g)
+    with contextlib.nullcontext(tok) if tok else minter.token(g["repo"], spec["verb"], "check") as t:
+        return CHECKS[spec["verb"]](t, t("GET"), g)
 
 
 def existing(minter, g):
@@ -297,21 +315,59 @@ def check_human_review(tok, repo, g):
     return None
 
 
-def check_require(tok, repo, g):
-    if has_ruleset(tok):
-        return f"{g['repo']} already has a {HUMAN_REVIEW} ruleset; change it on GitHub"
-    return None
+def matches(want, got):
+    """Whether got says everything want does: dicts by want's keys (GitHub
+    adds its own, like id and _links), lists as the same items in any order."""
+    if isinstance(want, dict):
+        return isinstance(got, dict) and all(matches(v, got.get(k)) for k, v in want.items())
+    if isinstance(want, list):
+        return (isinstance(got, list) and len(got) == len(want)
+                and all(any(matches(w, x) for x in got) for w in want))
+    return want == got
 
 
-def has_ruleset(tok):
-    """Whether the repo has a ruleset named human-review. Only the name is
-    compared: one you've edited by hand is yours, and isn't replaced."""
-    return any(r.get("name") == HUMAN_REVIEW for r in pages(tok, "/rulesets?includes_parents=false"))
+def reconcile_ruleset(tok, app_id, want=True):
+    """Make the repo's human-review rulesets what they should be: the one
+    standard ruleset (want), or none (an excluded repo, whose PRs get no
+    status, so a required check would hold them all). Adds it where it's
+    missing, puts it back where it was edited or disabled, and deletes any
+    second one of that name. Where GitHub refuses the bypass Apps (422: one
+    isn't installed there), the ruleset without them is the standard one; the
+    full one is tried again each round, so installing the App adds it. Returns
+    what it changed, or None."""
+    have = [r for r in pages(tok, "/rulesets?includes_parents=false") if r.get("name") == HUMAN_REVIEW]
+    done = []
+    for r in have[1 if want else 0:]:
+        tok("DELETE", f"/rulesets/{int(r['id'])}")
+        done.append(f"deleted ruleset {r['id']}")
+    if want:
+        full, bare = ruleset(app_id), ruleset(app_id, bypass_apps=False)
+        if not have:
+            try:
+                made, note = tok("POST", "/rulesets", full), ""
+            except GitHubError as e:
+                if e.code != 422 or full == bare:
+                    raise
+                made, note = tok("POST", "/rulesets", bare), f" without the bypass Apps ({e})"
+            done.append(f"added ruleset {made.get('id')}{note}")
+        else:
+            path = f"/rulesets/{int(have[0]['id'])}"
+            got = tok("GET", path)
+            if not matches(full, got):
+                try:
+                    tok("PUT", path, full)
+                    done.append(f"restored ruleset {have[0]['id']}")
+                except GitHubError as e:
+                    if e.code != 422 or full == bare:
+                        raise
+                    if not matches(bare, got):
+                        tok("PUT", path, bare)
+                        done.append(f"restored ruleset {have[0]['id']} without the bypass Apps ({e})")
+    return "; ".join(done) or None
 
 
 CHECKS = {
     "github-human-review": check_human_review,
-    "github-require-human-review": check_require,
     "github-commit-workflows": check_commit,
     "github-protect-branch": check_protect,
     "github-rerun-workflow": check_rerun,
@@ -340,26 +396,28 @@ def protection(tok, branch):
         raise
 
 
-def act(minter, spec, code=None):
+def act(minter, spec, code=None, tok=None):
     """Run an approved request; returns a message for the status. Raises
     GitHubError when GitHub refused it (transient: it may have taken effect)
     and NothingChanged when it failed before changing anything. code: GitHub's
-    OAuth code, for USER_VERBS."""
+    OAuth code, for USER_VERBS. tok: the approval's own token (step
+    "decide"), which the caller revokes; else each step mints its own."""
     g = spec["github"]
     if spec["verb"] in USER_VERBS:
         if not code:
             raise NothingChanged("needs you to sign in to GitHub; approve it from the page")
         return minter.user_action(spec["verb"], code, g)
-    try:
-        tok = minter.token(g["repo"], spec["verb"], "run")
-    except GitHubError as e:
-        raise NothingChanged(f"no token: {e}") from None
-    with tok:
-        if spec["verb"] == "github-require-human-review":
-            return act_require(tok, minter.status()["app_id"])
-        done = ACTS[spec["verb"]](tok, g)
+    if tok is None:
+        try:
+            run = minter.token(g["repo"], spec["verb"], "run")
+        except GitHubError as e:
+            raise NothingChanged(f"no token: {e}") from None
+    else:
+        run = contextlib.nullcontext(tok)
+    with run as t:
+        done = ACTS[spec["verb"]](t, g)
     if spec["verb"] == "github-human-review":
-        done += approve_pr(minter, g)
+        done += approve_pr(minter, g, tok)
     return done
 
 
@@ -411,23 +469,16 @@ def act_human_review(tok, g):
     return f"signed off #{g['pr']} at {g['headSHA'][:12]}"
 
 
-def act_require(tok, app_id):
-    # Never a second one beside a ruleset made since the check.
-    if has_ruleset(tok):
-        raise NothingChanged(f"a {HUMAN_REVIEW} ruleset appeared since the request; left it alone")
-    made = tok("POST", "/rulesets", ruleset(app_id))
-    return f"added the {HUMAN_REVIEW} ruleset (id {made.get('id')})"
-
-
-def approve_pr(minter, g):
+def approve_pr(minter, g, tok=None):
     """After a sign-off, approve the PR on GitHub as the ops App, so the one
     approval GitHub requires is there too: a PR the reviewer flagged gets a
     comment from it, not an Approve, and its author can't approve its own.
-    A separate token and step: the sign-off (the status) stands even if this
-    fails, e.g. before the App has pull_requests: write. Returns a note."""
+    A separate call: the sign-off (the status) stands even if this fails,
+    e.g. a review GitHub refuses. Returns a note.
+    tok: the approval's own token, else one is minted for this step."""
     try:
-        with minter.token(g["repo"], "github-human-review", "approve") as tok:
-            tok("POST", f"/pulls/{int(g['pr'])}/reviews",
+        with contextlib.nullcontext(tok) if tok else minter.token(g["repo"], "github-human-review", "approve") as t:
+            t("POST", f"/pulls/{int(g['pr'])}/reviews",
                 {"commit_id": g["headSHA"], "event": "APPROVE",
                  "body": "Human review signed off on the ops page, for exactly this commit."})
     except GitHubError as e:
@@ -435,8 +486,11 @@ def approve_pr(minter, g):
     return "; approved on GitHub"
 
 
-def status_body(state, description):
-    return {"state": state, "context": HUMAN_REVIEW, "description": description[:140]}
+def status_body(state, description, url=None):
+    body = {"state": state, "context": HUMAN_REVIEW, "description": description[:140]}
+    if url:
+        body["target_url"] = url  # "Details" on the PR's check: the request's ops page
+    return body
 
 
 ACTS = {
@@ -472,6 +526,105 @@ def reviewer_flag(reviews, reviewer, head):
         return None
     # A reviewer from before `ready` asks straight away.
     return reason.strip()[:500], state.get("ready", True) is not False
+
+
+YAML_FILE = re.compile(r"\.ya?ml$", re.I)
+# A manifest's kind, as a document or a list item declares it, and as a
+# kustomize patch's target names it ("target: {kind: Role}" on one line too).
+KIND = re.compile(r"""(?:^\s*(?:-\s*)?|[{,]\s*)kind:\s*['"]?([A-Za-z0-9]+)""", re.M)
+# More YAML files than this in one PR aren't read one by one: the PR is held.
+MAX_YAML_FILES = 50
+
+
+def load_triggers(path):
+    """The code-trigger list (code-triggers.json) as {"trusted": set of logins,
+    "triggers": [(repos or None, compiled path regex, what)], "kinds":
+    [(repos or None, set of kinds, what)]}. Raises on anything unreadable: the
+    caller fails closed."""
+    with open(path) as f:
+        data = json.load(f)
+    trusted = {str(t).lower() for t in data["trusted"]}
+    rules, kinds = [], []
+    for rule in data["triggers"]:
+        repos = rule.get("repos")
+        if repos is not None and not (isinstance(repos, list) and all(isinstance(r, str) for r in repos)):
+            raise ValueError(f"{rule.get('what')}: repos must be a list of names")
+        paths, rule_kinds = rule.get("paths", []), rule.get("kinds", [])
+        if not (paths or rule_kinds) or not str(rule["what"]).strip():
+            raise ValueError("every trigger needs what, and paths or kinds")
+        if not all(isinstance(k, str) and re.fullmatch(r"[A-Za-z0-9]+", k) for k in rule_kinds):
+            raise ValueError(f"{rule['what']}: kinds must be plain kind names")
+        scope = set(repos) if repos is not None else None
+        rules += [(scope, re.compile(pattern), str(rule["what"])) for pattern in paths]
+        if rule_kinds:
+            kinds.append((scope, set(rule_kinds), str(rule["what"])))
+    return {"trusted": trusted, "triggers": rules, "kinds": kinds}
+
+
+def kinds_in(tok, path, ref):
+    """The kinds a YAML file declares at ref; empty if it isn't there. Raises
+    GitHubError when the file can't be read whole, so the caller holds the PR."""
+    try:
+        got = tok("GET", f"/contents/{urllib.parse.quote(path)}?ref={ref}")
+    except GitHubError as e:
+        if e.code == 404:
+            return set()
+        raise
+    if not isinstance(got, dict) or got.get("encoding") != "base64":
+        raise GitHubError(413, f"{path} is too large to read")
+    return set(KIND.findall(base64.b64decode(got["content"]).decode("utf-8", "replace")))
+
+
+def code_trigger(tok, repo, pr, rules, humans):
+    """(why the PR needs a human, whether to file a flag for it) from the
+    code-trigger list, or None. Your own PRs aren't checked: you wrote them.
+    rules None (the list couldn't be read) holds every other PR. A PR or
+    commit by someone not on the trusted list is held but not filed: nobody
+    automated will merge it, so you approve it on GitHub when you look. A path
+    trigger on a trusted PR is filed, so you're asked."""
+    author = (pr.get("user") or {}).get("login", "")
+    if author.lower() in {h.lower() for h in humans}:
+        return None
+    if rules is None:
+        return "the code-trigger list can't be read, so every PR waits for a human", False
+    number = pr["number"]
+    untrusted = set()
+    if author.lower() not in rules["trusted"]:
+        untrusted.add(author or "an unknown author")
+    for c in pages(tok, f"/pulls/{number}/commits"):
+        login = (c.get("author") or {}).get("login")
+        if not login or login.lower() not in rules["trusted"]:
+            untrusted.add(login or "an author with no GitHub account")
+    if untrusted:
+        return f"by {', '.join(sorted(untrusted))}, not on the trusted list: approve it on GitHub", False
+    hits = {}
+    files = pages(tok, f"/pulls/{number}/files")
+    for f in files:
+        for path in filter(None, (f.get("filename"), f.get("previous_filename"))):
+            for repos, pattern, what in rules["triggers"]:
+                if (repos is None or repo in repos) and pattern.search(path):
+                    hits.setdefault(what, path)
+    # What a YAML file declares, before and after: a Role whose rules change,
+    # or a Secret whatever the file is called. Only when a kind rule applies here.
+    kind_rules = [(kinds, what) for repos, kinds, what in rules.get("kinds", []) if repos is None or repo in repos]
+    yaml = [f for f in files if YAML_FILE.search(f.get("filename", "")) or YAML_FILE.search(f.get("previous_filename") or "")]
+    if kind_rules and yaml:
+        if len(yaml) > MAX_YAML_FILES:
+            return f"touches {len(yaml)} YAML files, too many to read for their kinds", True
+        head, base = pr["head"]["sha"], (pr.get("base") or {}).get("sha")
+        for f in yaml:
+            found = set()
+            if f.get("status") != "removed":
+                found |= kinds_in(tok, f["filename"], head)
+            if base and f.get("status") != "added":
+                found |= kinds_in(tok, f.get("previous_filename") or f["filename"], base)
+            for kinds, what in kind_rules:
+                matched = sorted(found & kinds)
+                if matched:
+                    hits.setdefault(what, f"{f['filename']}: {', '.join(matched)}")
+    if hits:
+        return "touches " + "; ".join(f"{w} ({p})" for w, p in hits.items()), True
+    return None
 
 
 def human_approval(reviews, humans, head):
@@ -531,17 +684,20 @@ class Lazy:
         return self.tok(*args)
 
 
-def sync(minter, repo, desired, reviewer, recheck=None, humans=()):
+def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, triggers=None):
     """Set the human-review status on every open PR head in repo to what
     desired(pr number, head sha) says, or success where one of humans approved
-    the head on GitHub. Returns (the reviewer's flags that have no request yet:
-    [(pr number, head sha, reason)], the open PR numbers, the GitHub approvals:
-    [(pr number, head sha, login)]).
+    the head on GitHub. Returns (the flags that have no request yet: [(pr
+    number, head sha, reason, whose: "reviewer" or "code")], the open PR
+    numbers, the GitHub approvals: [(pr number, head sha, login)]).
+    triggers(tok, pr) is code_trigger's answer for an unflagged head.
     desired returns (state, description, flagged), flagged meaning a request
-    covers this head. recheck(pr number, head sha) is asked again, from fresh
+    covers this head; state None leaves the head's status as it is (a sign-off
+    is running). recheck(pr number, head sha) is asked again, from fresh
     requests, before a success is turned pending: a sign-off may have landed
-    since desired's were read. Reads with a read-only token; one that can write
-    statuses is minted only if a status has to change."""
+    since desired's were read. link(pr number, head sha) is the status's
+    target_url (the request's ops page), or None. Reads with a read-only token;
+    one that can write statuses is minted only if a status has to change."""
     to_file, numbers, approved = [], set(), []
     with minter.token(repo, "github-human-review", "sync") as tok, \
             Lazy(lambda: minter.token(repo, "github-human-review", "write")) as write:
@@ -549,22 +705,32 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=()):
             number, head = pr["number"], pr["head"]["sha"]
             numbers.add(number)
             state, description, flagged = desired(number, head)
+            if state is None:
+                continue
             reason = None
             # Already signed off, or nothing to look at: no reviews read.
-            reviews = pages(tok, f"/pulls/{number}/reviews") if state == "pending" or not flagged else []
+            # failure: you denied it, but approving the head on GitHub still signs it off.
+            held = state in ("pending", "failure")
+            reviews = pages(tok, f"/pulls/{number}/reviews") if held or not flagged else []
             login = human_approval(reviews, humans, head)
             if not flagged:
                 flag = reviewer_flag(reviews, reviewer, head)
+                trigger = triggers(tok, pr) if triggers else None
                 if flag:
                     reason, ready = flag
                     if ready:
                         if not login:  # you've already looked: nothing to file
-                            to_file.append((number, head, reason))
+                            to_file.append((number, head, reason, "reviewer"))
                         state, description = "pending", f"human review required: {reason}"
                     else:
                         # Held, but nobody is pinged until the author has done what's required.
                         state, description = "pending", f"human review after the required changes: {reason}"
-            if state == "pending" and login:
+                elif trigger:
+                    reason, fileable = trigger
+                    if fileable and not login:
+                        to_file.append((number, head, reason, "code"))
+                    state, description = "pending", f"human review required: {reason}"
+            if state in ("pending", "failure") and login:
                 # Worded as human_review_state words the request it signs off,
                 # so the next pass writes nothing.
                 state, description = "success", f"signed off by {login} (GitHub review)"
@@ -572,10 +738,14 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=()):
                     approved.append((number, head, login))
             current = tok("GET", f"/commits/{head}/status")
             mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
-            if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
+            if mine and mine[0].get("state") == "success" and state in ("pending", "failure") and not reason and recheck:
                 state, description, _ = recheck(number, head)
-            if not mine or (mine[0].get("state"), mine[0].get("description")) != (state, description[:140]):
-                write("POST", f"/statuses/{head}", status_body(state, description))
+                if state is None:
+                    continue
+            url = link(number, head) if link else None
+            if not mine or ((mine[0].get("state"), mine[0].get("description"), mine[0].get("target_url") or None)
+                            != (state, description[:140], url)):
+                write("POST", f"/statuses/{head}", status_body(state, description, url))
     return to_file, numbers, approved
 
 
@@ -611,14 +781,6 @@ def details(minter, spec):
             return details_commit(tok, web, g)
         if spec["verb"] == "github-human-review":
             return details_human_review(tok, web, g)
-        if spec["verb"] == "github-require-human-review":
-            return (f"<p>Adds the standard <code>{HUMAN_REVIEW}</code> ruleset to "
-                    f"{link(web + '/settings/rules', g['repo'])}, which has none now. A PR into "
-                    f"<code>{e(repo['default_branch'])}</code> then needs the <code>{HUMAN_REVIEW}</code> check, "
-                    "set only by the ops App: green unless an agent flagged the PR and you haven't signed it off. "
-                    "You bypass it as the repo's admin. The broker already keeps the check on every open PR "
-                    "there, so nothing waits on a check that never comes.</p>"
-                    f"<pre>{e(json.dumps(ruleset(minter.status()['app_id']), indent=2))}</pre>")
         if spec["verb"] == "github-protect-branch":
             return (f"<p>Adds this rule to {link(web + '/settings/branches', repo['default_branch'])}, "
                     "which has none now: changes only through a PR with one approval. You can still "
@@ -637,6 +799,39 @@ def details(minter, spec):
         return (f"<p>Runs {link(f'{web}/blob/{branch}/{workflow['path']}', workflow['name'])} on "
                 f"<code>{e(branch)}</code>, with its secrets.</p>"
                 + (f"<table>{inputs}</table>" if inputs else "<p>No inputs.</p>"))
+
+
+def asked(owner, spec):
+    """HTML of what a request asked for, from the request alone: for one that
+    has been decided, when details() would describe GitHub as it is now."""
+    g = spec["github"]
+    web = f"https://github.com/{owner}/{g['repo']}"
+    verb = spec["verb"]
+    if verb == "github-commit-workflows":
+        files = "".join(
+            f"<p><code>{e(f['path'])}</code>: deleted</p>" if f.get("delete") else
+            f"<p><code>{e(f['path'])}</code>:</p><pre>{e(f.get('content', ''))}</pre>" for f in g["files"])
+        return (f"<p>A commit on {link(f'{web}/tree/{g['branch']}', g['branch'])}, on top of "
+                f"{link(f'{web}/commit/{g['baseSHA']}', g['baseSHA'][:12])}:</p><pre>{e(g['message'])}</pre>{files}")
+    if verb == "github-human-review":
+        return (f"<p>A sign-off of {link(f'{web}/pull/{int(g['pr'])}', f'{g['repo']}#{int(g['pr'])}')} at "
+                f"{link(f'{web}/commit/{g['headSHA']}', g['headSHA'][:12])}.</p>")
+    if verb == "github-require-human-review":
+        return f"<p>The standard <code>{HUMAN_REVIEW}</code> ruleset on {link(web + '/settings/rules', g['repo'])}.</p>"
+    if verb == "github-protect-branch":
+        return (f"<p>The standard rule on the default branch of {link(web + '/settings/branches', g['repo'])}:</p>"
+                f"<pre>{e(json.dumps(PROTECTION, indent=2))}</pre>")
+    if verb == "github-rerun-workflow":
+        return f"<p>A re-run of the failed jobs of {link(f'{web}/actions/runs/{int(g['runID'])}', f'run {int(g['runID'])}')}.</p>"
+    if verb == "github-dispatch-workflow":
+        inputs = "".join(f"<tr><td><code>{e(k)}</code></td><td><code>{e(v)}</code></td></tr>"
+                         for k, v in sorted(g.get("inputs", {}).items()))
+        return (f"<p>A run of {link(f'{web}/actions/workflows/{g['workflow']}', g['workflow'])} on the default "
+                "branch.</p>" + (f"<table>{inputs}</table>" if inputs else "<p>No inputs.</p>"))
+    if verb == "github-create-repo":
+        return (f"<p>{'A private' if g.get('private', True) else 'A public'} repo {link(web, f'{owner}/{g['repo']}')}"
+                + (f", described as <q>{e(g['description'])}</q>" if g.get("description") else "") + ".</p>")
+    return f"<p><code>{e(describe(owner, spec))}</code></p>"
 
 
 def details_human_review(tok, web, g):

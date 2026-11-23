@@ -56,12 +56,36 @@ class TestTokens(MinterBase):
             # User verbs run with your token, not an installation token.
             # human-review also has the sync steps (the statuses on every open PR)
             # and approve (your sign-off approves the PR).
-            expected = {"check"} if verb in githubops.USER_VERBS else {"check", "run"}
-            self.assertEqual(set(steps), expected | ({"list", "sync", "write", "approve"} if verb == "github-human-review" else set()), verb)
+            # decide: a whole approval's token.
+            expected = {"check"} if verb in githubops.USER_VERBS else {"check", "run", "decide"}
+            self.assertEqual(set(steps), expected | ({"list", "sync", "write", "approve", "ruleset"} if verb == "github-human-review" else set()), verb)
             for perms in steps.values():
                 # Each step's permissions are within what the App was created with.
                 self.assertLessEqual(perms.keys(), minter.PERMISSIONS.keys(), verb)
             self.assertTrue(all(v == "read" for v in steps["check"].values()), verb)
+
+    def test_decide_is_check_run_and_approve_in_one(self):
+        self.assertEqual(minter.TOKENS["github-human-review"]["decide"],
+                         {"pull_requests": "write", "statuses": "write"})
+        self.assertEqual(minter.TOKENS["github-commit-workflows"]["decide"],
+                         {"contents": "write", "workflows": "write"})
+        self.assertEqual(minter.TOKENS["github-dispatch-workflow"]["decide"],
+                         {"actions": "write", "contents": "read"})
+
+    def test_installation_is_looked_up_once(self):
+        self.minter.token("web", "github-protect-branch", "check")
+        self.minter.token("web", "github-protect-branch", "run")
+        lookups = [c for c in self.gh.calls if c[1] == "/users/owner/installation"]
+        self.assertEqual(len(lookups), 1)
+        self.assertEqual(len(self.gh.tokens), 2)
+
+    def test_installed_again_looks_it_up_again(self):
+        self.minter.token("web", "github-protect-branch", "check")
+        self.gh.fail[("POST", "/app/installations/9/access_tokens")] = githubops.GitHubError(404, "Not Found")
+        self.minter.token("web", "github-protect-branch", "check")
+        lookups = [c for c in self.gh.calls if c[1] == "/users/owner/installation"]
+        self.assertEqual(len(lookups), 2)
+        self.assertEqual(len(self.gh.tokens), 2)
 
     def test_permissions_come_from_the_table(self):
         self.minter.token("web", "github-protect-branch", "run")

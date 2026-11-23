@@ -35,9 +35,14 @@ os.environ.update(
     MAX_PENDING="2",
     RETENTION_DAYS="90",
     GITHUB_OWNER="owner",
+    # Announced on the scan that admits them, unless a test says otherwise.
+    NOTIFY_DEBOUNCE="0",
+    NOTIFY_INTERVAL="0",
 )
 import broker  # noqa: E402  (reads the environment above at import)
 import minter  # noqa: E402
+
+NOTIFY = broker.notify  # Base mocks it
 
 APPROVER = "boss@example.test"
 
@@ -78,6 +83,13 @@ class FakeAPI:
             raise self.fail.pop((method, path))
         if path == broker.REQUESTS and method == "GET":
             return {"items": copy.deepcopy(list(self.requests.values()))}
+        if path == broker.REQUESTS and method == "POST":
+            # As the API server and the admission policy make it.
+            name = f"{body['metadata']['generateName']}{len(self.requests)}"
+            self.requests[name] = {"metadata": {"name": name, "resourceVersion": str(next(self.versions)),
+                                                "creationTimestamp": broker.stamp()},
+                                   "spec": {**copy.deepcopy(body["spec"]), "requester": broker.SELF}}
+            return copy.deepcopy(self.requests[name])
         if path.startswith(broker.REQUESTS + "/"):
             name, _, sub = path[len(broker.REQUESTS) + 1:].partition("/")
             if name not in self.requests:
@@ -170,9 +182,13 @@ class FakeGitHub:
                           "html_url": "https://github.test/owner/web/pull/5", "user": {"login": "agent[bot]"}}}
         self.reviews = {5: []}
         self.pr_files = {5: [{"filename": "rbac.yaml", "additions": 3, "deletions": 0}]}
+        self.pr_commits = {5: [{"author": {"login": "agent[bot]"}}]}
+        self.files_at = {}  # (path, ref) -> a file's text at that commit
         self.statuses = {}  # sha -> [status], newest first
         self.installed = [{"name": "web", "open_issues_count": 1}]  # what the ops App is installed on
-        self.rulesets = []
+        self.rulesets = {}  # repo -> its rulesets, as GET /rulesets/<id> shows them
+        self.next_ruleset = 76
+        self.no_bypass_apps = set()  # repos the bypass Apps aren't installed on
 
     def __call__(self, method, path, token=None, body=None, basic=None, base=None):
         self.calls.append((method, path, body))
@@ -206,12 +222,26 @@ class FakeGitHub:
         if route == "/installation/repositories":
             n = int(dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("page", 1))
             return {"repositories": copy.deepcopy(self.installed[(n - 1) * 100:n * 100])}
-        if route.startswith("/repos/owner/") and route.endswith("/rulesets"):  # one list for every repo
-            if method == "POST":
-                self.rulesets.append({**body, "id": 77})
-                return {"id": 77}
-            n = int(dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("page", 1))
-            return copy.deepcopy(self.rulesets[(n - 1) * 100:n * 100])
+        m = re.fullmatch(r"/repos/owner/([^/]+)/rulesets(?:/(\d+))?", route)
+        if m:  # repo -> [ruleset]
+            have = self.rulesets.setdefault(m[1], [])
+            if method in ("POST", "PUT") and m[1] in self.no_bypass_apps and any(
+                    a["actor_type"] == "Integration" for a in body["bypass_actors"]):
+                raise broker.githubops.GitHubError(422, "Validation Failed; Actor must be installed")
+            if m[2] is None and method == "POST":
+                self.next_ruleset += 1
+                have.append({**copy.deepcopy(body), "id": self.next_ruleset, "_links": {}})
+                return {"id": self.next_ruleset}
+            if m[2] is None:
+                n = int(dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("page", 1))
+                return [{"id": r["id"], "name": r["name"]} for r in have[(n - 1) * 100:n * 100]]
+            (i,) = [i for i, r in enumerate(have) if r["id"] == int(m[2])]
+            if method == "DELETE":
+                del have[i]
+                return {}
+            if method == "PUT":
+                have[i] = {**copy.deepcopy(body), "id": int(m[2])}
+            return copy.deepcopy(have[i])
         if route == REPO and method == "GET":
             return {"default_branch": self.default}
         sub = route[len(REPO):]
@@ -228,8 +258,12 @@ class FakeGitHub:
                 return copy.deepcopy(self.branches[name])
         if sub.startswith("/contents/"):
             path_ = urllib.parse.unquote(sub[len("/contents/"):])
-            if path_ in self.files:
-                return {"content": base64.b64encode(self.files[path_].encode()).decode()}
+            ref = dict(urllib.parse.parse_qsl(path.partition("?")[2])).get("ref")
+            text = self.files_at.get((path_, ref))
+            if text is None and not any(k[0] == path_ for k in self.files_at):
+                text = self.files.get(path_)  # a file with one version, whatever the ref
+            if text is not None:
+                return {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
         if sub == f"/git/commits/{BASE}":
             return {"tree": {"sha": "basetree"}}
         if sub == "/git/trees" and method == "POST":
@@ -249,7 +283,10 @@ class FakeGitHub:
         if sub.startswith("/pulls/") and method == "GET":
             number, _, rest = sub[len("/pulls/"):].partition("/")
             if int(number) in self.pulls:
-                found = {"": self.pulls, "reviews": self.reviews, "files": self.pr_files}[rest][int(number)]
+                found = {"": self.pulls, "reviews": self.reviews, "files": self.pr_files,
+                         "commits": self.pr_commits}[rest].get(int(number), [])
+                if rest == "commits" and int(number) not in self.pr_commits:
+                    found = [{"author": {"login": "agent[bot]"}}]
                 return page(found) if isinstance(found, list) else copy.deepcopy(found)
         if sub.startswith("/commits/") and sub.endswith("/status"):
             return {"statuses": copy.deepcopy(self.statuses.get(sub.split("/")[2], []))}
@@ -312,7 +349,8 @@ class MinterBase(unittest.TestCase):
                   mock.patch.object(minter, "created", None),
                   mock.patch.object(minter, "created_oauth", None),
                   mock.patch.object(minter, "OAUTH_DIR", os.path.join(d, "oauth")),
-                  mock.patch.object(minter, "audit", mock.Mock())):
+                  mock.patch.object(minter, "audit", mock.Mock()),
+                  mock.patch.dict(minter.INSTALLATIONS, clear=True)):
             p.start()
             self.addCleanup(p.stop)
         server = minter.serve(sock)
@@ -397,7 +435,43 @@ class TestScan(Base):
             self.api.add(f"r{i}", "flux-reconcile", "Kustomization", "flux-system", "web", age=10 - i)
         broker.scan()
         self.assertEqual([self.api.status(f"r{i}")["phase"] for i in range(3)], ["Pending", "Pending", "Rejected"])
-        self.assertEqual(self.notify.call_count, 2)
+        self.notify.assert_called_once()  # one summary of both
+        self.assertEqual([r["metadata"]["name"] for r in self.notify.call_args[0][0]], ["r0", "r1"])
+
+    def during_check(self, fn):
+        """broker.check as usual, after fn() runs where the check runs."""
+        real = broker.check
+
+        def check(req, *args):
+            fn()
+            return real(req, *args)
+        return mock.patch.object(broker, "check", check)
+
+    def test_checks_run_outside_the_lock(self):
+        # So an approval never waits for a scan's calls to GitHub.
+        held = []
+        with self.during_check(lambda: held.append(broker.lock.locked())):
+            st = self.admit("r1", "rollout-restart", "Deployment", "app", "web")
+        self.assertEqual((held, st["phase"]), ([False], "Pending"))
+
+    def test_a_slot_taken_during_the_checks_counts(self):
+        self.admit("old", "flux-reconcile", "Kustomization", "flux-system", "web")
+
+        def another():  # MAX_PENDING=2: this takes the last slot
+            self.api.add("other", "flux-reconcile", "Kustomization", "flux-system", "web", phase="Pending")
+        with self.during_check(another):
+            st = self.admit("new", "flux-reconcile", "Kustomization", "flux-system", "web")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("already wait", st["message"])
+
+    def test_a_request_changed_during_its_check_is_left_alone(self):
+        def change():
+            req = self.api.requests["r1"]
+            req["status"] = {"phase": "Expired"}
+            req["metadata"]["resourceVersion"] = str(next(self.api.versions))
+        with self.during_check(change):
+            st = self.admit("r1", "rollout-restart", "Deployment", "app", "web")
+        self.assertEqual(st["phase"], "Expired")
 
     def test_stale_new_requests_expire_before_taking_slots(self):
         # After a broker outage: three stale unadmitted requests and a fresh one.
@@ -439,6 +513,26 @@ class TestScan(Base):
         self.api.add("recent-junk", "delete-pod", "Pod", "app", "web-1", age=6 * 86400, phase="Rejected")
         broker.scan()
         self.assertEqual(sorted(self.api.requests), ["recent", "recent-junk"])
+
+
+    def flag(self, name, pr, head, age, **status):
+        self.api.add(name, "github-human-review", "Pod", "app", "x", age=age, **status)
+        spec = self.api.requests[name]["spec"]
+        del spec["target"]
+        spec["github"] = {"repo": "web", "pr": pr, "headSHA": head}
+
+    def test_a_newer_flag_for_the_same_pr_expires_the_waiting_one(self):
+        self.flag("old", 5, BASE, 20, phase="Pending", expiresAt=broker.stamp(broker.now() + timedelta(hours=1)))
+        self.flag("unadmitted", 5, BASE, 15)
+        self.flag("new", 5, MOVED, 10, phase="Succeeded")
+        self.flag("other-pr", 6, BASE, 30, phase="Pending")
+        broker.scan()
+        for name in ("old", "unadmitted"):
+            st = self.api.status(name)
+            self.assertEqual(st["phase"], "Expired")
+            self.assertIn("superseded by new (head bbbbbbbbbbbb)", st["message"])
+        self.assertEqual(self.api.status("new")["phase"], "Succeeded")
+        self.assertEqual(self.api.status("other-pr")["phase"], "Pending")
 
 
 class TestDecide(Base):
@@ -636,7 +730,7 @@ class TestHTTP(Served, Base):
         status, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("/r/waiting", body)
-        self.assertEqual(body.count("/r/done"), 30)
+        self.assertEqual(body.count("/r/done"), broker.ITEMS_SHOWN)  # one group; the rest is on its page
 
     def test_page_escapes_the_reason(self):
         self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
@@ -644,7 +738,7 @@ class TestHTTP(Served, Base):
         broker.scan()
         status, body = self.request("GET", "/r/r1")
         self.assertEqual(status, 200)
-        self.assertNotIn("<script>", body)
+        self.assertNotIn("<script>alert", body)
         self.assertIn("&lt;script&gt;", body)
         self.assertIn('name=decision value=approve', body)
 
@@ -663,6 +757,77 @@ class TestHTTP(Served, Base):
         self.assertEqual(self.request("POST", "/r/r1", origin="https://evil.test", form=form)[0], 403)
         self.assertEqual(self.api.status("r1")["phase"], "Pending")
         self.assertEqual(self.api.actions(), [])
+
+    def add_in(self, name, who, workstream=None, **status):
+        self.api.add(name, "rollout-restart", "Deployment", "app", "web", **status)
+        spec = self.api.requests[name]["spec"]
+        spec["requester"] = who
+        if workstream:
+            spec["workstream"] = workstream
+
+    def test_index_groups_by_agent_and_workstream(self):
+        with mock.patch.object(broker, "MAX_PENDING", 10):
+            self.add_in("a1", AGENT, "fix valheim")
+            self.add_in("a2", AGENT, "fix valheim")
+            self.add_in("b1", AGENT, "ci")
+            self.add_in("n1", NIGHT, "roadmap-42", phase="Succeeded")
+            broker.scan()
+        status, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("3 requests waiting, in 2 groups.", body)
+        self.assertEqual(body.count("<details class=group open>"), 2)
+        self.assertEqual(body.count("<details class=group>"), 1)  # nothing waiting: closed
+        self.assertIn("<b>fix valheim - claude-remote</b><span class=badge>2 waiting</span>", body)
+        self.assertLess(body.index("fix valheim"), body.index("roadmap-42"))
+        for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
+            self.assertIn(f'href="/g/{broker.group_id(key)}"', body)
+
+    def test_group_page_decides_each_request(self):
+        with mock.patch.object(broker, "MAX_PENDING", 10):
+            self.add_in("a1", AGENT, "fix valheim")
+            self.add_in("a2", AGENT, "fix valheim")
+            self.add_in("b1", AGENT, "ci")
+            broker.scan()
+        gid = broker.group_id((AGENT, "fix valheim"))
+        status, body = self.request("GET", f"/g/{gid}")
+        self.assertEqual(status, 200)
+        self.assertIn("Waiting (2)", body)
+        self.assertNotIn("/r/b1", body)
+        for name in ("a1", "a2"):
+            self.assertIn(f'<form method=post action="/r/{name}">', body)
+        self.assertEqual(body.count("name=decision value=approve"), 2)
+        h = self.api.status("a1")["specHash"]
+        status, body = self.request("POST", "/r/a1", form={"decision": "approve", "hash": h})
+        self.assertEqual(status, 200)
+        self.assertIn(f'href="/g/{gid}">Its group', body)
+        self.assertEqual(self.api.status("a1")["phase"], "Succeeded")
+        self.assertEqual(self.api.status("a2")["phase"], "Pending")
+        self.assertEqual(self.request("GET", "/g/000000000000")[0], 404)
+        self.assertEqual(self.request("GET", "/g/../r")[0], 404)
+
+    def test_buttons_give_feedback_and_the_csp_allows_only_that_script(self):
+        self.admit("r1", "rollout-restart", "Deployment", "app", "web")
+        conn = http.client.HTTPConnection(*self.server.server_address)
+        conn.request("GET", "/r/r1", headers={"X-Auth-Request-Email": APPROVER})
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        csp = resp.getheader("Content-Security-Policy")
+        scripts = re.findall(r"<script>(.*?)</script>", body, re.S)
+        self.assertEqual(len(scripts), 1)
+        digest = base64.b64encode(__import__("hashlib").sha256(scripts[0].encode()).digest()).decode()
+        self.assertIn(f"script-src 'sha256-{digest}'", csp)
+        self.assertIn('data-busy="Approving…"', body)
+        # The decision is a hidden field: disabling the button can't drop it.
+        self.assertIn("<input type=hidden name=decision value=approve>", body)
+
+    def test_a_decided_request_keeps_its_reason(self):
+        self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
+        self.api.requests["r1"]["spec"]["reason"] = "long " * 150 + "end"
+        broker.scan()
+        broker.decide("r1", "deny", self.api.status("r1")["specHash"], APPROVER)
+        self.assertEqual(self.api.status("r1")["phase"], "Denied")
+        body = self.request("GET", "/r/r1")[1]
+        self.assertIn("long " * 150 + "end", body)
 
     def test_path_cannot_escape_the_queue(self):
         for path in ("/r/..%2F..%2Fsecrets", "/r/..", "/r/a/b"):
@@ -744,7 +909,8 @@ class TestGitHubScan(GitHubBase):
 
 class TestGitHubDecide(GitHubBase):
     def assertWrites(self, permissions):
-        """The approval re-checks with read tokens, then runs with one write token."""
+        """The scan checks with read tokens; the approval re-checks and runs with
+        one token of its own (step decide)."""
         *checks, run = self.gh.tokens
         self.assertEqual(run, (["web"], permissions))
         for repos, perms in checks:
@@ -768,7 +934,7 @@ class TestGitHubDecide(GitHubBase):
              "content": COMMIT["files"][0]["content"]}]})
         self.assertEqual(commit[2]["parents"], [BASE])
         self.assertEqual(ref[2], {"sha": "c" * 40, "force": False})
-        self.assertEqual(len(self.gh.revoked), 3)  # every token: the checks' on admission and approval, and the run's
+        self.assertEqual(len(self.gh.revoked), 2)  # every token: the check's on admission, and the approval's
 
     def test_delete_is_a_null_sha(self):
         self.approve("github-commit-workflows", **{**COMMIT, "files": [{"path": ".github/workflows/ci.yml", "delete": True}]})
@@ -828,7 +994,7 @@ class TestGitHubDecide(GitHubBase):
         self.assertEqual(st["phase"], "Succeeded")
         self.assertEqual(self.gh.writes(), [("POST", f"{REPO}/actions/workflows/image.yml/dispatches",
                                              {"ref": "main", "inputs": {"tag": "1.2"}})])
-        self.assertWrites({"actions": "write"})
+        self.assertWrites({"actions": "write", "contents": "read"})
 
 
 class TestGitHubHTTP(Served, GitHubBase):
@@ -841,6 +1007,27 @@ class TestGitHubHTTP(Served, GitHubBase):
         self.assertIn("ci: build &lt;arm64&gt;", body)
         self.assertIn("with this repo's secrets", body)
         self.assertIn("value=approve", body)
+
+    def test_a_decided_request_still_says_what_it_asked_for(self):
+        self.admit_github("r1", "github-commit-workflows", **COMMIT)
+        h = self.api.status("r1")["specHash"]
+        self.assertEqual(broker.decide("r1", "deny", h, APPROVER)[0], 200)
+        status, body = self.request("GET", "/r/r1")
+        self.assertEqual(status, 200)
+        self.assertIn("What it asked for", body)
+        self.assertIn("ci: build &lt;arm64&gt;", body)
+        self.assertIn(".github/workflows/ci.yml", body)
+        self.assertIn("pull_request", body)
+        self.assertNotIn("value=approve", body)
+
+    def test_a_group_page_sends_github_approvals_to_their_own_page(self):
+        self.admit_github("r1", "github-commit-workflows", **COMMIT)
+        gid = broker.group_id(broker.group_key(self.api.requests["r1"]))
+        status, body = self.request("GET", f"/g/{gid}")
+        self.assertEqual(status, 200)
+        self.assertIn('href="/r/r1">Review and approve', body)  # the diff is there, not here
+        self.assertNotIn("value=approve", body)
+        self.assertIn("value=deny", body)
 
     def test_no_approve_without_details(self):
         self.admit_github("r1", "github-rerun-workflow", repo="web", runID=7)
@@ -1015,8 +1202,7 @@ class TestAsync(Base):
         super().setUp()
         for p in (mock.patch.object(broker, "PENDING_CAPS", {AGENT: 2, NIGHT: 3}),
                   mock.patch.object(broker, "MAX_TTL", 43200),
-                  mock.patch.object(broker, "QUIET_HOURS", ""),
-                  mock.patch.object(broker, "notify_digest", mock.Mock())):
+                  mock.patch.object(broker, "QUIET_HOURS", "")):
             p.start()
             self.addCleanup(p.stop)
 
@@ -1078,14 +1264,13 @@ class TestAsync(Base):
             self.assertNotIn("notifiedAt", self.api.status("night"))
             self.assertIn("notifiedAt", self.api.status("urgent"))
             self.notify.assert_called_once()
-            self.assertEqual(self.notify.call_args[0][0]["metadata"]["name"], "urgent")
-            broker.notify_digest.assert_not_called()
-            # Morning: one digest for what the night held, once.
+            self.assertEqual([r["metadata"]["name"] for r in self.notify.call_args[0][0]], ["urgent"])
+            # Morning: one summary for what the night held, once.
             with mock.patch.object(broker, "now", return_value=broker.parse_time("2026-11-01T07:01:00Z")):
                 broker.scan()
                 broker.scan()
-            broker.notify_digest.assert_called_once()
-            self.assertEqual([r["metadata"]["name"] for r in broker.notify_digest.call_args[0][0]], ["night"])
+            self.assertEqual(self.notify.call_count, 2)
+            self.assertEqual([r["metadata"]["name"] for r in self.notify.call_args[0][0]], ["night"])
             self.assertIn("notifiedAt", self.api.status("night"))
 
     def test_quiet_hours_in_a_zone(self):
@@ -1099,7 +1284,7 @@ class TestAsync(Base):
     def test_page_shows_requester_and_expiry(self):
         self.add("r1", NIGHT, ttl=3600)
         broker.scan()
-        page = broker.request_page(self.api.requests["r1"])
+        page = broker.request_page(self.api.requests["r1"], list(self.api.requests.values()))
         self.assertIn(NIGHT, page)
         self.assertIn(self.api.status("r1")["expiresAt"], page)
         self.assertIn("night-worker", broker.index_page(list(self.api.requests.values())))
@@ -1112,36 +1297,245 @@ class TestAsync(Base):
 
 
 class TestNotify(unittest.TestCase):
-    def test_posts_a_link_not_a_decision(self):
-        req = {"metadata": {"name": "r1"},
-               "spec": {"verb": "flux-resume", "target": {"kind": "Kustomization", "namespace": "flux-system", "name": "web"},
-                        "reason": "x"}}
+    def req(self, name, who="", workstream=None, reason="x"):
+        spec = {"verb": "flux-resume", "requester": who, "reason": reason,
+                "target": {"kind": "Kustomization", "namespace": "flux-system", "name": name}}
+        if workstream:
+            spec["workstream"] = workstream
+        return {"metadata": {"name": name, "creationTimestamp": "2026-11-01T02:00:00Z"}, "spec": spec,
+                "status": {"phase": "Pending"}}
+
+    def sent(self, new, waiting, items=None):
         with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
                 mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify(req)
+            broker.notify(new, waiting, items or waiting)
         sent = urlopen.call_args[0][0]
         self.assertEqual(sent.full_url, "https://ntfy.example.test")
-        body = json.loads(sent.data)
-        self.assertEqual(body["topic"], "topic123")
-        self.assertEqual([a["action"] for a in body["actions"]], ["view"])
-        self.assertEqual(body["click"], "https://ops.example.test/r/r1")
+        return json.loads(sent.data)
 
-    def test_digest_links_to_the_list(self):
-        req = {"metadata": {"name": "r1", "creationTimestamp": "2026-11-01T02:00:00Z"},
-               "spec": {"verb": "flux-resume", "requester": "someone",
-                        "target": {"kind": "Kustomization", "namespace": "flux-system", "name": "web"}, "reason": "x"}}
-        with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
-                mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify_digest([req, req])
-        body = json.loads(urlopen.call_args[0][0].data)
+    def test_posts_links_not_decisions(self):
+        r = self.req("r1", AGENT, "fix valheim")
+        body = self.sent([r], [r])
+        self.assertEqual(body["topic"], "topic123")
+        self.assertEqual({a["action"] for a in body["actions"]}, {"view"})
+        gid = broker.group_id((AGENT, "fix valheim"))
+        self.assertEqual(body["click"], f"https://ops.example.test/g/{gid}")  # one group: straight to it
+        self.assertIn("fix valheim - claude-remote", body["message"])
+
+    def test_one_summary_grouped_by_agent_and_workstream(self):
+        a = [self.req(f"a{i}", AGENT, "fix valheim") for i in range(6)]
+        b = [self.req("b0", AGENT, "ci"), self.req("n0", NIGHT, "roadmap-42")]
+        old = self.req("o0", NIGHT, "older")
+        body = self.sent(a + b, a + b + [old])
+        self.assertEqual(body["title"], "8 ops requests to approve, from claude-remote, night-shift/night-worker")
+        msg = body["message"]
+        self.assertLess(msg.index("fix valheim"), msg.index("roadmap-42"))  # the biggest group first
+        self.assertIn("6 new", msg)
+        self.assertIn("and 2 more", msg)  # SUMMARY_ITEMS per group
+        for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
+            self.assertIn(f"(https://ops.example.test/g/{broker.group_id(key)})", msg)
+        self.assertIn("Still waiting: older - night-shift/night-worker (1)", msg)
         self.assertEqual(body["click"], "https://ops.example.test/")
-        self.assertIn("2 ops requests", body["title"])
-        self.assertIn("someone", body["message"])
+        self.assertTrue(body["markdown"])
+        self.assertEqual(len(body["actions"]), 3)
+
+    def test_the_requester_cant_add_links(self):
+        r = self.req("r1", AGENT, "[x](https://evil.test)", reason="see [here](https://evil.test) **now**")
+        msg = self.sent([r], [r])["message"]
+        self.assertNotIn("](https://evil", msg)
+        self.assertNotIn("**now**", msg)
+        self.assertIn("\\[here\\]", msg)
 
     def test_off_without_url(self):
         with mock.patch.object(broker, "NTFY_URL", ""), mock.patch("urllib.request.urlopen") as urlopen:
-            broker.notify({})
+            broker.notify([], [], [])
         urlopen.assert_not_called()
+
+
+SESSION = "b1b3da34-05d3-461e-8ad8-c05f03d16ef2"  # claude.ai's session_01Nwipye4RvcaycGKTP4dbr1
+
+
+class TestSessions(Served, Base):
+    """One group per agent session, titled <theme> - <worker>, one row per subject."""
+
+    def flag(self, name, who, pr, session=None, workstream=None, age=0, **status):
+        spec = {"verb": "github-human-review", "requester": who, "reason": f"because {name}",
+                "github": {"repo": "web", "pr": pr, "headSHA": BASE}}
+        spec.update({k: v for k, v in (("session", session), ("workstream", workstream)) if v})
+        self.api.requests[name] = {
+            "metadata": {"name": name, "resourceVersion": "1",
+                         "creationTimestamp": broker.stamp(broker.now() - timedelta(seconds=age))},
+            "spec": spec, "status": {"phase": "Pending", "specHash": "h", **status}}
+
+    def restart(self, name, who, session=None, workstream=None, age=0, target="web", **status):
+        self.api.add(name, "rollout-restart", "Deployment", "app", target, age=age, **status)
+        spec = self.api.requests[name]["spec"]
+        spec["requester"] = who
+        spec.update({k: v for k, v in (("session", session), ("workstream", workstream)) if v})
+
+    def keys(self):
+        return broker.group_keys(list(self.api.requests.values()))
+
+    def test_a_session_is_one_group_titled_by_its_latest_theme(self):
+        self.restart("a1", AGENT, "s1", "ops page", age=30, phase="Succeeded")
+        self.restart("a2", AGENT, "s1", "ops page groups", age=20, target="api", phase="Succeeded")
+        self.restart("a3", AGENT, "s1", age=10, target="db", phase="Succeeded")  # no theme: keeps the last
+        self.restart("b1", AGENT, "s2", "other", phase="Succeeded")
+        keys = self.keys()
+        self.assertEqual({keys["a1"], keys["a2"], keys["a3"]}, {(None, "s1")})
+        self.assertEqual(len(set(keys.values())), 2)
+        body = self.request("GET", "/")[1]
+        self.assertIn("<b>ops page groups - claude-remote</b>", body)
+        self.assertNotIn("<b>ops page - claude-remote</b>", body)
+        self.assertIn("succeeded, ", body)
+        self.assertIn(" · claude-remote</span>", body)  # each request shows who filed it
+
+    def test_a_session_is_one_group_whoever_files_in_it(self):
+        self.restart("a1", AGENT, "s1", "ops page", age=10, phase="Succeeded")
+        self.restart("n1", NIGHT, "s1", phase="Succeeded")
+        self.assertEqual(self.keys()["n1"], (None, "s1"))
+        # Every requester that named the session shows in its title, newest first.
+        self.assertIn("<b>ops page - night-shift/night-worker, claude-remote</b>", self.request("GET", "/")[1])
+
+    def test_without_a_session_groups_as_before(self):
+        self.restart("a1", AGENT, workstream="fix valheim", phase="Succeeded")
+        self.assertEqual(self.keys()["a1"], (AGENT, "fix valheim"))
+        self.assertIn("<b>fix valheim - claude-remote</b>", self.request("GET", "/")[1])
+
+    def test_the_brokers_flags_join_the_session_of_their_pr(self):
+        self.flag("mine", AGENT, 5, "s1", "ops page", age=30)
+        self.flag("later", AGENT, 5, "s2", "rework", age=20)
+        self.flag("trigger", broker.SELF, 5, workstream="Code triggers", age=10)
+        self.flag("other", broker.SELF, 6, workstream="Code triggers")
+        keys = self.keys()
+        self.assertEqual(keys["trigger"], (None, "s2"))  # the session that last filed for it
+        self.assertEqual(keys["other"], (broker.SELF, "Code triggers"))
+        body = self.request("GET", f"/g/{broker.group_id(keys['trigger'])}")[1]
+        self.assertIn("<h1>rework - claude-remote</h1>", body)  # the broker's workstream isn't the theme
+        self.assertIn("/r/trigger", body)
+        self.assertIn(" · ops-broker: Code triggers</span>", body)  # the broker's flag, in the agent's group
+        self.assertIn("Code triggers - ops-broker", self.request("GET", "/")[1])
+        self.assertIn(f'href="/g/{broker.group_id(keys["trigger"])}">Its group', self.request("GET", "/r/trigger")[1])
+
+    def test_one_row_per_subject_the_rest_folded_under_it(self):
+        self.flag("old", AGENT, 5, "s1", age=30, phase="Expired")
+        self.flag("mid", AGENT, 5, "s1", age=20)
+        self.flag("new", AGENT, 5, "s1", age=10)
+        self.flag("pr6", AGENT, 6, "s1")
+        body = self.request("GET", f"/g/{broker.group_id((None, 's1'))}")[1]
+        self.assertEqual(body.count("<details class=earlier>"), 1)
+        self.assertIn("<summary>2 earlier, 1 waiting</summary>", body)
+        self.assertLess(body.index("/r/new"), body.index("2 earlier"))
+        self.assertLess(body.index("2 earlier"), body.index("/r/mid"))
+        self.assertLess(body.index("/r/pr6"), body.index("/r/new"))  # the newest subject first
+        self.assertIn("Waiting (3)", body)  # each request is still decided on its own
+        self.assertEqual(body.count('class="button review"'), 3)
+
+    def test_subjects(self):
+        def subject(verb, **spec):
+            return broker.subject({"spec": {"verb": verb, **spec}})
+        gh = {"repo": "web", "pr": 5, "branch": "b", "headSHA": BASE}
+        self.assertEqual(subject("github-human-review", github=gh), ("PR", "web", 5))
+        self.assertEqual(subject("github-commit-workflows", github=gh), ("branch", "web", "b"))
+        self.assertEqual(subject("github-protect-branch", github=gh), ("repo", "web"))
+        t = {"kind": "Kustomization", "namespace": "flux-system", "name": "web"}
+        self.assertEqual(subject("flux-suspend", target=t), subject("flux-resume", target=t))
+
+    def test_a_claude_ai_session_links_to_it(self):
+        url = "https://claude.ai/code/session_01Nwipye4RvcaycGKTP4dbr1"
+        with mock.patch.object(broker, "CLAUDE_AI_SESSIONS", {AGENT}):
+            def link(sid, who=AGENT):
+                return broker.session_url((None, sid), [{"spec": {"requester": who, "session": sid}}])
+            self.assertEqual(link(SESSION), url)
+            self.assertEqual(link("cse_01Nwipye4RvcaycGKTP4dbr1"), url)
+            for bad in ("s1", "session_01Nwipye4Rv", "https://evil.test/", SESSION.upper()):
+                self.assertIsNone(link(bad), bad)
+            self.assertIsNone(link(SESSION, NIGHT))  # not a claude.ai requester
+            self.assertIsNone(broker.session_url((AGENT, "fix valheim"), []))
+            self.restart("a1", AGENT, SESSION, "ops page")
+            body = self.request("GET", f"/g/{broker.group_id((None, SESSION))}")[1]
+        self.assertIn(f'<a href="{url}">Open the session on claude.ai</a>', body)
+        self.assertIsNone(link(SESSION))  # CLAUDE_AI_SESSIONS empty
+
+    def test_the_summary_shows_the_newest_per_subject(self):
+        self.flag("mid", AGENT, 5, "s1", "ops page", age=20)
+        self.flag("new", AGENT, 5, "s1", age=10)
+        self.flag("trigger", broker.SELF, 5, workstream="Code triggers")
+        items = list(self.api.requests.values())
+        with mock.patch.object(broker, "NTFY_URL", "https://ntfy.example.test/topic123"), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            NOTIFY(items, items, items)
+        msg = json.loads(urlopen.call_args[0][0].data)["message"]
+        self.assertIn("**ops page - claude-remote**: 3 new", msg)
+        self.assertIn("because trigger (2 earlier)", msg)
+        self.assertNotIn("because mid", msg)
+
+
+class TestDebounce(Base):
+    """One notification for a burst, and at most one per NOTIFY_INTERVAL."""
+
+    def setUp(self):
+        super().setUp()
+        for p in (mock.patch.object(broker, "NOTIFY_DEBOUNCE", 120), mock.patch.object(broker, "NOTIFY_INTERVAL", 900),
+                  mock.patch.object(broker, "QUIET_HOURS", "")):
+            p.start()
+            self.addCleanup(p.stop)
+        self.t = broker.parse_time("2026-11-01T12:00:00Z")
+
+    def at(self, seconds):
+        with mock.patch.object(broker, "now", return_value=self.t + timedelta(seconds=seconds)):
+            broker.scan()
+
+    def add(self, name, at, ttl=14400):
+        self.api.add(name, "flux-reconcile", "Kustomization", "flux-system", "web")
+        self.api.requests[name]["spec"].update(requester=AGENT, ttlSeconds=ttl)
+        self.api.requests[name]["metadata"]["creationTimestamp"] = broker.stamp(self.t + timedelta(seconds=at))
+
+    def names(self, call):
+        return [r["metadata"]["name"] for r in call[0][0]]
+
+    def test_a_burst_is_one_notification(self):
+        with mock.patch.object(broker, "MAX_PENDING", 50), mock.patch.object(broker, "PENDING_CAPS", {}):
+            for i in range(20):
+                self.add(f"r{i}", at=i * 5)
+                self.at(i * 5)
+            self.notify.assert_not_called()  # the first is still waiting for others
+            self.at(125)
+        self.notify.assert_called_once()
+        self.assertEqual(len(self.notify.call_args[0][0]), 20)
+        self.assertTrue(all(self.api.status(f"r{i}").get("notifiedAt") for i in range(20)))
+
+    def test_at_most_one_per_interval(self):
+        self.add("r1", at=0)
+        self.at(0)
+        self.at(120)
+        self.assertEqual(self.notify.call_count, 1)
+        self.add("r2", at=200)
+        self.at(320)
+        self.at(900)
+        self.assertEqual(self.notify.call_count, 1)  # 120 + 900 = 1020
+        self.at(1020)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.names(self.notify.call_args), ["r2"])
+        self.assertEqual(len(self.notify.call_args[0][1]), 2)  # r1 is still waiting, and listed as such
+        self.at(2000)
+        self.assertEqual(self.notify.call_count, 2)  # nothing new
+
+    def test_a_restart_remembers_the_last_one(self):
+        self.add("r1", at=0)
+        self.at(120)
+        self.add("r2", at=200)
+        # A new broker process: nothing in memory, but r1's notifiedAt is in the queue.
+        self.at(400)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_a_short_lived_request_skips_the_interval(self):
+        self.add("r1", at=0)
+        self.at(120)
+        self.add("short", at=200, ttl=600)  # would lose most of its 10 minutes to the interval
+        self.at(320)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.names(self.notify.call_args), ["short"])
 
 
 HEAD = "h" * 40
@@ -1156,10 +1550,171 @@ def review(login, commit, state=None, at="2026-11-01T01:00:00Z"):
 class TestHumanReview(Served, GitHubBase):
     def setUp(self):
         super().setUp()
+        # A trigger list that trusts the fake agent and matches nothing, unless a test says otherwise.
+        self.triggers({"trusted": ["agent[bot]"], "triggers": []})
         for p in (mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", set()),
                   mock.patch.object(broker, "REVIEWER_LOGIN", REVIEWER)):
             p.start()
             self.addCleanup(p.stop)
+
+    def triggers(self, data):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        self.addCleanup(os.remove, path)
+        for p in (mock.patch.object(broker, "CODE_TRIGGERS", path), mock.patch.dict(broker.TRIGGER_CACHE, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def requests_filed(self):
+        return [r for r in self.api.requests.values() if r["spec"].get("workstream") == "Code triggers"]
+
+    def description(self, sha=HEAD):
+        return [s for s in self.gh.statuses.get(sha, []) if s["context"] == "human-review"][0]["description"]
+
+    def test_a_path_trigger_on_an_agents_pr_holds_it_and_files_a_flag(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [
+            {"what": "RBAC", "paths": ["(^|/)rbac[^/]*\\.ya?ml$"]},
+            {"what": "elsewhere only", "repos": ["other"], "paths": ["."]}]})
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.assertIn("human review required: touches RBAC (rbac.yaml)", self.description())
+        self.assertNotIn("elsewhere", self.description())  # a rule for another repo doesn't apply
+        filed, = self.requests_filed()
+        self.assertEqual(filed["spec"]["reason"], "code trigger: touches RBAC (rbac.yaml)")
+        self.assertEqual(filed["spec"]["github"], {"repo": "web", "pr": 5, "headSHA": HEAD})
+
+    def kind_rules(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [
+            {"what": "RBAC", "kinds": ["Role", "ClusterRoleBinding"]}, {"what": "secrets", "kinds": ["Secret"]}]})
+        self.gh.pulls[5]["base"] = {"sha": "b" * 40}
+
+    def test_a_yaml_files_kind_counts_whatever_it_is_called(self):
+        self.kind_rules()
+        self.gh.pr_files[5] = [{"filename": "deploy/app.yaml", "status": "modified"}, {"filename": "README.md"}]
+        self.gh.files_at[("deploy/app.yaml", HEAD)] = ("apiVersion: v1\nkind: ConfigMap\n---\n"
+                                                      "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\n")
+        broker.sync_human_review()
+        self.assertIn("touches RBAC (deploy/app.yaml: Role)", self.description())
+        self.assertEqual(len(self.requests_filed()), 1)
+
+    def test_kinds_before_the_change_count_too(self):
+        self.kind_rules()
+        # A Secret turned into a ConfigMap, a removed binding, a kustomize patch's target.
+        self.gh.pr_files[5] = [{"filename": "a.yaml", "status": "modified"},
+                               {"filename": "b.yml", "status": "removed"},
+                               {"filename": "kustomization.yaml", "status": "added"}]
+        self.gh.files_at.update({("a.yaml", HEAD): "kind: ConfigMap\n", ("a.yaml", "b" * 40): "kind: Secret\n",
+                                 ("b.yml", "b" * 40): "- kind: ClusterRoleBinding\n",
+                                 ("kustomization.yaml", HEAD): "patches:\n  - target: {kind: ClusterRoleBinding}\n"})
+        broker.sync_human_review()
+        self.assertIn("secrets (a.yaml: Secret)", self.description())
+        self.assertIn("RBAC (b.yml: ClusterRoleBinding)", self.description())
+        reads = [p for _, p, *_ in self.gh.calls if "/contents/" in p]
+        self.assertFalse(any("b.yml" in p and HEAD in p for p in reads))  # removed: only its base is read
+        self.assertFalse(any("kustomization" in p and "b" * 40 in p for p in reads))  # added: only its head
+
+    def test_other_kinds_and_files_dont_count(self):
+        self.kind_rules()
+        self.gh.pr_files[5] = [{"filename": "deploy/app.yaml", "status": "modified"}, {"filename": "notes.txt"}]
+        self.gh.files_at[("deploy/app.yaml", HEAD)] = "kind: Deployment\nspec: {}\n# kind: Role in a comment\n"
+        self.gh.files_at[("notes.txt", HEAD)] = "kind: Role\n"
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_yaml_it_cant_read_holds_the_pr(self):
+        self.kind_rules()
+        self.gh.pr_files[5] = [{"filename": f"f{i}.yaml", "status": "added"} for i in range(51)]
+        broker.sync_human_review()
+        self.assertIn("51 YAML files, too many to read", self.description())
+        self.gh.pr_files[5] = [{"filename": "big.yaml", "status": "added"}]
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        self.gh.files_at[("big.yaml", "n" * 40)] = "x"
+        with mock.patch.object(broker.githubops, "kinds_in", side_effect=broker.githubops.GitHubError(413, "too large")):
+            broker.sync_human_review()
+        self.assertIsNone(self.status("n" * 40))  # no status: the required check blocks the merge until it can read it
+
+    def test_a_renamed_files_old_path_counts(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [{"what": "CI", "paths": ["^\\.github/workflows/"]}]})
+        self.gh.pr_files[5] = [{"filename": "ci.yml.bak", "previous_filename": ".github/workflows/ci.yml"}]
+        broker.sync_human_review()
+        self.assertIn("touches CI (.github/workflows/ci.yml)", self.description())
+
+    def test_an_untrusted_author_or_commit_is_held_but_not_filed(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": []})
+        self.gh.pulls[5]["user"] = {"login": "stranger"}
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.assertIn("by stranger, not on the trusted list", self.description())
+        self.assertEqual(self.requests_filed(), [])  # nobody automated merges it: no ping
+        self.gh.pulls[5]["user"] = {"login": "agent[bot]"}
+        self.gh.pr_commits[5].append({"author": None})
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        broker.sync_human_review()
+        self.assertIn("an author with no GitHub account", self.description("n" * 40))
+
+    def test_your_own_prs_are_not_checked(self):
+        self.triggers({"trusted": [], "triggers": [{"what": "RBAC", "paths": ["rbac"]}]})
+        self.gh.pulls[5]["user"] = {"login": "owner"}
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_an_unreadable_list_holds_every_pr(self):
+        for bad in ("{not json", json.dumps({"trusted": []}), json.dumps({"trusted": [], "triggers": [
+                {"what": "x", "paths": ["("]}]})):
+            with self.subTest(bad=bad):
+                self.gh.statuses.clear()
+                self.triggers(bad)
+                broker.sync_human_review()
+                self.assertEqual(self.status(), "pending")
+                self.assertIn("can't be read", self.description())
+                self.assertEqual(self.requests_filed(), [])
+
+    def test_your_github_approval_clears_a_held_pr(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": []})
+        self.gh.pulls[5]["user"] = {"login": "stranger"}
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
+            self.gh.reviews[5] = [{**review("owner", HEAD), "state": "APPROVED"}]
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
+    def test_flags_wait_for_a_free_slot_instead_of_being_rejected(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [{"what": "RBAC", "paths": ["rbac"]}]})
+        with mock.patch.object(broker, "pending_cap", lambda who: (who, 0)):
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(self.requests_filed(), [])
+        broker.sync_human_review()  # a slot is free now
+        self.assertEqual(len(self.requests_filed()), 1)
+
+    def test_the_shipped_list_loads_and_holds_what_agent_pr_held(self):
+        rules = broker.githubops.load_triggers(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                                            "code-triggers.json"))
+        self.assertIn("martin-nef-agent[bot]", rules["trusted"])
+        self.assertNotIn("martin-nef-reviewer[bot]", rules["trusted"])  # it reviews, it doesn't author code
+        self.assertNotIn("martin-nef-ops[bot]", rules["trusted"])
+        kinds = {k for _, ks, _ in rules["kinds"] for k in ks}
+        self.assertTrue({"Secret", "Role", "ClusterRoleBinding", "NetworkPolicy", "ResourceQuota",
+                         "ValidatingAdmissionPolicy"} <= kinds)
+        self.assertIn("dependabot[bot]", rules["trusted"])  # its version bumps aren't held; a trigger path still is
+
+        def hit(repo, path):
+            return [w for repos, rx, w in rules["triggers"] if (repos is None or repo in repos) and rx.search(path)]
+        for repo, path in (("any", ".github/workflows/ci.yml"), ("any", ".github/dependabot.yml"),
+                           ("any", ".github/CODEOWNERS"), ("any", "deploy/secrets.yaml"), ("any", ".sops.yaml"),
+                           ("any", "deploy/rbac.yaml"), ("any", "x/networkpolicy.yaml"), ("any", "age.agekey"),
+                           ("cluster-infra", "nefcloud/ops-broker/code-triggers.json"),
+                           ("cluster-infra", "nefcloud/night-shift/pvc.yaml"), ("claude-remote", "deploy/policy/CLAUDE.md"),
+                           ("claude-remote", "image/bin/agent-pr"), ("agent-harness", "profiles/night-worker.json"),
+                           ("agent-harness", "harness/paths.py"), ("pr-reviewer", "deploy/agent/policy.md"),
+                           ("pr-reviewer", "deploy/receiver/server.py"), ("pr-reviewer", "README.md")):
+            with self.subTest(path=path):
+                self.assertTrue(hit(repo, path))
+        for repo, path in (("any", "README.md"), ("any", "docs/.github/x.yml"), ("agent-harness", "harness/shift.py"),
+                           ("other", "nefcloud/ops-broker/x.py")):
+            with self.subTest(path=path):
+                self.assertFalse(hit(repo, path))
 
     def status(self, sha=HEAD):
         mine = [s for s in self.gh.statuses.get(sha, []) if s["context"] == "human-review"]
@@ -1177,6 +1732,21 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         self.assertEqual(len(self.gh.writes()), writes)  # same status: no second write
 
+    def test_the_check_links_to_the_request(self):
+        broker.sync_human_review()
+        self.assertNotIn("target_url", self.gh.statuses[HEAD][0])  # not flagged: nothing to link
+        self.flag()
+        broker.scan()
+        broker.sync_human_review()
+        self.assertEqual(self.gh.statuses[HEAD][0]["target_url"], f"{broker.PUBLIC_URL}/r/hr1")
+        writes = len(self.gh.writes())
+        broker.sync_human_review()
+        self.assertEqual(len(self.gh.writes()), writes)  # same link: no second write
+        # A status from before links existed gets one, even though nothing else changed.
+        del self.gh.statuses[HEAD][0]["target_url"]
+        broker.sync_human_review()
+        self.assertEqual(self.gh.statuses[HEAD][0]["target_url"], f"{broker.PUBLIC_URL}/r/hr1")
+
     def test_a_flag_holds_the_pr_until_signed_off(self):
         self.flag()
         broker.scan()  # admitted: Pending
@@ -1190,6 +1760,20 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         self.assertEqual(self.status(), "success")
 
+    def test_a_denied_flag_fails_the_check(self):
+        self.flag()
+        broker.scan()
+        code, _ = broker.decide("hr1", "deny", self.api.status("hr1")["specHash"], APPROVER)
+        self.assertEqual((code, self.api.status("hr1")["phase"]), (200, "Denied"))
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "failure")  # red, not waiting for you
+        self.assertIn("denied by", self.gh.statuses[HEAD][0]["description"])
+        # Changed your mind: approving the head on GitHub still signs it off.
+        self.approve_on_github()
+        with mock.patch.object(broker, "HUMAN_REVIEWERS", {"owner"}):
+            broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+
     def test_the_sign_off_approves_the_pr_on_github(self):
         self.flag()
         broker.scan()
@@ -1198,8 +1782,9 @@ class TestHumanReview(Served, GitHubBase):
         self.assertIn("approved on GitHub", self.api.status("hr1")["message"])
         approve = [b for m, p, b in self.gh.writes() if p.endswith("/pulls/5/reviews")]
         self.assertEqual([(b["commit_id"], b["event"]) for b in approve], [(HEAD, "APPROVE")])
-        # With its own token, pull_requests: write and nothing else.
-        self.assertIn((["web"], {"pull_requests": "write"}), self.gh.tokens)
+        # With the approval's one token: the re-check, the status and the approve.
+        self.assertEqual(self.gh.tokens[-1], (["web"], {"pull_requests": "write", "statuses": "write"}))
+        self.assertEqual(len(self.gh.revoked), len(self.gh.tokens))
 
     def test_a_failed_approve_leaves_the_sign_off(self):
         self.flag()
@@ -1216,9 +1801,10 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         perms = [p for _, p in self.gh.tokens]
         self.assertIn({"pull_requests": "read"}, perms)  # the scan's check
-        self.assertIn({"pull_requests": "read", "statuses": "read"}, perms)  # sync
+        self.assertIn({"pull_requests": "read", "statuses": "read", "contents": "read"}, perms)  # sync
         self.assertIn({"statuses": "write"}, perms)  # sync, to set the status
-        self.assertTrue(all("contents" not in p and "administration" not in p for p in perms))
+        # contents only to read (a YAML file's kinds), never to write; no administration.
+        self.assertTrue(all(p.get("contents") in (None, "read") and "administration" not in p for p in perms))
 
     def test_states(self):
         def state(**status):
@@ -1229,7 +1815,7 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(state(phase="Pending")[0::2], ("pending", True))
         self.assertEqual(state(phase="Succeeded", decidedBy="boss"), ("success", "signed off by boss", True))
         self.assertEqual(state(phase="Succeeded", head="o" * 40)[0], "pending")  # pushed since
-        self.assertEqual(state(phase="Denied")[0], "pending")
+        self.assertEqual(state(phase="Denied")[0::2], ("failure", True))  # red, not waiting
         self.assertEqual(state(phase="Expired")[0::2], ("pending", False))  # the reviewer's flag is filed again
         self.assertEqual(state(phase="Rejected")[0::2], ("pending", True))  # not refiled: no loop
 
@@ -1335,7 +1921,7 @@ class TestHumanReview(Served, GitHubBase):
         with mock.patch.object(broker, "file_human_review", lambda *a: created.append(a)):
             broker.sync_human_review()
         self.assertEqual(self.status(f"{159:040d}"), "success")  # past the first 100 PRs
-        self.assertEqual(created, [("web", 150, flagged, "late")])  # past the first 100 reviews
+        self.assertEqual(created, [("web", 150, flagged, "late", "reviewer")])  # past the first 100 reviews
 
     def test_a_fresh_sign_off_isnt_overwritten_by_a_stale_read(self):
         self.flag()
@@ -1348,6 +1934,49 @@ class TestHumanReview(Served, GitHubBase):
         with mock.patch.object(broker, "list_requests", lambda: next(calls, None) or real()):
             broker.sync_human_review()
         self.assertEqual(self.status(), "success")
+
+    def test_a_sign_off_still_running_isnt_undone(self):
+        # cluster-infra#67: the run has set success, but the request is still
+        # Approved until it records Succeeded. A sync in that gap leaves it.
+        self.flag()
+        broker.scan()
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "pending")
+        self.api.requests["hr1"]["status"].update(phase="Approved", decidedBy=APPROVER, decidedAt=broker.stamp())
+        self.gh.statuses[HEAD].insert(0, {"context": "human-review", "state": "success",
+                                          "description": "signed off by a human on the ops page"})
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+        # Once it's recorded, the next pass words it as usual.
+        self.api.requests["hr1"]["status"].update(phase="Succeeded")
+        broker.sync_human_review()
+        self.assertEqual(self.status(), "success")
+        self.assertIn("signed off by", self.description())
+
+    def test_a_flag_on_a_merged_pr_is_ended(self):
+        self.flag()
+        broker.scan()
+        self.gh.pulls[5].update(state="closed", merged=True)
+        broker.sync_human_review()
+        st = self.api.status("hr1")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("#5 was merged", st["message"])
+
+    def test_a_flag_is_ended_where_nothing_is_open_any_more(self):
+        self.flag()
+        broker.scan()
+        self.gh.pulls[5]["state"] = "closed"
+        self.gh.installed = [{"name": "web", "open_issues_count": 0}]
+        broker.sync_human_review()
+        self.assertIn("#5 was closed", self.api.status("hr1")["message"])
+
+    def test_a_pr_the_pass_didnt_list_is_asked_about_before_its_flag_ends(self):
+        # Opened after the pass listed the open PRs: GitHub says open, so it's kept.
+        self.flag()
+        broker.scan()
+        with mock.patch.dict(broker.OPEN_PRS, {"web": set()}):
+            self.assertTrue(broker.end_closed_flags("web", list(self.api.requests.values())))
+        self.assertEqual(self.api.status("hr1")["phase"], "Pending")
 
     def test_page_shows_the_pr_escaped(self):
         self.flag()
@@ -1425,13 +2054,13 @@ class TestHumanReview(Served, GitHubBase):
     def test_tokens_are_per_repo_and_write_only_when_a_status_changes(self):
         broker.sync_human_review()
         self.assertEqual(self.gh.tokens, [(None, {"metadata": "read"}),
-                                          (["web"], {"pull_requests": "read", "statuses": "read"}),
+                                          (["web"], {"pull_requests": "read", "statuses": "read", "contents": "read"}),
                                           (["web"], {"statuses": "write"})])
         self.assertEqual(len(self.gh.revoked), 3)
         self.gh.tokens.clear()
         broker.sync_human_review()  # nothing changed: no write token
         self.assertEqual([p for _, p in self.gh.tokens], [{"metadata": "read"},
-                                                          {"pull_requests": "read", "statuses": "read"}])
+                                                          {"pull_requests": "read", "statuses": "read", "contents": "read"}])
 
     def test_only_the_list_token_is_for_every_repo(self):
         with self.assertRaises(broker.githubops.GitHubError) as cm:
@@ -1447,7 +2076,7 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(self.gh.calls, [])
 
 
-class TestRequireHumanReview(Served, GitHubBase):
+class TestRulesets(Served, GitHubBase):
     def setUp(self):
         super().setUp()
         self.gh.installed.append({"name": "cv", "open_issues_count": 0})
@@ -1456,52 +2085,71 @@ class TestRequireHumanReview(Served, GitHubBase):
             p.start()
             self.addCleanup(p.stop)
 
-    def filed(self):
-        return sorted(r["spec"]["github"]["repo"] for r in self.api.requests.values()
-                      if r["spec"]["verb"] == "github-require-human-review")
+    def standard(self):
+        return broker.githubops.ruleset(42)
 
-    def capture(self):
-        """file_require, into the fake API as the admission policy would."""
-        return mock.patch.object(broker, "file_require",
-                                 lambda repo: self.add_github(f"req-{repo}", "github-require-human-review", repo=repo))
+    def names(self, repo):
+        return [r["name"] for r in self.gh.rulesets.get(repo, [])]
 
-    def test_repos_without_the_ruleset_are_asked_about_once(self):
-        with self.capture():
+    def test_added_where_missing_with_no_request(self):
+        broker.sync_human_review(rulesets=True)
+        for repo in ("web", "cv"):
+            (rs,) = self.gh.rulesets[repo]
+            self.assertTrue(broker.githubops.matches(self.standard(), rs))
+        self.assertEqual(self.api.requests, {})
+        self.assertIn({"administration": "write"}, [p for _, p in self.gh.tokens])
+
+    def test_the_standard_one(self):
+        broker.sync_human_review(rulesets=True)
+        (rs,) = self.gh.rulesets["web"]
+        check = rs["rules"][0]["parameters"]["required_status_checks"]
+        self.assertEqual(check, [{"context": "human-review", "integration_id": 42}])
+        self.assertEqual([(a["actor_type"], a["actor_id"]) for a in rs["bypass_actors"]],
+                         [("RepositoryRole", 5), ("Integration", 5855882)])
+
+    def test_left_alone_when_it_matches(self):
+        broker.sync_human_review(rulesets=True)
+        self.gh.calls.clear()
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual([(m, p) for m, p, _ in self.gh.calls if "/rulesets" in p and m != "GET"], [])
+
+    def test_an_edited_or_disabled_one_is_put_back(self):
+        broker.sync_human_review(rulesets=True)
+        (rs,) = self.gh.rulesets["web"]
+        rs["bypass_actors"].append({"actor_id": 1, "actor_type": "Integration", "bypass_mode": "always"})
+        (cv,) = self.gh.rulesets["cv"]
+        cv["enforcement"] = "disabled"
+        broker.sync_human_review(rulesets=True)
+        for repo in ("web", "cv"):
+            (now,) = self.gh.rulesets[repo]
+            self.assertTrue(broker.githubops.matches(self.standard(), now))
+
+    def test_a_deleted_one_comes_back_and_a_second_one_goes(self):
+        broker.sync_human_review(rulesets=True)
+        self.gh.rulesets["web"].clear()
+        self.gh.rulesets["cv"].append({"name": "human-review", "id": 5, "enforcement": "disabled"})
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.names("web"), ["human-review"])
+        self.assertEqual(self.names("cv"), ["human-review"])
+        self.assertNotEqual(self.gh.rulesets["cv"][0]["id"], 5)
+
+    def test_other_rulesets_are_left_alone(self):
+        self.gh.rulesets["web"] = [{"name": "main", "id": 3, "enforcement": "disabled"}]
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.names("web"), ["main", "human-review"])
+        self.assertEqual(self.gh.rulesets["web"][0]["enforcement"], "disabled")
+
+    def test_excluded_repos_have_none(self):
+        broker.sync_human_review(rulesets=True)
+        with mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"cv"}):
             broker.sync_human_review(rulesets=True)
-            self.assertEqual(self.filed(), ["cv", "web"])
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), ["cv", "web"])
+        self.assertEqual((self.names("web"), self.names("cv")), (["human-review"], []))
 
     def test_not_every_pass(self):
-        with self.capture():
-            broker.sync_human_review()
-        self.assertEqual(self.filed(), [])
+        broker.sync_human_review()
+        self.assertEqual(self.gh.rulesets, {})
 
-    def test_a_repo_with_one_or_excluded_isnt_asked_about(self):
-        self.gh.rulesets.append({"name": "human-review", "id": 1})  # the fake shares rulesets across repos
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
-        self.gh.rulesets.clear()
-        with self.capture(), mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"web", "cv"}):
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
-
-    def test_a_denied_repo_isnt_asked_again(self):
-        self.add_github("no", "github-require-human-review", repo="web")
-        self.api.requests["no"]["status"] = {"phase": "Denied"}
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), ["cv", "web"])  # web's is the Denied one, not a new one
-        self.assertEqual(len(self.api.requests), 2)
-
-    def test_at_most_a_batch_waits(self):
-        self.gh.installed += [{"name": f"r{i}", "open_issues_count": 0} for i in range(10)]
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(len(self.filed()), broker.RULESET_BATCH)
-
-    def test_nothing_filed_where_the_app_cant_set_statuses(self):
+    def test_none_where_the_app_cant_set_statuses(self):
         self.gh.installed = [{"name": "cv", "open_issues_count": 0}]  # no status to write this pass
         real = self.gh.__call__
 
@@ -1509,52 +2157,47 @@ class TestRequireHumanReview(Served, GitHubBase):
             if "access_tokens" in path and body["permissions"] == {"statuses": "write"}:
                 raise broker.githubops.GitHubError(422, "permissions not granted")
             return real(method, path, token, body, **kw)
-        with self.capture(), mock.patch.object(broker.githubops, "api", no_statuses), \
-                mock.patch.object(minter, "api", no_statuses):
+        with mock.patch.object(broker.githubops, "api", no_statuses), mock.patch.object(minter, "api", no_statuses):
             broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
+        self.assertEqual(self.gh.rulesets, {})
 
-    def test_nothing_filed_after_a_pass_that_couldnt_set_statuses(self):
+    def test_none_after_a_pass_that_couldnt_set_statuses(self):
         # A required check nobody can set would hold every PR.
         self.gh.fail[("GET", f"{REPO}/commits/{HEAD}/status")] = broker.githubops.GitHubError(403, "no statuses")
-        with self.capture():
-            broker.sync_human_review(rulesets=True)
-        self.assertEqual(self.filed(), [])
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.gh.rulesets, {})
 
-    def test_file_require_files_a_request(self):
-        with mock.patch.object(broker, "k8s") as k8s:
-            broker.file_require("web")
-        (method, path, body), _ = k8s.call_args
-        self.assertEqual((method, path, body["spec"]["verb"], body["spec"]["github"]), (
-            "POST", broker.REQUESTS, "github-require-human-review", {"repo": "web"}))
+    def test_one_repo_failing_doesnt_stop_the_rest(self):
+        self.gh.fail[("GET", "/repos/owner/web/rulesets?includes_parents=false&per_page=100&page=1")] = \
+            broker.githubops.GitHubError(500, "boom")
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual(self.names("cv"), ["human-review"])
 
-    def test_approving_adds_the_standard_ruleset(self):
-        st = self.admit_github("r1", "github-require-human-review", repo="web")
-        self.assertEqual(st["phase"], "Pending")
-        status, body = self.request("GET", "/r/r1")
-        self.assertEqual(status, 200)
-        self.assertIn("~DEFAULT_BRANCH", body)
-        code, _ = broker.decide("r1", "approve", st["specHash"], APPROVER)
-        self.assertEqual((code, self.api.status("r1")["phase"]), (200, "Succeeded"))
-        (rs,) = self.gh.rulesets
-        check = rs["rules"][0]["parameters"]["required_status_checks"]
-        self.assertEqual(check, [{"context": "human-review", "integration_id": 42}])
-        self.assertEqual(rs["bypass_actors"][0]["actor_type"], "RepositoryRole")
-        self.assertIn({"administration": "write"}, [p for _, p in self.gh.tokens])
+    def test_without_the_bypass_apps_where_github_refuses_them(self):
+        self.gh.no_bypass_apps = {"cv"}
+        broker.sync_human_review(rulesets=True)
+        bare = broker.githubops.ruleset(42, bypass_apps=False)
+        (cv,) = self.gh.rulesets["cv"]
+        self.assertEqual([a["actor_type"] for a in cv["bypass_actors"]], ["RepositoryRole"])
+        self.assertTrue(broker.githubops.matches(bare, cv))
+        (web,) = self.gh.rulesets["web"]
+        self.assertTrue(broker.githubops.matches(self.standard(), web))
+        # An edit there is still put back, without them.
+        cv["enforcement"] = "disabled"
+        broker.sync_human_review(rulesets=True)
+        self.assertTrue(broker.githubops.matches(bare, self.gh.rulesets["cv"][0]))
+        # Matching that, nothing is written but the full one's try.
+        self.gh.calls.clear()
+        broker.sync_human_review(rulesets=True)
+        self.assertEqual([(m, p) for m, p, _ in self.gh.calls if "/rulesets/" in p and m == "PUT"],
+                         [("PUT", f"/repos/owner/cv/rulesets/{cv['id']}")])
+        # Installing the App there adds it on the next round.
+        self.gh.no_bypass_apps = set()
+        broker.sync_human_review(rulesets=True)
+        self.assertTrue(broker.githubops.matches(self.standard(), self.gh.rulesets["cv"][0]))
 
-    def test_rejected_where_there_is_one_or_it_would_hold_prs_with_no_status(self):
-        self.gh.rulesets.append({"name": "human-review", "id": 1})
-        self.assertIn("already has", self.admit_github("r1", "github-require-human-review", repo="web")["message"])
-        self.gh.rulesets.clear()
-        with mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"web"}):
-            self.assertIn("EXCLUDE", self.admit_github("r2", "github-require-human-review", repo="web")["message"])
-
-    def test_one_made_since_the_check_is_left_alone(self):
-        st = self.admit_github("r1", "github-require-human-review", repo="web")
-        self.gh.rulesets.append({"name": "human-review", "id": 1})
-        broker.decide("r1", "approve", st["specHash"], APPROVER)
-        self.assertEqual(len(self.gh.rulesets), 1)
-        self.assertNotEqual(self.api.status("r1")["phase"], "Succeeded")
+    def test_the_old_verb_is_rejected(self):
+        self.assertIn("retired", self.admit_github("r1", "github-require-human-review", repo="web")["message"])
 
 
 class TestSopsKey(Base):
