@@ -819,7 +819,7 @@ class TestHTTP(Served, Base):
         self.assertEqual(body.count("<details class=group>"), 1)  # nothing waiting: closed
         self.assertIn("<b>fix valheim - claude-remote</b><span class=badge>2 waiting</span>", body)
         self.assertLess(body.index("fix valheim"), body.index("roadmap-42"))
-        for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
+        for key in (("workstream", "fix valheim"), ("workstream", "ci"), ("workstream", "roadmap-42")):
             self.assertIn(f'href="/g/{broker.group_id(key)}"', body)
 
     def test_group_page_decides_each_request(self):
@@ -828,7 +828,7 @@ class TestHTTP(Served, Base):
             self.add_in("a2", AGENT, "fix valheim")
             self.add_in("b1", AGENT, "ci")
             broker.scan()
-        gid = broker.group_id((AGENT, "fix valheim"))
+        gid = broker.group_id(("workstream", "fix valheim"))
         status, body = self.request("GET", f"/g/{gid}")
         self.assertEqual(status, 200)
         self.assertIn("Waiting (2)", body)
@@ -1449,7 +1449,7 @@ class TestNotify(unittest.TestCase):
         body = self.sent([r], [r])
         self.assertEqual(body["topic"], "topic123")
         self.assertEqual({a["action"] for a in body["actions"]}, {"view"})
-        gid = broker.group_id((AGENT, "fix valheim"))
+        gid = broker.group_id(("workstream", "fix valheim"))
         self.assertEqual(body["click"], f"https://ops.example.test/g/{gid}")  # one group: straight to it
         self.assertIn("fix valheim - claude-remote", body["message"])
 
@@ -1463,7 +1463,7 @@ class TestNotify(unittest.TestCase):
         self.assertLess(msg.index("fix valheim"), msg.index("roadmap-42"))  # the biggest group first
         self.assertIn("6 new", msg)
         self.assertIn("and 2 more", msg)  # SUMMARY_ITEMS per group
-        for key in ((AGENT, "fix valheim"), (AGENT, "ci"), (NIGHT, "roadmap-42")):
+        for key in (("workstream", "fix valheim"), ("workstream", "ci"), ("workstream", "roadmap-42")):
             self.assertIn(f"(https://ops.example.test/g/{broker.group_id(key)})", msg)
         self.assertIn("Still waiting: older - night-shift/night-worker (1)", msg)
         self.assertEqual(body["click"], "https://ops.example.test/")
@@ -1535,13 +1535,21 @@ class TestSessions(Served, Base):
         self.restart("a1", AGENT, "s1", "ops page", age=10, phase="Succeeded")
         self.restart("n1", NIGHT, "s1", phase="Succeeded")
         self.assertEqual(self.keys()["n1"], (None, "s1"))
-        # Every requester that named the session shows in its title, newest first.
-        self.assertIn("<b>ops page - night-shift/night-worker, claude-remote</b>", self.request("GET", "/")[1])
+        # The title names whoever filed the latest request: after a hand-over, the agent doing the work now.
+        self.assertIn("<b>ops page - night-shift/night-worker</b>", self.request("GET", "/")[1])
+        self.restart("a2", AGENT, "s1", phase="Succeeded", age=-5)
+        self.assertEqual(self.keys()["a2"], (None, "s1"))
+        self.assertIn("<b>ops page - claude-remote</b>", self.request("GET", "/")[1])
+        # The group's page lists everyone that worked in it, newest first.
+        body = self.request("GET", f"/g/{broker.group_id((None, 's1'))}")[1]
+        self.assertIn("claude-remote, night-shift/night-worker", body)
 
-    def test_without_a_session_groups_as_before(self):
-        self.restart("a1", AGENT, workstream="fix valheim", phase="Succeeded")
-        self.assertEqual(self.keys()["a1"], (AGENT, "fix valheim"))
-        self.assertIn("<b>fix valheim - claude-remote</b>", self.request("GET", "/")[1])
+    def test_without_a_session_groups_by_workstream_whoever_asked(self):
+        self.restart("a1", AGENT, workstream="fix valheim", phase="Succeeded", age=10)
+        self.restart("n1", NIGHT, workstream="fix valheim", phase="Succeeded")
+        self.assertEqual(self.keys()["a1"], ("workstream", "fix valheim"))
+        self.assertEqual(self.keys()["n1"], ("workstream", "fix valheim"))
+        self.assertIn("<b>fix valheim - night-shift/night-worker</b>", self.request("GET", "/")[1])
 
     def test_the_brokers_flags_join_the_session_of_their_pr(self):
         self.flag("mine", AGENT, 5, "s1", "ops page", age=30)
@@ -1550,7 +1558,7 @@ class TestSessions(Served, Base):
         self.flag("other", broker.SELF, 6, workstream="Code triggers")
         keys = self.keys()
         self.assertEqual(keys["trigger"], (None, "s2"))  # the session that last filed for it
-        self.assertEqual(keys["other"], (broker.SELF, "web#6"))  # an old flag of no session: its PR's group
+        self.assertEqual(keys["other"], ("workstream", "web#6"))  # an old flag of no session: its PR's group
         body = self.request("GET", f"/g/{broker.group_id(keys['trigger'])}")[1]
         self.assertIn("<h1>rework - claude-remote</h1>", body)  # the broker's workstream isn't the theme
         self.assertIn("/r/trigger", body)
@@ -1574,7 +1582,7 @@ class TestSessions(Served, Base):
 
     def test_a_flag_for_an_untagged_pr_is_its_prs_group_by_its_author(self):
         self.flag("trigger", broker.SELF, 9, workstream="Bump the image", on_behalf_of="martin-nef")
-        self.assertEqual(self.keys()["trigger"], (broker.SELF, "web#9"))
+        self.assertEqual(self.keys()["trigger"], ("workstream", "Bump the image"))
         self.assertIn("<b>Bump the image - martin-nef</b>", self.request("GET", "/")[1])
 
     def test_an_agents_word_on_its_own_request_doesnt_name_the_group(self):

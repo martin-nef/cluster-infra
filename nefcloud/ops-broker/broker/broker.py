@@ -272,6 +272,12 @@ def on_behalf_of(req):
     return req["spec"].get("onBehalfOf", "") if requester(req) == SELF else ""
 
 
+def worker(req):
+    """Whose work a request is: its stamped requester, or for the broker's
+    own flags, whose PR they're for (on_behalf_of), when the PR says."""
+    return on_behalf_of(req) or requester(req)
+
+
 # The workstreams the broker gave its flags before they named whose PR they
 # were for: not a theme, so such a flag groups by its PR.
 OLD_FLAG_LABELS = {"Code triggers", "PR reviewer's flags"}
@@ -279,15 +285,16 @@ OLD_FLAG_LABELS = {"Code triggers", "PR reviewer's flags"}
 
 def group_key(req):
     """The group a request files itself under: (None, session), or without a
-    session (older clients), (requester, workstream). A session's group is the
-    session alone: its work spans requesters (the agent, the broker's flags for
-    it), and each request shows its own. The broker's flag for a PR with no
-    ops tag groups by the PR: (SELF, "repo#n")."""
+    session, ("workstream", its workstream). Never who asked: a session or a
+    workstream handed from one agent to another stays one group, and each
+    request shows its own requester. An old broker flag with no theme groups
+    by its PR, ("workstream", "repo#n")."""
     if session(req):
         return None, session(req)
-    if requester(req) == SELF and req["spec"].get("github", {}).get("pr"):
-        return SELF, f"{req['spec']['github']['repo']}#{req['spec']['github']['pr']}"
-    return requester(req), req["spec"].get("workstream", "")
+    ws = req["spec"].get("workstream", "")
+    if requester(req) == SELF and ws in ("", *OLD_FLAG_LABELS) and req["spec"].get("github", {}).get("pr"):
+        ws = f"{req['spec']['github']['repo']}#{req['spec']['github']['pr']}"
+    return "workstream", ws
 
 
 # A request's subject, by verb: a group shows only the newest request per
@@ -337,10 +344,7 @@ def agent_name(who):
 
 def theme(key, reqs):
     """What the group is about: its workstream, or a session's latest one
-    (reqs newest first), its PR's title for a PR's group, else the PR."""
-    if key[0] == SELF:
-        return next((r["spec"]["workstream"] for r in reqs
-                     if r["spec"].get("workstream") not in (None, *OLD_FLAG_LABELS)), key[1])
+    (reqs newest first)."""
     if key[0] is not None:
         return key[1]
     # A flag the broker filed into it by subject (group_keys) names another session's theme.
@@ -349,22 +353,17 @@ def theme(key, reqs):
 
 
 def workers(key, reqs):
-    """Who the group's work is from: its requester, or the requesters that
-    named the session, newest first. More than one shows: the session is the
-    agents' own label, and the stamped requesters are what can't be faked.
-    For the broker's flags, whose PR they're for (on_behalf_of): the agent's
-    own word, like the session."""
-    if key[0] == SELF:
-        return list(dict.fromkeys(on_behalf_of(r) for r in reqs if on_behalf_of(r))) or [SELF]
-    if key[0] is not None:
-        return [key[0]]
-    named = [(on_behalf_of(r) if requester(r) == SELF else requester(r)) for r in reqs if session(r) == key[1]]
-    return list(dict.fromkeys(w for w in named if w)) or [SELF]
+    """Everyone whose work is in the group (worker), newest first: the group
+    page lists them all. The stamped requesters are what can't be faked; for
+    the broker's flags it's the PR's word, like the session."""
+    return list(dict.fromkeys(worker(r) for r in reqs))
 
 
 def group_title(key, reqs):
-    """<theme> - <worker>, or the worker alone."""
-    t, w = theme(key, reqs), ", ".join(agent_name(who) for who in workers(key, reqs))
+    """<theme> - <the latest request's worker>, or the worker alone: after a
+    hand-over, the agent now doing the work."""
+    # Not the broker itself when an agent is there: an untagged PR's flag joins a session by subject.
+    t, w = theme(key, reqs), agent_name(next((worker(r) for r in reqs if worker(r) != SELF), SELF))
     return f"{t} - {w}" if t else w
 
 
@@ -1481,7 +1480,7 @@ def group_page(gid, items):
             continue
         live, done = split(reqs)
         url = session_url(key, reqs)
-        about = (f"<p class=muted>{e(', '.join(w or 'no requester recorded' for w in workers(key, reqs)))}"
+        about = (f"<p class=muted>{e(', '.join(agent_name(w) for w in workers(key, reqs)))}"
                  + (f" · session <code>{e(key[1])}</code>" if key[0] is None else "") + "</p>")
         if url:
             about += f'<p><a href="{e(url)}">Open the session on claude.ai</a></p>'
