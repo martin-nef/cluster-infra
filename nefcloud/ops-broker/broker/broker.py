@@ -21,6 +21,11 @@ GitHub's sign-in, and the minter acts with your token for that one call:
 
   github-create-repo
 
+One verb asks instead of acting (README, "Questions"):
+
+  question              The user answers on the request's page (an option
+                        or free text); the answer goes to status.answer.
+
 One verb isn't an action but a sign-off (README, "Human review required"):
 
   github-human-review   An agent flags a PR; nobody merges it until you
@@ -104,6 +109,7 @@ MAX_TTL = int(os.environ.get("MAX_TTL", "43200"))
 PENDING_CAPS = {u.strip(): int(n) for u, _, n in
                 (c.rpartition("=") for c in os.environ.get("PENDING_CAPS", "").split(",") if c.strip())}
 PENDING_FLAGS = int(os.environ.get("PENDING_FLAGS", "20"))  # waiting flags per requester, apart from PENDING_CAPS
+PENDING_QUESTIONS = int(os.environ.get("PENDING_QUESTIONS", "3"))  # waiting questions per requester, the same
 QUIET_HOURS = os.environ.get("QUIET_HOURS", "")  # "22:00-07:00" in QUIET_TZ; empty: never quiet
 QUIET_TZ = os.environ.get("QUIET_TZ", "UTC")
 # Notifications are debounced: a new request waits NOTIFY_DEBOUNCE seconds for
@@ -187,7 +193,7 @@ GITHUB_VERBS = set(githubops.VERBS) | set(githubops.RETIRED)
 USER_VERBS = set(githubops.USER_VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
 POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
-FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected", "Superseded", "Withdrawn"}
+FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected", "Superseded", "Withdrawn", "Answered"}
 SHORT_LIVED = {"Expired", "Rejected", "Superseded", "Withdrawn"}
 
 # Serialises every status change, so a request is decided and run at most once.
@@ -280,6 +286,7 @@ def group_key(req):
 SUBJECTS = {
     "github-human-review": lambda s: ("PR", s["github"]["repo"], s["github"]["pr"]),
     "github-commit-workflows": lambda s: ("branch", s["github"]["repo"], s["github"].get("branch")),
+    "question": lambda s: ("question", s["question"]["text"]),
 }
 
 
@@ -395,6 +402,10 @@ def is_flag(req):
     return req["spec"].get("verb") == "github-human-review"
 
 
+def is_question(req):
+    return req["spec"].get("verb") == "question"
+
+
 def expires(req):
     """When it expires unanswered, or None for a flag (github-human-review):
     its PR bounds it, so it lasts until the PR is closed or its head moves
@@ -415,10 +426,13 @@ def soonest(reqs):
 def pending_cap(req):
     """(the pool a request counts against while it waits, its size). Flags have
     a pool per requester, PENDING_FLAGS: they last as long as their PR, so open
-    flags can't take the slots an agent's break-glass requests need."""
+    flags can't take the slots an agent's break-glass requests need. Questions
+    too, PENDING_QUESTIONS, for the same reason."""
     who = requester(req)
     if is_flag(req):
         return f"flags:{who}", PENDING_FLAGS
+    if is_question(req):
+        return f"questions:{who}", PENDING_QUESTIONS
     return (who, PENDING_CAPS[who]) if who in PENDING_CAPS else ("", MAX_PENDING)
 
 
@@ -467,6 +481,9 @@ def describe(req):
     s = req["spec"]
     if s["verb"] in GITHUB_VERBS:
         return githubops.describe(GITHUB_OWNER, s)
+    if s["verb"] == "question":
+        text = " ".join(s["question"]["text"].split())
+        return f"question: {text[:80]}{'…' if len(text) > 80 else ''}"
     t = s["target"]
     return f"{s['verb']} {t['kind']} {t['namespace']}/{t['name']}"
 
@@ -497,6 +514,8 @@ def check(req, tok=None):
     spec = req.get("spec", {})
     if spec.get("verb") in GITHUB_VERBS:
         return check_github(spec, tok), None
+    if spec.get("verb") == "question":
+        return check_question(spec), None
     target = spec.get("target", {})
     if target.get("kind") not in VERBS.get(spec.get("verb"), ()):
         return f"verb {spec.get('verb')!r} can't target kind {target.get('kind')!r}", None
@@ -518,6 +537,21 @@ def check(req, tok=None):
             return ("pod isn't controlled by a ReplicaSet, StatefulSet or DaemonSet, so it may not "
                     "come back; do that by hand"), None
     return None, obj["metadata"].get("uid")
+
+
+def check_question(spec):
+    """A question has nothing to look up; the CRD checks its shape, and this
+    again, in case the CRD is ever loosened."""
+    q = spec.get("question")
+    if not isinstance(q, dict) or "target" in spec or "github" in spec:
+        return "question takes spec.question only"
+    if not q.get("text") or not q.get("ifUnanswered"):
+        return "a question needs text and ifUnanswered"
+    options = q.get("options") or []
+    labels = [o.get("label") for o in options]
+    if options and (not 2 <= len(options) <= 4 or not all(labels) or len(set(labels)) != len(labels)):
+        return "a question has no options, or 2 to 4 with different labels"
+    return None
 
 
 def check_github(spec, tok=None):
@@ -889,7 +923,7 @@ def notify(new, waiting, items):
     actions.append({"action": "view", "label": "Review" if len(fresh) == 1 else "All requests", "url": url,
                     "clear": True})
     send({
-        "title": f"{plural(len(new), 'ops request')} to approve, from {', '.join(agents)}"[:200],
+        "title": f"{to_decide(new)}, from {', '.join(agents)}"[:200],
         "message": "\n".join(lines).strip()[:3800],
         "markdown": True,
         "priority": 4,
@@ -897,6 +931,16 @@ def notify(new, waiting, items):
         "click": url,
         "actions": actions,
     })
+
+
+def to_decide(new):
+    """1 question and 2 ops requests to answer or approve, say."""
+    q = sum(map(is_question, new))
+    what = [plural(q, "question")] if q else []
+    what += [plural(len(new) - q, "ops request")] if len(new) > q else []
+    verbs = ["answer"] if q else []
+    verbs += ["approve"] if len(new) > q else []
+    return f"{' and '.join(what)} to {' or '.join(verbs)}"
 
 
 def send(body):
@@ -925,7 +969,9 @@ def tidy(req):
     """Expire, recover or delete one request that is past its time."""
     p = phase(req)
     if p in ("", "Pending") and expires(req) and now() > expires(req):
-        set_status(req, phase="Expired", message="nobody approved it in time", finishedAt=stamp())
+        set_status(req, phase="Expired", finishedAt=stamp(), message=(
+            "nobody answered in time: do what it said if unanswered" if is_question(req) else
+            "nobody approved it in time"))
         audit("expired", req)
     elif p == "Approved" and (now() - parse_time(req["status"].get("decidedAt") or stamp())).total_seconds() > STRANDED_AFTER:
         # The broker stopped while running it, before recording the outcome.
@@ -1026,6 +1072,7 @@ def admit(req, pending, checked):
     pool, cap = pending_cap(req)
     if problem is None and pending.get(pool, 0) >= cap:
         problem = (f"{cap} flags from {requester(req)} already wait for a sign-off" if is_flag(req) else
+                   f"{cap} questions from {requester(req)} already wait for an answer" if is_question(req) else
                    f"{cap} requests from {pool} already wait for a decision" if pool else
                    f"{cap} requests already wait for a decision")
     if problem:
@@ -1034,7 +1081,8 @@ def admit(req, pending, checked):
         return False
     set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid,
                **({"expiresAt": stamp(expires(req))} if expires(req) else {}),
-               message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
+               message=f"waiting for {'an answer' if is_question(req) else 'approval'} at "
+                       f"{PUBLIC_URL}/r/{req['metadata']['name']}")
     audit("pending", req, reason=req["spec"]["reason"], workstream=req["spec"].get("workstream", ""),
           session=session(req))
     return True
@@ -1159,6 +1207,8 @@ def decide(name, decision, seen_hash, approver, code=None):
         req, refused = decidable(name, seen_hash)
         if refused:
             return refused
+        if is_question(req):
+            return 400, "a question is answered, not approved or denied"
         if decision == "approve" and req["spec"]["verb"] in USER_VERBS and not code:
             return 400, "this one needs you to sign in to GitHub; approve it from its page"
         tok = None
@@ -1169,6 +1219,38 @@ def decide(name, decision, seen_hash, approver, code=None):
                 return 502, f"couldn't check the target again ({e}); try again"
         with tok or contextlib.nullcontext():
             return decided(req, decision, approver, code, tok)
+
+
+ANSWER_MAX = 2000  # characters of free text
+
+
+def answer(name, seen_hash, approver, option, text):
+    """Answer a question: an option's label, free text, or both. Nothing
+    runs; the answer is the request's status, for the agent that asked.
+    Returns (http status, message)."""
+    text = text.strip()
+    with lock:
+        req, refused = decidable(name, seen_hash)
+        if refused:
+            return refused
+        if not is_question(req):
+            return 400, "only a question can be answered"
+        labels = [o["label"] for o in req["spec"]["question"].get("options") or []]
+        if option and option not in labels:
+            return 400, "not one of the question's options"
+        if not option and not text:
+            return 400, "pick an option or write an answer"
+        if len(text) > ANSWER_MAX:
+            return 400, f"the answer is longer than {ANSWER_MAX} characters"
+        given = {k: v for k, v in (("option", option), ("text", text)) if v}
+        try:
+            set_status(req, phase="Answered", decidedBy=approver, decidedAt=stamp(), finishedAt=stamp(),
+                       answer={**given, "by": approver, "at": stamp()},
+                       message=f"answered by {approver}" + (f": {option}" if option else ""))
+        except K8sError as e:
+            return (409 if e.code == 409 else 502), f"not recorded: {e}"
+    audit("answered", req, by=approver, **given)
+    return 200, "Answered."
 
 
 def decided(req, decision, approver, code, tok):
@@ -1277,7 +1359,8 @@ details.earlier{{margin:0 0 .4rem 1rem}} details.earlier>summary{{cursor:pointer
 .item .reason{{margin:.3rem 0}}
 .clamp{{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}}
 .phase{{font-size:.85rem;padding:0 .4rem;border-radius:.3rem;background:#8882}}
-.phase.Pending{{background:#bf8700;color:#fff}} .phase.Succeeded{{background:#1a7f37;color:#fff}}
+.phase.Pending{{background:#bf8700;color:#fff}} .phase.Succeeded,.phase.Answered{{background:#1a7f37;color:#fff}}
+textarea{{width:100%;box-sizing:border-box;font:inherit;min-height:5rem}}
 .phase.Failed,.phase.Unknown,.phase.Denied{{background:#b42318;color:#fff}}
 </style></head><body>{body}<script>{script}</script></body></html>"""
 
@@ -1308,17 +1391,54 @@ def decision_forms(req, can_approve=True):
         for d in ("approve", "deny") if d == "deny" or can_approve)
 
 
+def answer_forms(req):
+    """A button for each option, and a free-text answer: one form each, so
+    the option is a hidden field the script can't drop."""
+    h, name = e(req["status"].get("specHash", "")), e(req["metadata"]["name"])
+    start = (f'<form method=post action="/r/{name}"><input type=hidden name=hash value="{h}">'
+             '<input type=hidden name=decision value=answer>')
+    out = "".join(f'{start}<input type=hidden name=option value="{e(o["label"])}">'
+                  f'<button class=approve data-busy="Answering…">{e(o["label"])}</button></form>'
+                  for o in req["spec"]["question"].get("options") or [])
+    return (out + f'<p>Or in your own words:</p><form method=post action="/r/{name}" style="display:block">'
+            f'<input type=hidden name=hash value="{h}"><input type=hidden name=decision value=answer>'
+            f'<textarea name=text maxlength={ANSWER_MAX} required></textarea>'
+            '<button class=review data-busy="Answering…">Answer</button></form>')
+
+
+def question_section(req):
+    """The question, what each answer leads to, and the answer if there is one.
+    All of it is the agent's text but the answer: plain text, never a link."""
+    q, st = req["spec"]["question"], req.get("status", {})
+    out = f"<h2>The question</h2><p class=reason>{e(q['text'])}</p>"
+    if q.get("options"):
+        out += ("<p>The answers it offers, and what it does with each (its claim):</p><table>"
+                + "".join(f"<tr><td><b>{e(o['label'])}</b></td><td class=reason>{e(o['then'])}</td></tr>"
+                          for o in q["options"]) + "</table>")
+    out += f"<p>If nobody answers in time, it will:</p><p class=reason>{e(q['ifUnanswered'])}</p>"
+    a = st.get("answer")
+    if a:
+        out += ("<h2>The answer</h2>" + (f"<p><b>{e(a['option'])}</b></p>" if a.get("option") else "")
+                + (f"<p class=reason>{e(a['text'])}</p>" if a.get("text") else "")
+                + f"<p class=muted>{e(a.get('by', ''))}, {e(a.get('at', ''))}</p>")
+    if st.get("phase") == "Pending":
+        out += answer_forms(req)
+    return out
+
+
 def request_page(req, items):
     """items: every request, for its group."""
     s, st = req["spec"], req.get("status", {})
     github = s["verb"] in GITHUB_VERBS
     if github:
         target = f"<code>{e(GITHUB_OWNER)}/{e(s['github']['repo'])}</code>"
+    elif is_question(req):
+        target = None
     else:
         t = s["target"]
         target = f"<code>{e(t['kind'])} {e(t['namespace'])}/{e(t['name'])}</code>"
     rows = [("Verb", f"<code>{e(s['verb'])}</code>"),
-            ("Target", target),
+            *([("Target", target)] if target else []),
             ("Group", group_link(req, items)),
             ("Phase", f'<span class="phase {e(st.get("phase", ""))}">{e(st.get("phase", "new"))}</span>'),
             ("Status", e(st.get("message", ""))),
@@ -1346,7 +1466,9 @@ def request_page(req, items):
         # asked (a repo that now exists, a rule that's now there), so show the
         # request itself. Its status says what happened.
         body += "<h2>What it asked for</h2>" + githubops.asked(GITHUB_OWNER, s)
-    if st.get("phase") == "Pending":
+    if is_question(req):
+        body += question_section(req)
+    elif st.get("phase") == "Pending":
         body += decision_forms(req, can_approve)
     return body + f'<p><a href="/g/{group_id(group_keys(items)[req["metadata"]["name"]])}">Its group</a>' \
         ' · <a href="/">All requests</a></p>'
@@ -1375,7 +1497,10 @@ def item(req, clamp=False, actions=False):
     if p != "Pending" and st.get("message"):
         out += f"<div class=muted>{e(st['message'])}</div>"
     if actions and p == "Pending":
-        if req["spec"]["verb"] in GITHUB_VERBS:
+        if is_question(req):
+            # The question, its options and what each leads to are on its page.
+            out += f'<a class="button approve" href="/r/{name}">Answer</a>'
+        elif req["spec"]["verb"] in GITHUB_VERBS:
             # Its page shows what approving does, read live (a diff, a PR): it's
             # approved there, after you've seen it.
             out += f'<a class="button review" href="/r/{name}">Review and approve</a>' + decision_forms(req, False)
@@ -1588,6 +1713,11 @@ def result_page(name, message):
     return f'<p>{e(message)}</p><p><a href="/r/{e(name)}">The request</a>{group} · <a href="/">All requests</a></p>'
 
 
+# Bytes in a posted form: room for a free-text answer of ANSWER_MAX characters,
+# percent-encoded (up to 12 bytes each).
+FORM_MAX = 4096 + 12 * ANSWER_MAX
+
+
 class Handler(BaseHTTPRequestHandler):
     def approver(self):
         """The signed-in email if it may approve. Set by oauth2-proxy via Traefik,
@@ -1665,8 +1795,12 @@ class Handler(BaseHTTPRequestHandler):
         if form is None:
             return self.reply(413, "too large or no length")
         decision = form.get("decision", [""])[0]
+        if decision == "answer":
+            status, message = answer(name, form.get("hash", [""])[0], approver,
+                                     form.get("option", [""])[0], form.get("text", [""])[0])
+            return self.reply(status, result_page(name, message), html_page=True)
         if decision not in ("approve", "deny"):
-            return self.reply(400, "decision must be approve or deny")
+            return self.reply(400, "decision must be approve, deny or answer")
         if decision == "approve" and form.get("signin", [""])[0] == "github":
             return self.reply(*start_authorize(name, form.get("hash", [""])[0], approver), html_page=True)
         status, message = decide(name, decision, form.get("hash", [""])[0], approver)
@@ -1678,7 +1812,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers["Content-Length"])
         except (TypeError, ValueError):
             return None
-        if not 0 <= length <= 4096:
+        if not 0 <= length <= FORM_MAX:
             return None
         return urllib.parse.parse_qs(self.rfile.read(length).decode())
 

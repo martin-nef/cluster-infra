@@ -2441,3 +2441,139 @@ def _bech32_bytes(s):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuestion(Served, Base):
+    QUESTION = {"text": "Keep the old API, or drop it?",
+                "options": [{"label": "A", "then": "keep it"}, {"label": "B <b>", "then": "drop it"}],
+                "ifUnanswered": "keep it"}
+
+    def add(self, name="q1", question=None, **spec):
+        self.api.add(name, "question", "Pod", "x", "x")
+        s = self.api.requests[name]["spec"]
+        del s["target"]
+        s.update(question=copy.deepcopy(question or self.QUESTION), requester=AGENT, **spec)
+
+    def asked(self, name="q1", **kw):
+        self.add(name, **kw)
+        broker.scan()
+        return self.api.status(name)
+
+    def test_a_question_waits_for_an_answer_and_is_announced(self):
+        st = self.asked()
+        self.assertEqual(st["phase"], "Pending")
+        self.assertIn("waiting for an answer", st["message"])
+        self.notify.assert_called_once()
+        self.assertEqual(self.api.actions(), [])
+
+    def test_its_shape_is_checked_again(self):
+        bad = [{"text": "x", "ifUnanswered": ""},
+               {"text": "x", "ifUnanswered": "y", "options": [{"label": "A", "then": "z"}]},
+               {"text": "x", "ifUnanswered": "y", "options": [{"label": "A", "then": "z"}] * 2}]
+        for i, q in enumerate(bad):
+            with self.subTest(q):
+                self.assertEqual(self.asked(f"bad{i}", question=q)["phase"], "Rejected")
+        self.add("both")
+        self.api.requests["both"]["spec"]["target"] = {"kind": "Pod", "namespace": "app", "name": "web-1"}
+        broker.scan()
+        self.assertEqual(self.api.status("both")["phase"], "Rejected")
+
+    def test_questions_have_slots_of_their_own(self):
+        with mock.patch.object(broker, "PENDING_CAPS", {AGENT: 1}), \
+                mock.patch.object(broker, "PENDING_QUESTIONS", 2):
+            for i in range(3):
+                self.add(f"q{i}", question={**self.QUESTION, "text": f"question {i}"})
+                self.api.requests[f"q{i}"]["metadata"]["creationTimestamp"] = broker.stamp(
+                    broker.now() - timedelta(seconds=10 - i))
+            self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
+            self.api.requests["r1"]["spec"]["requester"] = AGENT
+            broker.scan()
+        self.assertEqual([self.api.status(f"q{i}")["phase"] for i in range(3)], ["Pending", "Pending", "Rejected"])
+        self.assertIn("questions", self.api.status("q2")["message"])
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")  # a break-glass request still gets its slot
+
+    def test_answer_with_an_option(self):
+        h = self.asked()["specHash"]
+        self.assertEqual(broker.answer("q1", h, APPROVER, "B <b>", "")[0], 200)
+        st = self.api.status("q1")
+        self.assertEqual(st["phase"], "Answered")
+        self.assertEqual({k: v for k, v in st["answer"].items() if k != "at"}, {"option": "B <b>", "by": APPROVER})
+        self.assertEqual(st["decidedBy"], APPROVER)
+        self.assertEqual(self.api.actions(), [])
+        # Once only.
+        self.assertEqual(broker.answer("q1", h, APPROVER, "A", "")[0], 409)
+
+    def test_answer_in_words(self):
+        h = self.asked()["specHash"]
+        self.assertEqual(broker.answer("q1", h, APPROVER, "", "  Neither: deprecate it.  ")[0], 200)
+        self.assertEqual(self.api.status("q1")["answer"]["text"], "Neither: deprecate it.")
+        self.assertNotIn("option", self.api.status("q1")["answer"])
+
+    def test_bad_answers_are_refused(self):
+        h = self.asked()["specHash"]
+        for args in (("C", ""), ("", "   "), ("", "x" * (broker.ANSWER_MAX + 1))):
+            with self.subTest(args):
+                self.assertEqual(broker.answer("q1", h, APPROVER, *args)[0], 400)
+        self.assertEqual(broker.answer("q1", "0" * 16, APPROVER, "A", "")[0], 409)
+        self.assertEqual(self.api.status("q1")["phase"], "Pending")
+
+    def test_a_question_cant_be_approved_and_others_cant_be_answered(self):
+        h = self.asked()["specHash"]
+        self.assertEqual(broker.decide("q1", "approve", h, APPROVER)[0], 400)
+        self.assertEqual(broker.decide("q1", "deny", h, APPROVER)[0], 400)
+        self.admit("r1", "rollout-restart", "Deployment", "app", "web")
+        self.assertEqual(broker.answer("r1", self.api.status("r1")["specHash"], APPROVER, "", "yes")[0], 400)
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")
+
+    def test_unanswered_it_expires_to_its_default(self):
+        self.asked()
+        self.api.requests["q1"]["metadata"]["creationTimestamp"] = broker.stamp(broker.now() - timedelta(days=2))
+        broker.scan()
+        st = self.api.status("q1")
+        self.assertEqual(st["phase"], "Expired")
+        self.assertIn("if unanswered", st["message"])
+
+    def test_the_page_shows_it_as_text_with_a_button_per_option(self):
+        self.add()
+        self.api.requests["q1"]["spec"]["question"]["text"] = "<a href=https://evil.test>see</a>"
+        broker.scan()
+        status, body = self.request("GET", "/r/q1")
+        self.assertEqual(status, 200)
+        self.assertNotIn("<a href=https://evil.test", body)
+        self.assertIn("&lt;a href=https://evil.test&gt;", body)
+        self.assertIn('name=option value="B &lt;b&gt;"', body)
+        self.assertIn("<textarea name=text", body)
+        self.assertNotIn("value=approve", body)
+        self.assertIn("keep it", body)  # what it does if unanswered
+
+    def test_answer_through_the_page(self):
+        h = self.asked()["specHash"]
+        text = "Ni l'un ni l'autre — " * 90  # long and not ASCII: past the old 4 KB form limit
+        status, _ = self.request("POST", "/r/q1", form={"decision": "answer", "hash": h, "text": text[:2000]})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.api.status("q1")["answer"]["text"], text[:2000].strip())
+        body = self.request("GET", "/r/q1")[1]
+        self.assertIn("The answer", body)
+        self.assertNotIn("<textarea", body)
+
+    def test_the_group_links_to_its_page_to_answer(self):
+        self.asked(session="s1")
+        gid = broker.group_id((None, "s1"))
+        body = self.request("GET", f"/g/{gid}")[1]
+        self.assertIn('class="button approve" href="/r/q1">Answer</a>', body)
+        self.assertNotIn("value=approve", body)
+
+    def test_it_can_be_withdrawn(self):
+        self.asked(session="s1")
+        self.api.withdrawals["w1"] = {"metadata": {"name": "w1", "resourceVersion": "1",
+                                                   "creationTimestamp": broker.stamp()},
+                                      "spec": {"request": "q1", "requester": AGENT}}
+        broker.scan()
+        self.assertEqual(self.api.status("q1")["phase"], "Withdrawn")
+
+    def test_the_summary_says_what_to_do(self):
+        q = {"spec": {"verb": "question"}}
+        r = {"spec": {"verb": "rollout-restart"}}
+        self.assertEqual(broker.to_decide([q]), "1 question to answer")
+        self.assertEqual(broker.to_decide([r, r]), "2 ops requests to approve")
+        self.assertEqual(broker.to_decide([q, r]), "1 question and 1 ops request to answer or approve")
