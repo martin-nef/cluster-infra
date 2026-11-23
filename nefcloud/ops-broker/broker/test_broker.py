@@ -730,7 +730,7 @@ class TestHTTP(Served, Base):
         status, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("/r/waiting", body)
-        self.assertEqual(body.count("/r/done"), broker.ITEMS_SHOWN)  # one group; the rest is on its page
+        self.assertNotIn("/r/done", body)  # decided: on the group's page only
 
     def test_page_escapes_the_reason(self):
         self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
@@ -1387,6 +1387,7 @@ class TestSessions(Served, Base):
         body = self.request("GET", "/")[1]
         self.assertIn("<b>ops page groups - claude-remote</b>", body)
         self.assertNotIn("<b>ops page - claude-remote</b>", body)
+        body = self.request("GET", f"/g/{broker.group_id((None, 's1'))}")[1]  # decided: on the group's page
         self.assertIn("succeeded, ", body)
         self.assertIn(" · claude-remote</span>", body)  # each request shows who filed it
 

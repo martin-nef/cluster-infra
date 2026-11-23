@@ -1325,8 +1325,8 @@ def group_summary(key, reqs):
 def index_page(items):
     """Groups (one per session), those with requests waiting first and open,
     then the GROUPS_SHOWN most recent others, closed. Each opens into its
-    subjects, newest request each: every subject with one waiting, and the
-    newest ITEMS_SHOWN of the rest."""
+    subjects with a request waiting, and only their waiting requests. Decided
+    ones are on the group's page."""
     by = groups(items)
     waiting = sorted((k for k, rs in by.items() if any(phase(r) == "Pending" for r in rs)),
                      key=lambda k: min(expires(r) for r in by[k] if phase(r) == "Pending"))
@@ -1334,12 +1334,10 @@ def index_page(items):
     out = []
     for key in waiting + rest:
         reqs = by[key]
-        live, done = split(reqs)
-        shown = live + done[:ITEMS_SHOWN]
+        live = split(reqs)[0]  # decided ones are on the group's page
         out.append(f'<details class=group{" open" if key in waiting else ""}><summary>{group_summary(key, reqs)}'
-                   "</summary>" + subjects(shown, ITEMS_SHOWN, clamp=True)
-                   + f'<p><a href="/g/{group_id(key)}">Open the group</a>'
-                   + (f" ({len(reqs)} requests)" if len(reqs) > len(shown) else "") + "</p></details>")
+                   "</summary>" + (subjects(live, 0, clamp=True) or "<p class=muted>Nothing waiting.</p>")
+                   + f'<p><a href="/g/{group_id(key)}">Open the group</a> ({plural(len(reqs), "request")})</p></details>')
     n = sum(phase(r) == "Pending" for r in items)
     lead = (f"<p>{plural(n, 'request')} waiting, in {plural(len(waiting), 'group')}.</p>" if n else
             "<p>Nothing waiting.</p>")
@@ -1348,7 +1346,6 @@ def index_page(items):
 
 
 GROUPS_SHOWN = 20  # decided groups on the index
-ITEMS_SHOWN = 5  # decided subjects per group, and earlier requests per subject, on the index
 GROUP_ITEMS = 100  # decided subjects, and earlier requests per subject, on a group's page
 
 
