@@ -521,7 +521,7 @@ class TestScan(Base):
         del spec["target"]
         spec["github"] = {"repo": "web", "pr": pr, "headSHA": head}
 
-    def test_a_newer_flag_for_the_same_pr_expires_the_waiting_one(self):
+    def test_a_newer_flag_for_the_same_pr_supersedes_the_waiting_one(self):
         self.flag("old", 5, BASE, 20, phase="Pending", expiresAt=broker.stamp(broker.now() + timedelta(hours=1)))
         self.flag("unadmitted", 5, BASE, 15)
         self.flag("new", 5, MOVED, 10, phase="Succeeded")
@@ -529,10 +529,24 @@ class TestScan(Base):
         broker.scan()
         for name in ("old", "unadmitted"):
             st = self.api.status(name)
-            self.assertEqual(st["phase"], "Expired")
+            self.assertEqual(st["phase"], "Superseded")
             self.assertIn("superseded by new (head bbbbbbbbbbbb)", st["message"])
         self.assertEqual(self.api.status("new")["phase"], "Succeeded")
         self.assertEqual(self.api.status("other-pr")["phase"], "Pending")
+
+    def test_flags_have_slots_of_their_own(self):
+        # Two flags wait, as many as the shared pool's MAX_PENDING: a break-glass
+        # request still gets a slot, and flags only run out of their own.
+        self.flag("f5", 5, BASE, 30, phase="Pending")
+        self.flag("f6", 6, BASE, 30, phase="Pending")
+        with mock.patch.object(broker, "PENDING_FLAGS", 2), \
+                mock.patch.object(broker, "check", lambda req, tok=None: (None, None)):
+            self.assertEqual(self.admit("r1", "delete-pod", "Pod", "app", "web-1")["phase"], "Pending")
+            self.flag("f7", 7, BASE, 0)
+            broker.scan()
+        st = self.api.status("f7")
+        self.assertEqual(st["phase"], "Rejected")
+        self.assertIn("2 flags from", st["message"])
 
 
 class TestDecide(Base):
@@ -1339,6 +1353,14 @@ class TestNotify(unittest.TestCase):
         self.assertTrue(body["markdown"])
         self.assertEqual(len(body["actions"]), 3)
 
+    def test_a_flag_has_no_expiry_to_show(self):
+        flag = {"metadata": {"name": "f1", "creationTimestamp": "2026-11-01T02:00:00Z"}, "status": {"phase": "Pending"},
+                "spec": {"verb": "github-human-review", "requester": AGENT, "reason": "x", "workstream": "w",
+                         "github": {"repo": "web", "pr": 5, "headSHA": "a" * 40}}}
+        self.assertNotIn("expires", self.sent([flag], [flag])["message"])
+        r = self.req("r1", AGENT, "w")
+        self.assertIn("first expires", self.sent([flag, r], [flag, r])["message"])
+
     def test_the_requester_cant_add_links(self):
         r = self.req("r1", AGENT, "[x](https://evil.test)", reason="see [here](https://evil.test) **now**")
         msg = self.sent([r], [r])["message"]
@@ -1681,7 +1703,7 @@ class TestHumanReview(Served, GitHubBase):
 
     def test_flags_wait_for_a_free_slot_instead_of_being_rejected(self):
         self.triggers({"trusted": ["agent[bot]"], "triggers": [{"what": "RBAC", "paths": ["rbac"]}]})
-        with mock.patch.object(broker, "pending_cap", lambda who: (who, 0)):
+        with mock.patch.object(broker, "PENDING_FLAGS", 0):
             broker.sync_human_review()
         self.assertEqual(self.status(), "pending")
         self.assertEqual(self.requests_filed(), [])
@@ -1816,7 +1838,7 @@ class TestHumanReview(Served, GitHubBase):
         self.assertEqual(state(phase="Succeeded", decidedBy="boss"), ("success", "signed off by boss", True))
         self.assertEqual(state(phase="Succeeded", head="o" * 40)[0], "pending")  # pushed since
         self.assertEqual(state(phase="Denied")[0::2], ("failure", True))  # red, not waiting
-        self.assertEqual(state(phase="Expired")[0::2], ("pending", False))  # the reviewer's flag is filed again
+        self.assertEqual(state(phase="Superseded", head="o" * 40)[0::2], ("pending", False))  # filed again
         self.assertEqual(state(phase="Rejected")[0::2], ("pending", True))  # not refiled: no loop
 
     def test_a_push_after_the_sign_off_needs_a_new_one(self):
@@ -1974,8 +1996,47 @@ class TestHumanReview(Served, GitHubBase):
         # Opened after the pass listed the open PRs: GitHub says open, so it's kept.
         self.flag()
         broker.scan()
-        with mock.patch.dict(broker.OPEN_PRS, {"web": set()}):
-            self.assertTrue(broker.end_closed_flags("web", list(self.api.requests.values())))
+        with mock.patch.dict(broker.OPEN_PRS, {"web": {}}):
+            self.assertTrue(broker.end_flags("web", list(self.api.requests.values())))
+        self.assertEqual(self.api.status("hr1")["phase"], "Pending")
+
+    def test_a_flag_outlives_every_ttl(self):
+        self.flag()
+        self.api.requests["hr1"]["spec"]["ttlSeconds"] = 60  # asked for a minute: ignored
+        broker.scan()
+        st = self.api.status("hr1")
+        self.assertEqual(st["phase"], "Pending")
+        self.assertNotIn("expiresAt", st)
+        req = self.api.requests["hr1"]
+        req["metadata"]["creationTimestamp"] = broker.stamp(
+            broker.now() - timedelta(seconds=broker.REQUEST_TTL + broker.MAX_TTL + 86400))
+        broker.scan()
+        broker.sync_human_review()
+        self.assertEqual((self.api.status("hr1")["phase"], self.status()), ("Pending", "pending"))
+        self.assertIn("lasts while its PR is open", self.request("GET", "/r/hr1")[1])
+        self.assertIn("doesn&#x27;t expire", self.request("GET", "/")[1])
+        code, _ = broker.decide("hr1", "approve", st["specHash"], APPROVER)
+        self.assertEqual((code, self.api.status("hr1")["phase"]), (200, "Succeeded"))
+
+    def test_a_flag_ends_when_its_pr_gets_new_commits(self):
+        self.flag()
+        broker.scan()
+        broker.sync_human_review()
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        broker.sync_human_review()
+        st = self.api.status("hr1")
+        self.assertEqual(st["phase"], "Superseded")
+        self.assertIn("#5 has new commits (head nnnnnnnnnnnn)", st["message"])
+        self.assertEqual(self.status("n" * 40), "pending")
+        self.assertIn("new commits since it was flagged", self.description("n" * 40))
+
+    def test_a_flag_of_a_head_the_pass_didnt_see_is_kept(self):
+        # Pushed and flagged after the pass listed the PRs: GitHub has the flag's head, so it stays.
+        self.gh.pulls[5]["head"]["sha"] = "n" * 40
+        self.flag(head="n" * 40)
+        broker.scan()
+        with mock.patch.dict(broker.OPEN_PRS, {"web": {5: HEAD}}):
+            self.assertTrue(broker.end_flags("web", list(self.api.requests.values())))
         self.assertEqual(self.api.status("hr1")["phase"], "Pending")
 
     def test_page_shows_the_pr_escaped(self):
@@ -2046,7 +2107,7 @@ class TestHumanReview(Served, GitHubBase):
         with mock.patch.object(broker, "HUMAN_REVIEW_EXCLUDE", {"skip"}), \
                 mock.patch.object(broker, "OPEN_PRS", {}) as open_prs:
             broker.sync_human_review()
-            self.assertEqual(open_prs, {"web": {5}, "quiet": set()})
+            self.assertEqual(open_prs, {"web": {5: HEAD}, "quiet": {}})
         self.assertEqual(self.status(), "success")
         touched = {p.split("/")[3] for _, p, _ in self.gh.calls if p.startswith("/repos/")}
         self.assertEqual(touched, {"web"})
