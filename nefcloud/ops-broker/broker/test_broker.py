@@ -1747,6 +1747,12 @@ class TestHumanReview(Served, GitHubBase):
         broker.sync_human_review()
         self.assertEqual(self.gh.statuses[HEAD][0]["target_url"], f"{broker.PUBLIC_URL}/r/hr1")
 
+    def test_the_check_doesnt_link_an_earlier_heads_request(self):
+        self.flag("old", head=BASE)  # filed for the head before a push; this head's isn't filed yet
+        broker.scan()
+        broker.sync_human_review()
+        self.assertNotIn("target_url", self.gh.statuses[HEAD][0])
+
     def test_a_flag_holds_the_pr_until_signed_off(self):
         self.flag()
         broker.scan()  # admitted: Pending
