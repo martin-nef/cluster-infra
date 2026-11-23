@@ -740,7 +740,7 @@ class Served:
             headers["Origin"] = origin
         body = None
         if form is not None:
-            body = urllib.parse.urlencode(form)
+            body = urllib.parse.urlencode(form, doseq=True)
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
@@ -2469,7 +2469,9 @@ class TestQuestion(Served, Base):
     def test_its_shape_is_checked_again(self):
         bad = [{"text": "x", "ifUnanswered": ""},
                {"text": "x", "ifUnanswered": "y", "options": [{"label": "A", "then": "z"}]},
-               {"text": "x", "ifUnanswered": "y", "options": [{"label": "A", "then": "z"}] * 2}]
+               {"text": "x", "ifUnanswered": "y", "options": [{"label": "A", "then": "z"}] * 2},
+               {"text": "x", "ifUnanswered": "y", "multiple": True},
+               {"text": "x", "ifUnanswered": "y", "options": [{"label": str(i), "then": "z"} for i in range(9)]}]
         for i, q in enumerate(bad):
             with self.subTest(q):
                 self.assertEqual(self.asked(f"bad{i}", question=q)["phase"], "Rejected")
@@ -2494,27 +2496,42 @@ class TestQuestion(Served, Base):
 
     def test_answer_with_an_option(self):
         h = self.asked()["specHash"]
-        self.assertEqual(broker.answer("q1", h, APPROVER, "B <b>", "")[0], 200)
+        self.assertEqual(broker.answer("q1", h, APPROVER, ["B <b>"], "")[0], 200)
         st = self.api.status("q1")
         self.assertEqual(st["phase"], "Answered")
-        self.assertEqual({k: v for k, v in st["answer"].items() if k != "at"}, {"option": "B <b>", "by": APPROVER})
+        asked = {"text": self.QUESTION["text"], "options": self.QUESTION["options"], "multiple": False}
+        self.assertEqual({k: v for k, v in st["answer"].items() if k != "at"},
+                         {"question": asked, "picked": ["B <b>"], "by": APPROVER})
         self.assertEqual(st["decidedBy"], APPROVER)
         self.assertEqual(self.api.actions(), [])
         # Once only.
-        self.assertEqual(broker.answer("q1", h, APPROVER, "A", "")[0], 409)
+        self.assertEqual(broker.answer("q1", h, APPROVER, ["A"], "")[0], 409)
+
+    def test_tick_several_and_add_words(self):
+        h = self.asked(question={**self.QUESTION, "multiple": True})["specHash"]
+        self.assertEqual(broker.answer("q1", h, APPROVER, ["B <b>", "A"], "both, B first")[0], 200)
+        a = self.api.status("q1")["answer"]
+        self.assertEqual((a["picked"], a["text"], a["question"]["multiple"]), (["A", "B <b>"], "both, B first", True))
+
+    def test_a_plain_text_question(self):
+        h = self.asked(question={"text": "What should the page be called?", "ifUnanswered": "Ops"})["specHash"]
+        self.assertEqual(broker.answer("q1", h, APPROVER, [], "Approvals")[0], 200)
+        self.assertEqual({k: v for k, v in self.api.status("q1")["answer"].items() if k not in ("at", "by")},
+                         {"question": {"text": "What should the page be called?"}, "text": "Approvals"})
 
     def test_answer_in_words(self):
         h = self.asked()["specHash"]
-        self.assertEqual(broker.answer("q1", h, APPROVER, "", "  Neither: deprecate it.  ")[0], 200)
+        self.assertEqual(broker.answer("q1", h, APPROVER, [], "  Neither: deprecate it.  ")[0], 200)
         self.assertEqual(self.api.status("q1")["answer"]["text"], "Neither: deprecate it.")
-        self.assertNotIn("option", self.api.status("q1")["answer"])
+        self.assertNotIn("picked", self.api.status("q1")["answer"])
 
     def test_bad_answers_are_refused(self):
         h = self.asked()["specHash"]
-        for args in (("C", ""), ("", "   "), ("", "x" * (broker.ANSWER_MAX + 1))):
+        for args in ((["C"], ""), ([], "   "), ([], "x" * (broker.ANSWER_MAX + 1)), (["A", "B <b>"], ""),
+                     (["A", "A"], "")):
             with self.subTest(args):
                 self.assertEqual(broker.answer("q1", h, APPROVER, *args)[0], 400)
-        self.assertEqual(broker.answer("q1", "0" * 16, APPROVER, "A", "")[0], 409)
+        self.assertEqual(broker.answer("q1", "0" * 16, APPROVER, ["A"], "")[0], 409)
         self.assertEqual(self.api.status("q1")["phase"], "Pending")
 
     def test_a_question_cant_be_approved_and_others_cant_be_answered(self):
@@ -2522,7 +2539,7 @@ class TestQuestion(Served, Base):
         self.assertEqual(broker.decide("q1", "approve", h, APPROVER)[0], 400)
         self.assertEqual(broker.decide("q1", "deny", h, APPROVER)[0], 400)
         self.admit("r1", "rollout-restart", "Deployment", "app", "web")
-        self.assertEqual(broker.answer("r1", self.api.status("r1")["specHash"], APPROVER, "", "yes")[0], 400)
+        self.assertEqual(broker.answer("r1", self.api.status("r1")["specHash"], APPROVER, [], "yes")[0], 400)
         self.assertEqual(self.api.status("r1")["phase"], "Pending")
 
     def test_unanswered_it_expires_to_its_default(self):
@@ -2533,7 +2550,7 @@ class TestQuestion(Served, Base):
         self.assertEqual(st["phase"], "Expired")
         self.assertIn("if unanswered", st["message"])
 
-    def test_the_page_shows_it_as_text_with_a_button_per_option(self):
+    def test_the_page_shows_it_as_text_with_a_choice_per_option(self):
         self.add()
         self.api.requests["q1"]["spec"]["question"]["text"] = "<a href=https://evil.test>see</a>"
         broker.scan()
@@ -2541,8 +2558,9 @@ class TestQuestion(Served, Base):
         self.assertEqual(status, 200)
         self.assertNotIn("<a href=https://evil.test", body)
         self.assertIn("&lt;a href=https://evil.test&gt;", body)
-        self.assertIn('name=option value="B &lt;b&gt;"', body)
+        self.assertIn('type=radio name=option value="B &lt;b&gt;"', body)
         self.assertIn("<textarea name=text", body)
+        self.assertNotIn("required", body.split("<textarea")[1].split(">")[0])  # words are optional with options
         self.assertNotIn("value=approve", body)
         self.assertIn("keep it", body)  # what it does if unanswered
 
@@ -2552,6 +2570,12 @@ class TestQuestion(Served, Base):
         status, _ = self.request("POST", "/r/q1", form={"decision": "answer", "hash": h, "text": text[:2000]})
         self.assertEqual(status, 200)
         self.assertEqual(self.api.status("q1")["answer"]["text"], text[:2000].strip())
+        self.add("q2", question={**self.QUESTION, "multiple": True})
+        broker.scan()
+        h2 = self.api.status("q2")["specHash"]
+        self.assertIn("type=checkbox", self.request("GET", "/r/q2")[1])
+        status, _ = self.request("POST", "/r/q2", form={"decision": "answer", "hash": h2, "option": ["A", "B <b>"]})
+        self.assertEqual((status, self.api.status("q2")["answer"]["picked"]), (200, ["A", "B <b>"]))
         body = self.request("GET", "/r/q1")[1]
         self.assertIn("The answer", body)
         self.assertNotIn("<textarea", body)

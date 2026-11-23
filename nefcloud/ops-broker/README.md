@@ -168,14 +168,16 @@ spec:
   ttlSeconds: 43200          # optional, as for every request: how long the question is worth asking
   question:
     text: Drop /v1 now, or keep it until cv-current moves to /v2?
-    options:                 # optional, 2 to 4
+    multiple: false          # optional: true lets you tick any number of the options
+    options:                 # optional, 2 to 8; none makes it a plain-text question
       - {label: Drop it now, then: Remove /v1 and fix cv-current in the same PR set.}
       - {label: Keep it, then: Mark /v1 deprecated and file an issue to move cv-current.}
     ifUnanswered: Keep it, and say so in the PR.
 ```
 
-- **The page.** The question, each option with what the agent then does, and what it does if nobody answers, all as plain text: nothing the agent wrote becomes a link. A button for each option, and a free-text field. **Answer** takes the place of Approve and Deny. Behind the same Google login, from the same `ALLOWED_APPROVERS`. The group page shows an **Answer** button that opens the question's own page, since the options and what follows them only fit there.
-- **The answer** goes to `status.answer`: `option` (the label you picked), `text` (what you wrote), `by` and `at`, and the request ends `Answered`. One answer only: a second one is refused, as a second Approve is. The agent reads it with `kubectl -n ops-broker get opsrequest <name> -o jsonpath='{.status.answer}'`, or waits with `-w`.
+- **Three formats.** Pick one option, tick any number (`multiple: true`), or plain text (no options). You can always answer in your own words as well, or instead.
+- **The page.** The question, each option with what the agent then does, and what it does if nobody answers, all as plain text: nothing the agent wrote becomes a link. One form: the options (radio buttons, or tickboxes if multiple) and a free-text field. **Answer** takes the place of Approve and Deny. Behind the same Google login, from the same `ALLOWED_APPROVERS`. The group page shows an **Answer** button that opens the question's own page, since the options and what follows them only fit there.
+- **The answer** goes to `status.answer`: `question` (its text, options and `multiple`, as asked, so the answer reads on its own), `picked` (the labels you picked, in the question's order), `text` (what you wrote), `by` and `at`, and the request ends `Answered`. One answer only: a second one is refused, as a second Approve is. The requester reads it with `kubectl -n ops-broker get opsrequest <name> -o jsonpath='{.status.answer}'` when it suits it: at once, after other work, or in a later session. The broker doesn't assume how long you take.
 - **Lifetime.** Open until you answer it, the agent withdraws it (it found the answer elsewhere: [Withdrawing a request](#withdrawing-a-request)), or it expires (`ttlSeconds`, 24 h at most). Expired, the agent does what it said in `ifUnanswered`. Quiet hours apply as to any request: a question that will still be open at 07:00 waits for the morning summary.
 - **Its own slots.** `PENDING_QUESTIONS` (3) per requester, apart from `PENDING_CAPS`, as flags have theirs. So questions can't crowd out break-glass requests, and the reverse. A fourth is `Rejected`: an agent with that many open questions should wait for answers, not ask more.
 - **The answer is your input; the question is the agent's.** The answer is typed behind your login, so the agent can take it as yours. The question, the options and their `then` are the agent's own text, and so is anything it quoted in them: the page shows them as its claim, and an agent reading the request back treats them as its own words, not yours.

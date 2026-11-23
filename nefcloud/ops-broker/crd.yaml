@@ -187,6 +187,9 @@ spec:
                     written to status.answer.
                   type: object
                   required: [text, ifUnanswered]
+                  x-kubernetes-validations:
+                    - rule: "!has(self.multiple) || !self.multiple || has(self.options)"
+                      message: multiple needs options to tick
                   properties:
                     text:
                       description: The question, as plain text.
@@ -194,10 +197,12 @@ spec:
                       minLength: 1
                       maxLength: 2000
                     options:
-                      description: Optional answers to pick from (2-4), each with what the agent then does.
+                      description: >-
+                        Optional answers to pick from (2-8), each with what the agent then does. The user
+                        can always answer in their own words too.
                       type: array
                       minItems: 2
-                      maxItems: 4
+                      maxItems: 8
                       x-kubernetes-list-type: map
                       x-kubernetes-list-map-keys: [label]
                       items:
@@ -215,6 +220,9 @@ spec:
                             type: string
                             minLength: 1
                             maxLength: 500
+                    multiple:
+                      description: True to let the user tick any number of the options; else they pick one.
+                      type: boolean
                     ifUnanswered:
                       description: What the agent does if nobody answers before it expires.
                       type: string
@@ -279,12 +287,28 @@ spec:
                 decidedAt: {type: string, format: date-time}
                 finishedAt: {type: string, format: date-time}
                 answer:
-                  description: question; the user's answer (phase Answered).
+                  description: >-
+                    question; the user's answer (phase Answered), with the question and its options as
+                    they were asked, so it reads on its own.
                   type: object
                   properties:
-                    option:
-                      description: The label of the option picked, if one was.
-                      type: string
+                    question:
+                      description: The question as asked (the agent's text).
+                      type: object
+                      properties:
+                        text: {type: string}
+                        multiple: {type: boolean}
+                        options:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              label: {type: string}
+                              then: {type: string}
+                    picked:
+                      description: The labels of the options picked, in the question's order.
+                      type: array
+                      items: {type: string}
                     text:
                       description: What the user wrote, if anything.
                       type: string

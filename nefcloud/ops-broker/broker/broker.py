@@ -23,8 +23,9 @@ GitHub's sign-in, and the minter acts with your token for that one call:
 
 One verb asks instead of acting (README, "Questions"):
 
-  question              The user answers on the request's page (an option
-                        or free text); the answer goes to status.answer.
+  question              The user answers on the request's page (one option,
+                        any options if multiple, and free text); the answer,
+                        with its question, goes to status.answer.
 
 One verb isn't an action but a sign-off (README, "Human review required"):
 
@@ -549,8 +550,10 @@ def check_question(spec):
         return "a question needs text and ifUnanswered"
     options = q.get("options") or []
     labels = [o.get("label") for o in options]
-    if options and (not 2 <= len(options) <= 4 or not all(labels) or len(set(labels)) != len(labels)):
-        return "a question has no options, or 2 to 4 with different labels"
+    if options and (not 2 <= len(options) <= 8 or not all(labels) or len(set(labels)) != len(labels)):
+        return "a question has no options, or 2 to 8 with different labels"
+    if q.get("multiple") and not options:
+        return "multiple needs options to tick"
     return None
 
 
@@ -1224,29 +1227,37 @@ def decide(name, decision, seen_hash, approver, code=None):
 ANSWER_MAX = 2000  # characters of free text
 
 
-def answer(name, seen_hash, approver, option, text):
-    """Answer a question: an option's label, free text, or both. Nothing
-    runs; the answer is the request's status, for the agent that asked.
+def answer(name, seen_hash, approver, picked, text):
+    """Answer a question: the options picked (one, or any number if it's
+    multiple), free text, or both. Free text is always allowed. Nothing runs;
+    the answer is the request's status, for the agent that asked, and carries
+    the question and its options so it reads on its own.
     Returns (http status, message)."""
-    text = text.strip()
+    text, picked = text.strip(), [p for p in picked if p]
     with lock:
         req, refused = decidable(name, seen_hash)
         if refused:
             return refused
         if not is_question(req):
             return 400, "only a question can be answered"
-        labels = [o["label"] for o in req["spec"]["question"].get("options") or []]
-        if option and option not in labels:
-            return 400, "not one of the question's options"
-        if not option and not text:
+        q = req["spec"]["question"]
+        labels = [o["label"] for o in q.get("options") or []]
+        if any(p not in labels for p in picked) or len(set(picked)) != len(picked):
+            return 400, "not the question's options"
+        if len(picked) > 1 and not q.get("multiple"):
+            return 400, "pick one option"
+        if not picked and not text:
             return 400, "pick an option or write an answer"
         if len(text) > ANSWER_MAX:
             return 400, f"the answer is longer than {ANSWER_MAX} characters"
-        given = {k: v for k, v in (("option", option), ("text", text)) if v}
+        picked = [l for l in labels if l in picked]  # in the question's order
+        given = {k: v for k, v in (("picked", picked), ("text", text)) if v}
+        asked = {"text": q["text"], **({"options": q["options"], "multiple": bool(q.get("multiple"))}
+                                       if labels else {})}
         try:
             set_status(req, phase="Answered", decidedBy=approver, decidedAt=stamp(), finishedAt=stamp(),
-                       answer={**given, "by": approver, "at": stamp()},
-                       message=f"answered by {approver}" + (f": {option}" if option else ""))
+                       answer={"question": asked, **given, "by": approver, "at": stamp()},
+                       message=f"answered by {approver}" + (f": {', '.join(picked)}" if picked else ""))
         except K8sError as e:
             return (409 if e.code == 409 else 502), f"not recorded: {e}"
     audit("answered", req, by=approver, **given)
@@ -1392,18 +1403,18 @@ def decision_forms(req, can_approve=True):
 
 
 def answer_forms(req):
-    """A button for each option, and a free-text answer: one form each, so
-    the option is a hidden field the script can't drop."""
+    """One form: the options (pick one, or tick any if it's multiple) and a
+    free-text answer, which is always there. Either or both."""
     h, name = e(req["status"].get("specHash", "")), e(req["metadata"]["name"])
-    start = (f'<form method=post action="/r/{name}"><input type=hidden name=hash value="{h}">'
-             '<input type=hidden name=decision value=answer>')
-    out = "".join(f'{start}<input type=hidden name=option value="{e(o["label"])}">'
-                  f'<button class=approve data-busy="Answering…">{e(o["label"])}</button></form>'
-                  for o in req["spec"]["question"].get("options") or [])
-    return (out + f'<p>Or in your own words:</p><form method=post action="/r/{name}" style="display:block">'
+    q = req["spec"]["question"]
+    kind = "checkbox" if q.get("multiple") else "radio"
+    options = "".join(f'<label style="display:block"><input type={kind} name=option value="{e(o["label"])}"> '
+                      f'{e(o["label"])}</label>' for o in q.get("options") or [])
+    words = "Anything to add, in your own words:" if options else "Your answer:"
+    return (f'<form method=post action="/r/{name}" style="display:block">'
             f'<input type=hidden name=hash value="{h}"><input type=hidden name=decision value=answer>'
-            f'<textarea name=text maxlength={ANSWER_MAX} required></textarea>'
-            '<button class=review data-busy="Answering…">Answer</button></form>')
+            f'{options}<p>{words}</p><textarea name=text maxlength={ANSWER_MAX}></textarea>'
+            '<button class=approve data-busy="Answering…">Answer</button></form>')
 
 
 def question_section(req):
@@ -1412,13 +1423,14 @@ def question_section(req):
     q, st = req["spec"]["question"], req.get("status", {})
     out = f"<h2>The question</h2><p class=reason>{e(q['text'])}</p>"
     if q.get("options"):
-        out += ("<p>The answers it offers, and what it does with each (its claim):</p><table>"
+        out += (f"<p>The answers it offers ({'tick any' if q.get('multiple') else 'pick one'}), "
+                "and what it does with each (its claim):</p><table>"
                 + "".join(f"<tr><td><b>{e(o['label'])}</b></td><td class=reason>{e(o['then'])}</td></tr>"
                           for o in q["options"]) + "</table>")
     out += f"<p>If nobody answers in time, it will:</p><p class=reason>{e(q['ifUnanswered'])}</p>"
     a = st.get("answer")
     if a:
-        out += ("<h2>The answer</h2>" + (f"<p><b>{e(a['option'])}</b></p>" if a.get("option") else "")
+        out += ("<h2>The answer</h2>" + "".join(f"<p><b>{e(p)}</b></p>" for p in a.get("picked") or [])
                 + (f"<p class=reason>{e(a['text'])}</p>" if a.get("text") else "")
                 + f"<p class=muted>{e(a.get('by', ''))}, {e(a.get('at', ''))}</p>")
     if st.get("phase") == "Pending":
@@ -1715,7 +1727,7 @@ def result_page(name, message):
 
 # Bytes in a posted form: room for a free-text answer of ANSWER_MAX characters,
 # percent-encoded (up to 12 bytes each).
-FORM_MAX = 4096 + 12 * ANSWER_MAX
+FORM_MAX = 8192 + 12 * ANSWER_MAX  # and up to 8 picked options
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1797,7 +1809,7 @@ class Handler(BaseHTTPRequestHandler):
         decision = form.get("decision", [""])[0]
         if decision == "answer":
             status, message = answer(name, form.get("hash", [""])[0], approver,
-                                     form.get("option", [""])[0], form.get("text", [""])[0])
+                                     form.get("option", []), form.get("text", [""])[0])
             return self.reply(status, result_page(name, message), html_page=True)
         if decision not in ("approve", "deny"):
             return self.reply(400, "decision must be approve, deny or answer")
