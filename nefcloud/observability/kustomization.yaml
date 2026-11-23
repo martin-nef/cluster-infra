@@ -1,9 +1,10 @@
 # Metrics for the cluster's agents (roadmap: Observability). VictoriaMetrics
 # stores them; the OTel collector is the one OTLP endpoint senders push to
-# (Claude Code first), so a sender never talks to the database itself. No app
-# repo: nothing here is built, and like ops-broker/ it is plain manifests in
-# this repo, out of reach of the agents' own repos. Grafana comes next, in this
-# namespace, with VictoriaMetrics as its datasource.
+# (Claude Code first), so a sender never talks to the database itself, and
+# vmauth gives the agents read-only PromQL. No app repo: nothing here is built,
+# and like ops-broker/ it is plain manifests in this repo, out of reach of the
+# agents' own repos. Grafana comes next, in this namespace, with VictoriaMetrics
+# as its datasource.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -12,9 +13,14 @@ resources:
   - networkpolicy.yaml
   - victoria-metrics.yaml
   - otel-collector.yaml
+  - vmauth.yaml
 configMapGenerator:
-  # Hashed: an edit to the config rolls the collector.
+  # Hashed: an edit to a config rolls its Deployment.
   - name: otel-collector
     namespace: observability
     files:
       - config.yaml=otel-collector-config.yaml
+  - name: vmauth
+    namespace: observability
+    files:
+      - auth.yaml=vmauth-config.yaml

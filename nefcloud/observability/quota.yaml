@@ -1,6 +1,6 @@
-# Live game servers share these nodes. Sized for VictoriaMetrics and the
-# collector plus one collector surge pod during a rollout (VictoriaMetrics is
-# Recreate). Grafana raises this when it moves in.
+# Live game servers share these nodes. Sized for VictoriaMetrics, the collector
+# and vmauth, plus one surge pod each for the collector and vmauth during a
+# rollout (VictoriaMetrics is Recreate). Grafana raises this when it moves in.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -10,14 +10,14 @@ spec:
   hard:
     requests.cpu: 200m
     requests.memory: 512Mi
-    limits.cpu: "1"
+    limits.cpu: 1500m
     limits.memory: 1536Mi
     requests.ephemeral-storage: 512Mi
     limits.ephemeral-storage: 2Gi
     requests.storage: 5Gi
     persistentvolumeclaims: "1"
-    pods: "4"
-    services: "2"
+    pods: "5"
+    services: "3"
 ---
 apiVersion: v1
 kind: LimitRange

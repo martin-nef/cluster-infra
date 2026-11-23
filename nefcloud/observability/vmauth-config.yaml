@@ -1,0 +1,20 @@
+# vmauth's -auth.config: the read-only PromQL endpoint for agents. Only these
+# query paths reach VictoriaMetrics. Anything else (writes such as
+# /api/v1/import or /opentelemetry/..., /api/v1/admin/tsdb/delete_series,
+# /api/v1/export, vmui) matches no route and vmauth refuses it. src_paths must
+# match the whole path.
+unauthorized_user:
+  # More waits up to -maxQueueDuration, then gets 429. Plenty for a few agents.
+  max_concurrent_requests: 4
+  url_map:
+    - src_paths:
+        - /api/v1/query
+        - /api/v1/query_range
+        - /api/v1/series
+        - /api/v1/labels
+        - /api/v1/label/[^/]+/values
+        - /api/v1/metadata
+        # Series count per metric and label: the cardinality check.
+        - /api/v1/status/tsdb
+        - /api/v1/status/buildinfo
+      url_prefix: http://victoria-metrics.observability.svc.cluster.local:8428

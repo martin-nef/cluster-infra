@@ -1,0 +1,81 @@
+# Read-only PromQL for the agents:
+# http://vmauth.observability.svc.cluster.local:8427/api/v1/query (README.md).
+# VictoriaMetrics' own port also takes writes and deletes, so agents get this
+# proxy instead; vmauth-config.yaml lists the paths it passes on.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmauth
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vmauth
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vmauth
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vmauth
+          # Multi-arch index digest of v1.155.0, the same release as
+          # VictoriaMetrics.
+          image: victoriametrics/vmauth:v1.155.0@sha256:dfeb63e5eff4bc32ed0fa2d43d8e85b717e8442c8b5c753e83c216669665a7de
+          args:
+            - -auth.config=/conf/auth.yaml
+            # vmauth's own endpoints (/-/reload, /flags, /metrics, /health) go
+            # on a port no NetworkPolicy opens; only the probe uses it.
+            - -httpInternalListenAddr=:8426
+          ports:
+            - name: http
+              containerPort: 8427
+            - name: internal
+              containerPort: 8426
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: internal
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+              ephemeral-storage: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: vmauth
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmauth
+  namespace: observability
+spec:
+  selector:
+    app.kubernetes.io/name: vmauth
+  ports:
+    - name: http
+      port: 8427
+      targetPort: http
