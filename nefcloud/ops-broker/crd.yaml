@@ -211,7 +211,8 @@ spec:
                   description: >-
                     How long it may wait for a decision. Default the broker's REQUEST_TTL (4 h);
                     capped at its MAX_TTL (12 h). An agent that runs at night asks for long enough to
-                    reach the morning.
+                    reach the morning. Ignored for github-human-review: a flag lasts until its PR is
+                    closed or gets new commits.
                   type: integer
                   minimum: 60
                   maximum: 86400
@@ -220,7 +221,7 @@ spec:
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected]
+                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected, Superseded]
                 message: {type: string}
                 specHash: {type: string}
                 expiresAt: {type: string, format: date-time}

@@ -688,8 +688,8 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
     """Set the human-review status on every open PR head in repo to what
     desired(pr number, head sha) says, or success where one of humans approved
     the head on GitHub. Returns (the flags that have no request yet: [(pr
-    number, head sha, reason, whose: "reviewer" or "code")], the open PR
-    numbers, the GitHub approvals: [(pr number, head sha, login)]).
+    number, head sha, reason, whose: "reviewer" or "code")], the open PRs:
+    {number: head sha}, the GitHub approvals: [(pr number, head sha, login)]).
     triggers(tok, pr) is code_trigger's answer for an unflagged head.
     desired returns (state, description, flagged), flagged meaning a request
     covers this head; state None leaves the head's status as it is (a sign-off
@@ -698,12 +698,12 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
     since desired's were read. link(pr number, head sha) is the status's
     target_url (the request's ops page), or None. Reads with a read-only token;
     one that can write statuses is minted only if a status has to change."""
-    to_file, numbers, approved = [], set(), []
+    to_file, numbers, approved = [], {}, []
     with minter.token(repo, "github-human-review", "sync") as tok, \
             Lazy(lambda: minter.token(repo, "github-human-review", "write")) as write:
         for pr in pages(tok, "/pulls?state=open"):
             number, head = pr["number"], pr["head"]["sha"]
-            numbers.add(number)
+            numbers[number] = head
             state, description, flagged = desired(number, head)
             if state is None:
                 continue

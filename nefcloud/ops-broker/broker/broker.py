@@ -44,15 +44,15 @@ approve anything, so it doesn't matter who else reads the topic: the agent can
 reach ntfy.sh too, but it can't log in as you.
 
 Every transition is written to the request's status (the audit trail, kept for
-RETENTION_DAYS; Rejected and Expired ones, which decided nothing, for
-SHORT_RETENTION_DAYS) and printed as one JSON line.
+RETENTION_DAYS; Rejected, Expired and Superseded ones, which decided nothing,
+for SHORT_RETENTION_DAYS) and printed as one JSON line.
 
 Requests from agents that run while you sleep (README, "Async requesters"):
 
 - spec.requester is stamped by an admission policy from the API server's view
   of who created it, so the page and the caps can trust it.
 - spec.ttlSeconds picks how long it waits, REQUEST_TTL by default and at most
-  MAX_TTL.
+  MAX_TTL. A flag (github-human-review) doesn't expire: its PR ends it.
 - Each requester named in PENDING_CAPS has its own pending slots; everyone else
   shares MAX_PENDING. So a night agent can't take the interactive agent's slots.
 - During QUIET_HOURS, a request that will still be waiting when they end isn't
@@ -102,6 +102,7 @@ MAX_TTL = int(os.environ.get("MAX_TTL", "43200"))
 # "user=n,user=n": requesters (API server usernames) with pending slots of their own.
 PENDING_CAPS = {u.strip(): int(n) for u, _, n in
                 (c.rpartition("=") for c in os.environ.get("PENDING_CAPS", "").split(",") if c.strip())}
+PENDING_FLAGS = int(os.environ.get("PENDING_FLAGS", "20"))  # waiting flags per requester, apart from PENDING_CAPS
 QUIET_HOURS = os.environ.get("QUIET_HOURS", "")  # "22:00-07:00" in QUIET_TZ; empty: never quiet
 QUIET_TZ = os.environ.get("QUIET_TZ", "UTC")
 # Notifications are debounced: a new request waits NOTIFY_DEBOUNCE seconds for
@@ -184,8 +185,8 @@ GITHUB_VERBS = set(githubops.VERBS) | set(githubops.RETIRED)
 USER_VERBS = set(githubops.USER_VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
 POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
-FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected"}
-SHORT_LIVED = {"Expired", "Rejected"}
+FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected", "Superseded"}
+SHORT_LIVED = {"Expired", "Rejected", "Superseded"}
 
 # Serialises every status change, so a request is decided and run at most once.
 # The Deployment is Recreate, so this process is the only broker.
@@ -388,12 +389,34 @@ def ttl(req):
     return min(int(req["spec"].get("ttlSeconds") or REQUEST_TTL), MAX_TTL)
 
 
+def is_flag(req):
+    return req["spec"].get("verb") == "github-human-review"
+
+
 def expires(req):
+    """When it expires unanswered, or None for a flag (github-human-review):
+    its PR bounds it, so it lasts until the PR is closed or its head moves
+    (end_flags, supersede)."""
+    if is_flag(req):
+        return None
     return parse_time(req["metadata"]["creationTimestamp"]) + timedelta(seconds=ttl(req))
 
 
-def pending_cap(who):
-    """(the pool a requester's pending requests count against, its size)."""
+NEVER = datetime.max.replace(tzinfo=timezone.utc)  # sorts after any expiry
+
+
+def soonest(reqs):
+    """When the first of reqs expires, or None if none of them does."""
+    return min((t for t in map(expires, reqs) if t), default=None)
+
+
+def pending_cap(req):
+    """(the pool a request counts against while it waits, its size). Flags have
+    a pool per requester, PENDING_FLAGS: they last as long as their PR, so open
+    flags can't take the slots an agent's break-glass requests need."""
+    who = requester(req)
+    if is_flag(req):
+        return f"flags:{who}", PENDING_FLAGS
     return (who, PENDING_CAPS[who]) if who in PENDING_CAPS else ("", MAX_PENDING)
 
 
@@ -431,10 +454,11 @@ def quiet_until(t=None):
 
 def held(req, t=None):
     """Whether to save its notification for after the quiet hours: it's quiet now, and the
-    request will still be waiting when it stops being quiet. One that would
-    expire before then is announced now, since it's only worth anything now."""
+    request will still be waiting when it stops being quiet (a flag always
+    will). One that would expire before then is announced now, since it's only
+    worth anything now."""
     until = quiet_until(t)
-    return until is not None and expires(req) > until
+    return until is not None and (expires(req) is None or expires(req) > until)
 
 
 def describe(req):
@@ -591,9 +615,6 @@ def human_review_state(head, reqs):
         return None, "being signed off", True
     if p in ("", "Pending"):
         return "pending", f"human review required: {reason}", True
-    if p == "Expired":
-        # Not covered any more, so the reviewer's flag, if it still stands, is filed again.
-        return "pending", "flag expired without a sign-off: flag it again", False
     # Rejected, Failed, Unknown: nobody signed it off. Not filed again by itself,
     # so a request that keeps being rejected (a full queue) can't loop.
     return "pending", f"flag {p.lower()} without a sign-off: flag it again", True
@@ -616,8 +637,7 @@ def file_human_review(repo, pr, head, reason, whose="reviewer"):
         "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
         "metadata": {"generateName": "github-human-review-", "namespace": NAMESPACE},
         "spec": {"verb": "github-human-review", "github": {"repo": repo, "pr": pr, "headSHA": head},
-                 "reason": f"{by}: {reason}"[:1000], "ttlSeconds": MAX_TTL,
-                 "workstream": workstream},
+                 "reason": f"{by}: {reason}"[:1000], "workstream": workstream},
     }, content_type="application/json")
     print(json.dumps({"time": stamp(), "event": "filed", "action": f"github-human-review {GITHUB_OWNER}/{repo}#{pr}",
                       "reason": reason}), flush=True)
@@ -656,16 +676,17 @@ def sync_human_review(rulesets=False):
         print(f"code triggers: can't read {CODE_TRIGGERS}: {e!r}; holding every PR", flush=True)
     if len(TRIGGER_CACHE) > 5000:
         TRIGGER_CACHE.clear()
-    # Filed flags count against the broker's own slots: when they're full, a
+    # Filed flags count against the broker's own flag slots: when they're full, a
     # flag waits for a later pass instead of being rejected for good.
-    room = [pending_cap(SELF)[1] - sum(1 for r in items if requester(r) == SELF and phase(r) in ("", "Pending"))]
+    room = [PENDING_FLAGS - sum(1 for r in items
+                                if requester(r) == SELF and is_flag(r) and phase(r) in ("", "Pending"))]
     with MINTER.token(None, "github-human-review", "list") as tok:
         installed = githubops.installed(tok)
     repos = [(r, n) for r, n in installed if r not in HUMAN_REVIEW_EXCLUDE]
     for repo, open_count in repos:
         if not open_count:
-            OPEN_PRS[repo] = set()  # no open issues or PRs: nothing to set, and no token minted for it
-            clean = end_closed_flags(repo, items) and clean
+            OPEN_PRS[repo] = {}  # no open issues or PRs: nothing to set, and no token minted for it
+            clean = end_flags(repo, items) and clean
             continue
         reqs = human_review_requests(items, repo)
 
@@ -695,50 +716,62 @@ def sync_human_review(rulesets=False):
             clean = False
             print(f"human-review sync {repo}: {e}", flush=True)
             continue
-        clean = end_closed_flags(repo, items) and clean
+        clean = end_flags(repo, items) and clean
     # Only after a pass that set every status it had to: a required check the
     # broker can't set (a missing permission) would hold every PR.
     if rulesets and clean:
         reconcile_rulesets([r for r, _ in installed])
 
 
-def end_closed_flags(repo, items):
-    """End the flags still waiting on a PR that has been closed or merged, so
-    they leave the page and free their slot: Rejected, as an approval of one
-    would be. Candidates are the waiting flags on PRs this pass didn't see
-    open; GitHub confirms each PR is closed (one read per PR, outside the
-    lock), since a PR opened after the pass listed them isn't in OPEN_PRS
-    either. The writes are under the lock, on a fresh list, conditional on
-    the version just read. Returns False if it couldn't finish."""
+def end_flags(repo, items):
+    """End the flags still waiting on a PR that has been closed or merged
+    (Rejected, as an approval of one would be), or whose head has moved on
+    (Superseded: a flag covers exactly one head), so they leave the page and
+    free their slot. Candidates are the waiting flags on PRs this pass didn't
+    see open, or saw at another head; GitHub confirms each (one read per PR,
+    outside the lock), since a PR opened, or a head flagged, after the pass
+    listed them isn't in OPEN_PRS yet. The writes are under the lock, on a
+    fresh list, conditional on the version just read. Returns False if it
+    couldn't finish."""
     seen = OPEN_PRS.get(repo)
+    if seen is None:
+        return True
     waiting = [r for reqs in human_review_requests(items, repo).values() for r in reqs
                if phase(r) in ("", "Pending")]
-    numbers = {int(r["spec"]["github"]["pr"]) for r in waiting} - (seen or set())
-    if seen is None or not numbers:
+    numbers = {int(r["spec"]["github"]["pr"]) for r in waiting
+               if seen.get(int(r["spec"]["github"]["pr"])) != r["spec"]["github"]["headSHA"]}
+    if not numbers:
         return True
-    closed = {}
+    closed, heads = {}, {}
     try:
         with MINTER.token(repo, "github-human-review", "check") as tok:
             for n in sorted(numbers):
                 pr = tok("GET", f"/pulls/{n}")
                 if pr["state"] != "open":
                     closed[n] = "merged" if pr.get("merged") else "closed"
+                else:
+                    heads[n] = pr["head"]["sha"]
     except (githubops.GitHubError, OSError) as e:
-        print(f"human-review {repo}: closed PRs: {e}", flush=True)
+        print(f"human-review {repo}: closed PRs and new heads: {e}", flush=True)
         return False
     with lock:
         for req in human_review_requests(list_requests(), repo).values():
             for r in req:
-                n = int(r["spec"]["github"]["pr"])
-                if n not in closed or phase(r) not in ("", "Pending"):
+                n, sha = int(r["spec"]["github"]["pr"]), r["spec"]["github"]["headSHA"]
+                if phase(r) not in ("", "Pending"):
                     continue
-                message = f"#{n} was {closed[n]}, so there is nothing to sign off"
+                if n in closed:
+                    end = "Rejected", f"#{n} was {closed[n]}, so there is nothing to sign off"
+                elif n in heads and heads[n] != sha:
+                    end = "Superseded", f"#{n} has new commits (head {heads[n][:12]}): flag that head"
+                else:
+                    continue
                 try:
-                    set_status(r, phase="Rejected", finishedAt=stamp(), message=message)
+                    set_status(r, phase=end[0], finishedAt=stamp(), message=end[1])
                 except K8sError as e:
                     print(f"ending {r['metadata']['name']}: {e}", flush=True)  # the next pass tries again
                     continue
-                audit("rejected", r, reason=message)
+                audit(end[0].lower(), r, reason=end[1])
     return True
 
 
@@ -835,7 +868,8 @@ def notify(new, waiting, items):
         n = sum(map(len, added))
         older = len(reqs) - n
         head = f"**{md(titles[key])}**: {n} new" + (f", {older} still waiting" if older else "")
-        head += f", first expires {local(min(expires(r) for r in reqs))}"
+        if soonest(reqs):
+            head += f", first expires {local(soonest(reqs))}"
         lines += [head, *(f"- {md(describe(rs[0]))}: {md(rs[0]['spec']['reason'][:140])}"
                           + (f" ({len(rs) - 1} earlier)" if len(rs) > 1 else "") for rs in added[:SUMMARY_ITEMS])]
         if len(added) > SUMMARY_ITEMS:
@@ -888,7 +922,7 @@ def age(req):
 def tidy(req):
     """Expire, recover or delete one request that is past its time."""
     p = phase(req)
-    if p in ("", "Pending") and now() > expires(req):
+    if p in ("", "Pending") and expires(req) and now() > expires(req):
         set_status(req, phase="Expired", message="nobody approved it in time", finishedAt=stamp())
         audit("expired", req)
     elif p == "Approved" and (now() - parse_time(req["status"].get("decidedAt") or stamp())).total_seconds() > STRANDED_AFTER:
@@ -904,7 +938,7 @@ def tidy(req):
 
 
 def supersede(items):
-    """Expire every github-human-review request that still waits while a newer
+    """End every github-human-review request that still waits while a newer
     one exists for the same PR (a flag for a later head, or the same one filed
     again). Only the newest decides the PR's status (human_review_state), so an
     older one only clutters the queue and takes a pending slot."""
@@ -916,12 +950,12 @@ def supersede(items):
     stale = [r for r in items if r["spec"].get("verb") == "github-human-review" and phase(r) in ("", "Pending")
              and newest[(r["spec"]["github"].get("repo"), int(r["spec"]["github"].get("pr") or 0))] is not r]
 
-    def expire(req):
+    def end(req):
         n = newest[(req["spec"]["github"].get("repo"), int(req["spec"]["github"].get("pr") or 0))]
-        set_status(req, phase="Expired", finishedAt=stamp(),
+        set_status(req, phase="Superseded", finishedAt=stamp(),
                    message=f"superseded by {n['metadata']['name']} (head {n['spec']['github']['headSHA'][:12]})")
-        audit("expired", req, reason="superseded", by=n["metadata"]["name"])
-    each(stale, expire)
+        audit("superseded", req, by=n["metadata"]["name"])
+    each(stale, end)
 
 
 def pr_closed(req):
@@ -937,15 +971,17 @@ def admit(req, pending, checked):
     pending counts the Pending requests per pool (pending_cap). Returns
     whether it is now Pending."""
     problem, uid = checked
-    pool, cap = pending_cap(requester(req))
+    pool, cap = pending_cap(req)
     if problem is None and pending.get(pool, 0) >= cap:
-        problem = (f"{cap} requests from {pool} already wait for a decision" if pool else
+        problem = (f"{cap} flags from {requester(req)} already wait for a sign-off" if is_flag(req) else
+                   f"{cap} requests from {pool} already wait for a decision" if pool else
                    f"{cap} requests already wait for a decision")
     if problem:
         set_status(req, phase="Rejected", message=problem, finishedAt=stamp())
         audit("rejected", req, reason=problem)
         return False
-    set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid, expiresAt=stamp(expires(req)),
+    set_status(req, phase="Pending", specHash=spec_hash(req), targetUID=uid,
+               **({"expiresAt": stamp(expires(req))} if expires(req) else {}),
                message=f"waiting for approval at {PUBLIC_URL}/r/{req['metadata']['name']}")
     audit("pending", req, reason=req["spec"]["reason"], workstream=req["spec"].get("workstream", ""),
           session=session(req))
@@ -984,7 +1020,7 @@ def announce_at(new, items):
     sent = [parse_time(r["status"]["notifiedAt"]) for r in items if r.get("status", {}).get("notifiedAt")]
     if sent:
         paced = max(due, max(sent) + timedelta(seconds=NOTIFY_INTERVAL))
-        if not any(paced - t > (expires(r) - t) / 2 for r in new):
+        if not any(expires(r) and paced - t > (expires(r) - t) / 2 for r in new):
             due = paced
     return due
 
@@ -1024,13 +1060,13 @@ def scan():
         pending = {}
         for r in items:
             if phase(r) == "Pending":
-                pool = pending_cap(requester(r))[0]
+                pool = pending_cap(r)[0]
                 pending[pool] = pending.get(pool, 0) + 1
 
         def admit_new(req):
             name = req["metadata"]["name"]
             if phase(req) == "" and name in checked and admit(req, pending, checked[name]):
-                pool = pending_cap(requester(req))[0]
+                pool = pending_cap(req)[0]
                 pending[pool] = pending.get(pool, 0) + 1
         each(items, admit_new)
         announce(items)
@@ -1044,7 +1080,7 @@ def decidable(name, seen_hash):
         return None, ((404 if e.code == 404 else 502), str(e))
     if phase(req) != "Pending":
         return None, (409, f"it is {phase(req) or 'not yet admitted'}, not Pending")
-    if now() > expires(req):
+    if expires(req) and now() > expires(req):
         return None, (409, "it has expired")
     # spec is immutable in the CRD; this also catches a page that went stale.
     if seen_hash != spec_hash(req) or seen_hash != req["status"].get("specHash"):
@@ -1234,7 +1270,7 @@ def request_page(req, items):
             ("Status", e(st.get("message", ""))),
             ("Requester", e(s.get("requester") or "unknown (made without the admission policy)")),
             ("Created", e(req["metadata"]["creationTimestamp"])),
-            ("Expires", e(stamp(expires(req))))]
+            ("Expires", e(stamp(expires(req)) if expires(req) else "no: it lasts while its PR is open at this head"))]
     if st.get("decidedBy"):
         rows.append(("Decided by", e(st["decidedBy"])))
     body = (f"<h1>{e(describe(req))}</h1><p class=muted>{e(req['metadata']['name'])}</p><table>"
@@ -1276,8 +1312,9 @@ def item(req, clamp=False, actions=False):
     a Pending one can be decided with from the list."""
     st, name = req.get("status", {}), e(req["metadata"]["name"])
     p = st.get("phase", "")
-    when = f"expires {local(expires(req))}" if p == "Pending" else f"{p.lower() or 'new'}, " + local(
-        parse_time(st.get("finishedAt") or req["metadata"]["creationTimestamp"]))
+    when = f"{p.lower() or 'new'}, " + local(parse_time(st.get("finishedAt") or req["metadata"]["creationTimestamp"]))
+    if p == "Pending":
+        when = f"expires {local(expires(req))}" if expires(req) else "doesn't expire"
     out = (f'<div class=item><a href="/r/{name}"><code>{e(describe(req))}</code></a> '
            f'<span class="phase {e(p)}">{e(p or "new")}</span> <span class=muted>{e(when)} · {e(filed_by(req))}</span>'
            f'<div class="reason{" clamp" if clamp else ""}">{e(req["spec"]["reason"])}</div>')
@@ -1318,7 +1355,7 @@ def group_summary(key, reqs):
     waiting = [r for r in reqs if phase(r) == "Pending"]
     others = len(reqs) - len(waiting)
     badge = f"<span class=badge>{len(waiting)} waiting</span>" if waiting else ""
-    meta = (f"first expires {local(min(expires(r) for r in waiting))}" if waiting else
+    meta = (f"first expires {local(soonest(waiting))}" if soonest(waiting) else
             f"latest {local(parse_time(reqs[0]['metadata']['creationTimestamp']))}")
     meta += f" · {others} decided or closed" if others else ""
     return f"<b>{e(group_title(key, reqs))}</b>{badge}<br><span class=muted>{e(meta)}</span>"
@@ -1331,7 +1368,7 @@ def index_page(items):
     ones are on the group's page."""
     by = groups(items)
     waiting = sorted((k for k, rs in by.items() if any(phase(r) == "Pending" for r in rs)),
-                     key=lambda k: min(expires(r) for r in by[k] if phase(r) == "Pending"))
+                     key=lambda k: soonest(r for r in by[k] if phase(r) == "Pending") or NEVER)
     rest = [k for k in by if k not in waiting][:GROUPS_SHOWN]  # groups() is newest first
     out = []
     for key in waiting + rest:
