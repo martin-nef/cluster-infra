@@ -209,9 +209,9 @@ spec:
                   pattern: ^[^\r\n]+$
                 ttlSeconds:
                   description: >-
-                    How long it may wait for a decision. Default the broker's REQUEST_TTL (4 h);
-                    capped at its MAX_TTL (12 h). An agent that runs at night asks for long enough to
-                    reach the morning. Ignored for github-human-review: a flag lasts until its PR is
+                    How long it may wait for a decision. Default the broker's REQUEST_TTL (24 h);
+                    capped at its MAX_TTL (24 h). Shorter only for a request that is worth nothing
+                    later. Ignored for github-human-review: a flag lasts until its PR is
                     closed or gets new commits.
                   type: integer
                   minimum: 60
