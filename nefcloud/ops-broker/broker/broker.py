@@ -1334,9 +1334,9 @@ def index_page(items):
     out = []
     for key in waiting + rest:
         reqs = by[key]
-        live = split(reqs)[0]  # decided ones are on the group's page
+        live = [[r for r in rs if phase(r) == "Pending"] for rs in split(reqs)[0]]  # decided: on the group's page
         out.append(f'<details class=group{" open" if key in waiting else ""}><summary>{group_summary(key, reqs)}'
-                   "</summary>" + (subjects(live, 0, clamp=True) or "<p class=muted>Nothing waiting.</p>")
+                   "</summary>" + (subjects(live, len(reqs), clamp=True) or "<p class=muted>Nothing waiting.</p>")
                    + f'<p><a href="/g/{group_id(key)}">Open the group</a> ({plural(len(reqs), "request")})</p></details>')
     n = sum(phase(r) == "Pending" for r in items)
     lead = (f"<p>{plural(n, 'request')} waiting, in {plural(len(waiting), 'group')}.</p>" if n else

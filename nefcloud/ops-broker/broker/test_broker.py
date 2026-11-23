@@ -732,6 +732,13 @@ class TestHTTP(Served, Base):
         self.assertIn("/r/waiting", body)
         self.assertNotIn("/r/done", body)  # decided: on the group's page only
 
+    def test_index_hides_a_decided_request_newer_than_a_waiting_one(self):
+        self.admit("waiting", "rollout-restart", "Deployment", "app", "web")
+        self.api.add("done", "rollout-restart", "Deployment", "app", "web", phase="Succeeded")
+        body = self.request("GET", "/")[1]
+        self.assertIn("/r/waiting", body)
+        self.assertNotIn("/r/done", body)
+
     def test_page_escapes_the_reason(self):
         self.api.add("r1", "rollout-restart", "Deployment", "app", "web")
         self.api.requests["r1"]["spec"]["reason"] = "<script>alert(1)</script>"
