@@ -71,3 +71,33 @@ spec:
       ports:
         - {protocol: TCP, port: 443}
         - {protocol: TCP, port: 80}
+---
+# Push metrics to the OTel collector, and query them read-only through vmauth
+# (nefcloud/observability/README.md).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-observability
+  namespace: claude-remote
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - {protocol: TCP, port: 4318}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vmauth
+      ports:
+        - {protocol: TCP, port: 8427}

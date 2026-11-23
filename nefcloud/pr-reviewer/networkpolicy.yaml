@@ -1,7 +1,8 @@
 # Default deny, then one policy per exception, as in claude-remote/. The review
 # Jobs read code written by other people, and trusted ones run its tests, so
 # they get the internet over HTTPS (GitHub, Anthropic, package registries) and
-# nothing inside: no LAN, tailnet, cluster services or API server.
+# inside only the metrics endpoints in observability: no LAN, tailnet, other
+# cluster services or API server.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -92,3 +93,33 @@ spec:
               - 169.254.0.0/16
       ports:
         - {protocol: TCP, port: 443}
+---
+# Push metrics to the OTel collector, and query them read-only through vmauth
+# (nefcloud/observability/README.md).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-observability
+  namespace: pr-reviewer
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - {protocol: TCP, port: 4318}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vmauth
+      ports:
+        - {protocol: TCP, port: 8427}
