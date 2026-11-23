@@ -16,8 +16,9 @@ with a third App (the "ops" App) whose key only the token minter holds:
   github-create-repo        Create a repo under the owner's account (USER_VERBS).
   github-human-review       Sign off a PR that an agent flagged as needing a
                             human: the human-review status on its head turns
-                            success. Until then sync() keeps it pending, and a
-                            required human-review check keeps the PR unmerged.
+                            success. Until then sync() keeps it pending (failure
+                            once denied), and a required human-review check
+                            keeps the PR unmerged.
   github-require-human-review
                             Retired: the broker keeps the ruleset itself
                             (reconcile_ruleset). RETIRED.
@@ -708,7 +709,9 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
                 continue
             reason = None
             # Already signed off, or nothing to look at: no reviews read.
-            reviews = pages(tok, f"/pulls/{number}/reviews") if state == "pending" or not flagged else []
+            # failure: you denied it, but approving the head on GitHub still signs it off.
+            held = state in ("pending", "failure")
+            reviews = pages(tok, f"/pulls/{number}/reviews") if held or not flagged else []
             login = human_approval(reviews, humans, head)
             if not flagged:
                 flag = reviewer_flag(reviews, reviewer, head)
@@ -727,7 +730,7 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
                     if fileable and not login:
                         to_file.append((number, head, reason, "code"))
                     state, description = "pending", f"human review required: {reason}"
-            if state == "pending" and login:
+            if state in ("pending", "failure") and login:
                 # Worded as human_review_state words the request it signs off,
                 # so the next pass writes nothing.
                 state, description = "success", f"signed off by {login} (GitHub review)"
@@ -735,7 +738,7 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
                     approved.append((number, head, login))
             current = tok("GET", f"/commits/{head}/status")
             mine = [s for s in current.get("statuses", []) if s.get("context") == HUMAN_REVIEW]
-            if mine and mine[0].get("state") == "success" and state == "pending" and not reason and recheck:
+            if mine and mine[0].get("state") == "success" and state in ("pending", "failure") and not reason and recheck:
                 state, description, _ = recheck(number, head)
                 if state is None:
                     continue

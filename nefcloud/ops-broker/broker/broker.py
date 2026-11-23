@@ -583,7 +583,8 @@ def human_review_state(head, reqs):
     if p == "Succeeded":
         return "success", f"signed off by {last['status'].get('decidedBy', 'a human')}", True
     if p == "Denied":
-        return "pending", f"denied by {last['status'].get('decidedBy', 'a human')}: change it and flag it again", True
+        # failure, not pending: the check shows red, and agent-pr reports it blocked, not settling.
+        return "failure", f"denied by {last['status'].get('decidedBy', 'a human')}: change it and flag it again", True
     if p == "Approved":
         # The run sets success before the request is Succeeded: writing pending
         # now would undo it (cluster-infra#67). tidy ends a stranded one as Unknown.
