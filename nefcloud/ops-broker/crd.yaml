@@ -189,6 +189,13 @@ spec:
                     admission policy, whatever the request said; don't set it.
                   type: string
                   maxLength: 253
+                onBehalfOf:
+                  description: >-
+                    The broker's own flags only: whose PR it is, the agent the PR's ops tag names
+                    (agent-pr tag), else its GitHub author. The agent's word; it only names the group.
+                    Ignored on anyone else's request.
+                  type: string
+                  maxLength: 253
                 session:
                   description: >-
                     The requester's session: the Claude session id for claude-remote (CLAUDE_CODE_SESSION_ID),

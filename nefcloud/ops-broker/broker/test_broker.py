@@ -1497,10 +1497,11 @@ SESSION = "b1b3da34-05d3-461e-8ad8-c05f03d16ef2"  # claude.ai's session_01Nwipye
 class TestSessions(Served, Base):
     """One group per agent session, titled <theme> - <worker>, one row per subject."""
 
-    def flag(self, name, who, pr, session=None, workstream=None, age=0, **status):
-        spec = {"verb": "github-human-review", "requester": who, "reason": f"because {name}",
+    def flag(self, name, who, pr, session=None, workstream=None, age=0, on_behalf_of=None, **status):
+        spec = {"verb": "github-human-review", "requester": who, "reason": f"code trigger: because {name}",
                 "github": {"repo": "web", "pr": pr, "headSHA": BASE}}
-        spec.update({k: v for k, v in (("session", session), ("workstream", workstream)) if v})
+        spec.update({k: v for k, v in (("session", session), ("workstream", workstream),
+                                       ("onBehalfOf", on_behalf_of)) if v})
         self.api.requests[name] = {
             "metadata": {"name": name, "resourceVersion": "1",
                          "creationTimestamp": broker.stamp(broker.now() - timedelta(seconds=age))},
@@ -1549,13 +1550,36 @@ class TestSessions(Served, Base):
         self.flag("other", broker.SELF, 6, workstream="Code triggers")
         keys = self.keys()
         self.assertEqual(keys["trigger"], (None, "s2"))  # the session that last filed for it
-        self.assertEqual(keys["other"], (broker.SELF, "Code triggers"))
+        self.assertEqual(keys["other"], (broker.SELF, "web#6"))  # an old flag of no session: its PR's group
         body = self.request("GET", f"/g/{broker.group_id(keys['trigger'])}")[1]
         self.assertIn("<h1>rework - claude-remote</h1>", body)  # the broker's workstream isn't the theme
         self.assertIn("/r/trigger", body)
-        self.assertIn(" · ops-broker: Code triggers</span>", body)  # the broker's flag, in the agent's group
-        self.assertIn("Code triggers - ops-broker", self.request("GET", "/")[1])
+        self.assertIn(" · ops-broker (code trigger)</span>", body)  # the broker's flag, in the agent's group
+        index = self.request("GET", "/")[1]
+        self.assertIn("<b>web#6 - ops-broker</b>", index)
+        self.assertNotIn("Code triggers", index)
         self.assertIn(f'href="/g/{broker.group_id(keys["trigger"])}">Its group', self.request("GET", "/r/trigger")[1])
+
+    def test_a_flag_for_a_tagged_pr_is_in_the_group_of_the_session_that_made_it(self):
+        night = "system:serviceaccount:night-shift:worker"
+        self.flag("trigger", broker.SELF, 7, "roadmap-q", "Ops broker verb: question", age=10, on_behalf_of=night)
+        self.flag("review", broker.SELF, 8, "roadmap-q", "Ops broker verb: question", on_behalf_of=night)
+        keys = self.keys()
+        self.assertEqual(keys["trigger"], keys["review"])
+        self.assertEqual(keys["trigger"], (None, "roadmap-q"))
+        index = self.request("GET", "/")[1]
+        self.assertIn("<b>Ops broker verb: question - night-shift/worker</b>", index)  # not "- ops-broker"
+        body = self.request("GET", f"/g/{broker.group_id(keys['trigger'])}")[1]
+        self.assertIn(" · ops-broker (code trigger) for night-shift/worker</span>", body)
+
+    def test_a_flag_for_an_untagged_pr_is_its_prs_group_by_its_author(self):
+        self.flag("trigger", broker.SELF, 9, workstream="Bump the image", on_behalf_of="martin-nef")
+        self.assertEqual(self.keys()["trigger"], (broker.SELF, "web#9"))
+        self.assertIn("<b>Bump the image - martin-nef</b>", self.request("GET", "/")[1])
+
+    def test_an_agents_word_on_its_own_request_doesnt_name_the_group(self):
+        self.flag("a1", AGENT, 5, "s1", "ops page", on_behalf_of="someone-else")
+        self.assertIn("<b>ops page - claude-remote</b>", self.request("GET", "/")[1])
 
     def test_one_row_per_subject_the_rest_folded_under_it(self):
         self.flag("old", AGENT, 5, "s1", age=30, phase="Expired")
@@ -1707,7 +1731,7 @@ class TestHumanReview(Served, GitHubBase):
             self.addCleanup(p.stop)
 
     def requests_filed(self):
-        return [r for r in self.api.requests.values() if r["spec"].get("workstream") == "Code triggers"]
+        return [r for r in self.api.requests.values() if r["spec"]["reason"].startswith("code trigger: ")]
 
     def description(self, sha=HEAD):
         return [s for s in self.gh.statuses.get(sha, []) if s["context"] == "human-review"][0]["description"]
@@ -1723,6 +1747,26 @@ class TestHumanReview(Served, GitHubBase):
         filed, = self.requests_filed()
         self.assertEqual(filed["spec"]["reason"], "code trigger: touches RBAC (rbac.yaml)")
         self.assertEqual(filed["spec"]["github"], {"repo": "web", "pr": 5, "headSHA": HEAD})
+        # No ops tag: whose and what come from the PR's author and title.
+        self.assertEqual((filed["spec"]["onBehalfOf"], filed["spec"]["workstream"]), ("agent[bot]", "Widen <RBAC>"))
+        self.assertNotIn("session", filed["spec"])
+
+    def test_a_flag_carries_the_session_its_prs_ops_tag_names(self):
+        self.triggers({"trusted": ["agent[bot]"], "triggers": [{"what": "RBAC", "paths": ["rbac"]}]})
+        self.gh.pulls[5]["body"] = ("Why.\n\n<!-- ops-session: roadmap-q agent: system:serviceaccount:night-shift:worker "
+                                   "workstream: Ops broker verb: question -->\n\n🤖 Generated")
+        broker.sync_human_review()
+        filed, = self.requests_filed()
+        self.assertEqual({k: filed["spec"][k] for k in ("session", "workstream", "onBehalfOf")},
+                         {"session": "roadmap-q", "workstream": "Ops broker verb: question",
+                          "onBehalfOf": "system:serviceaccount:night-shift:worker"})
+
+    def test_a_malformed_ops_tag_is_no_tag(self):
+        for body in ("<!-- ops-session: bad#id agent: a workstream: w -->",
+                     "<!-- ops-session: s agent: a workstream: two\nlines -->", None):
+            with self.subTest(body):
+                owner = broker.githubops.pr_owner({"body": body, "title": "T", "user": {"login": "u"}})
+                self.assertEqual(owner, {"agent": "u", "workstream": "T"})
 
     def kind_rules(self):
         self.triggers({"trusted": ["agent[bot]"], "triggers": [
@@ -2067,7 +2111,8 @@ class TestHumanReview(Served, GitHubBase):
         with mock.patch.object(broker, "file_human_review", lambda *a: created.append(a)):
             broker.sync_human_review()
         self.assertEqual(self.status(f"{159:040d}"), "success")  # past the first 100 PRs
-        self.assertEqual(created, [("web", 150, flagged, "late", "reviewer")])  # past the first 100 reviews
+        owner = {"agent": "agent[bot]", "workstream": "Widen <RBAC>"}  # no ops tag: its author and title
+        self.assertEqual(created, [("web", 150, flagged, "late", "reviewer", owner)])  # past the first 100 reviews
 
     def test_a_fresh_sign_off_isnt_overwritten_by_a_stale_read(self):
         self.flag()

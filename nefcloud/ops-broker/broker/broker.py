@@ -34,7 +34,9 @@ One verb isn't an action but a sign-off (README, "Human review required"):
 The broker checks the target exists and marks the request Pending. Requests
 are grouped by spec.session, the requester's own label for the session that
 asked, titled by its latest spec.workstream (the theme) and the requesters
-that named it; without a session, by requester and workstream. Within a group, only
+that named it; without a session, by requester and workstream. The broker's
+own flags join the session the PR's ops tag names (githubops.pr_owner), else
+their PR's own group. Within a group, only
 the newest request per subject shows (subject). Notifications are debounced (announce): one ntfy summary
 of everything new, by group, linking to each group's page, PUBLIC_URL/g/<id>,
 which lists its requests, PUBLIC_URL/r/<name>. The pages are behind Traefik's
@@ -264,13 +266,27 @@ def session(req):
     return req["spec"].get("session", "")
 
 
+def on_behalf_of(req):
+    """Whose PR the broker filed a flag for: the agent its ops tag names, or its
+    GitHub author. Empty for anything else."""
+    return req["spec"].get("onBehalfOf", "") if requester(req) == SELF else ""
+
+
+# The workstreams the broker gave its flags before they named whose PR they
+# were for: not a theme, so such a flag groups by its PR.
+OLD_FLAG_LABELS = {"Code triggers", "PR reviewer's flags"}
+
+
 def group_key(req):
     """The group a request files itself under: (None, session), or without a
     session (older clients), (requester, workstream). A session's group is the
     session alone: its work spans requesters (the agent, the broker's flags for
-    it), and each request shows its own."""
+    it), and each request shows its own. The broker's flag for a PR with no
+    ops tag groups by the PR: (SELF, "repo#n")."""
     if session(req):
         return None, session(req)
+    if requester(req) == SELF and req["spec"].get("github", {}).get("pr"):
+        return SELF, f"{req['spec']['github']['repo']}#{req['spec']['github']['pr']}"
     return requester(req), req["spec"].get("workstream", "")
 
 
@@ -321,9 +337,13 @@ def agent_name(who):
 
 def theme(key, reqs):
     """What the group is about: its workstream, or a session's latest one
-    (reqs newest first). Not from what the broker filed into it."""
+    (reqs newest first), its PR's title for a PR's group, else the PR."""
+    if key[0] == SELF:
+        return next((r["spec"]["workstream"] for r in reqs
+                     if r["spec"].get("workstream") not in (None, *OLD_FLAG_LABELS)), key[1])
     if key[0] is not None:
         return key[1]
+    # A flag the broker filed into it by subject (group_keys) names another session's theme.
     return next((r["spec"]["workstream"] for r in reqs
                  if session(r) == key[1] and r["spec"].get("workstream")), "")
 
@@ -331,10 +351,15 @@ def theme(key, reqs):
 def workers(key, reqs):
     """Who the group's work is from: its requester, or the requesters that
     named the session, newest first. More than one shows: the session is the
-    agents' own label, and the stamped requesters are what can't be faked."""
+    agents' own label, and the stamped requesters are what can't be faked.
+    For the broker's flags, whose PR they're for (on_behalf_of): the agent's
+    own word, like the session."""
+    if key[0] == SELF:
+        return list(dict.fromkeys(on_behalf_of(r) for r in reqs if on_behalf_of(r))) or [SELF]
     if key[0] is not None:
         return [key[0]]
-    return list(dict.fromkeys(requester(r) for r in reqs if session(r) == key[1]))
+    named = [(on_behalf_of(r) if requester(r) == SELF else requester(r)) for r in reqs if session(r) == key[1]]
+    return list(dict.fromkeys(w for w in named if w)) or [SELF]
 
 
 def group_title(key, reqs):
@@ -630,16 +655,20 @@ def review_url(reqs, head):
     return f"{PUBLIC_URL}/r/{mine[-1]['metadata']['name']}" if mine else None
 
 
-def file_human_review(repo, pr, head, reason, whose="reviewer"):
+def file_human_review(repo, pr, head, reason, whose="reviewer", owner=None):
     """File a request for the reviewer's flag or a code trigger. The admission
-    policy stamps this broker as the requester; the reason says whose flag it is."""
-    by, workstream = ((REVIEWER_LOGIN, "PR reviewer's flags") if whose == "reviewer"
-                      else ("code trigger", "Code triggers"))
+    policy stamps this broker as the requester; the reason says whose flag it is.
+    owner (githubops.pr_owner): the session, theme and agent the PR names, so
+    the flag joins the group of the session that made the PR."""
+    by = REVIEWER_LOGIN if whose == "reviewer" else "code trigger"
+    owner = owner or {}
+    spec = {"verb": "github-human-review", "github": {"repo": repo, "pr": pr, "headSHA": head},
+            "reason": f"{by}: {reason}"[:1000]}
+    spec.update({k: v for k, v in (("session", owner.get("session")), ("workstream", owner.get("workstream")),
+                                   ("onBehalfOf", owner.get("agent"))) if v})
     k8s("POST", REQUESTS, {
         "apiVersion": "ops.nefcloud.top/v1alpha1", "kind": "OpsRequest",
-        "metadata": {"generateName": "github-human-review-", "namespace": NAMESPACE},
-        "spec": {"verb": "github-human-review", "github": {"repo": repo, "pr": pr, "headSHA": head},
-                 "reason": f"{by}: {reason}"[:1000], "workstream": workstream},
+        "metadata": {"generateName": "github-human-review-", "namespace": NAMESPACE}, "spec": spec,
     }, content_type="application/json")
     print(json.dumps({"time": stamp(), "event": "filed", "action": f"github-human-review {GITHUB_OWNER}/{repo}#{pr}",
                       "reason": reason}), flush=True)
@@ -706,11 +735,11 @@ def sync_human_review(rulesets=False):
             to_file, OPEN_PRS[repo], approved = githubops.sync(
                 MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck,
                 HUMAN_REVIEWERS, link=lambda pr, head: review_url(reqs.get(pr, []), head), triggers=triggers)
-            for pr, head, reason, whose in to_file:
+            for pr, head, reason, whose, owner in to_file:
                 if room[0] <= 0:
                     print(f"human-review {repo}#{pr}: no free slot; filed on a later pass", flush=True)
                     continue
-                file_human_review(repo, pr, head, reason, whose)
+                file_human_review(repo, pr, head, reason, whose, owner)
                 room[0] -= 1
             for pr, head, login in approved:
                 signed_off_on_github(repo, pr, head, login)
@@ -1354,10 +1383,12 @@ def request_page(req, items):
 
 def filed_by(req):
     """Who filed it, for its line in a group: the stamped requester, and for the
-    broker's own flags whose they are (its workstream, which only it sets)."""
+    broker's own flags why (code trigger or the reviewer) and whose PR."""
     who = agent_name(requester(req))
-    if requester(req) == SELF and req["spec"].get("workstream"):
-        return f"{who}: {req['spec']['workstream']}"
+    if requester(req) == SELF:
+        why = req["spec"]["reason"].partition(":")[0]
+        mine = f" for {agent_name(on_behalf_of(req))}" if on_behalf_of(req) else ""
+        return f"{who} ({why}){mine}"
     return who
 
 

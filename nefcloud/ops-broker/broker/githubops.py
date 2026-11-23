@@ -684,11 +684,29 @@ class Lazy:
         return self.tok(*args)
 
 
+# The ops tag an agent ends its PR body with (agent-pr tag): the session and
+# theme its ops requests carry, and the agent's own username. The broker's
+# flags for the PR join that session's group. Grouping only: it's the agent's
+# word, like spec.session, and nothing is decided on it.
+OPS_TAG = re.compile(r"<!-- ops-session: ([A-Za-z0-9_.:-]{1,100}) agent: ([A-Za-z0-9_.:@\[\]-]{1,253}) "
+                     r"workstream: ([^\r\n]{1,80}?) -->")
+
+
+def pr_owner(pr):
+    """Whose PR it is, for the broker's flags on it: {session, agent,
+    workstream} from its ops tag, or without one {agent: its GitHub author,
+    workstream: its title}."""
+    if m := OPS_TAG.search(pr.get("body") or ""):
+        return {"session": m.group(1), "agent": m.group(2), "workstream": m.group(3).strip()}
+    title = " ".join((pr.get("title") or "").split())[:80]
+    return {"agent": (pr.get("user") or {}).get("login", "")[:253], **({"workstream": title} if title else {})}
+
+
 def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, triggers=None):
     """Set the human-review status on every open PR head in repo to what
     desired(pr number, head sha) says, or success where one of humans approved
     the head on GitHub. Returns (the flags that have no request yet: [(pr
-    number, head sha, reason, whose: "reviewer" or "code")], the open PRs:
+    number, head sha, reason, whose: "reviewer" or "code", pr_owner)], the open PRs:
     {number: head sha}, the GitHub approvals: [(pr number, head sha, login)]).
     triggers(tok, pr) is code_trigger's answer for an unflagged head.
     desired returns (state, description, flagged), flagged meaning a request
@@ -720,7 +738,7 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
                     reason, ready = flag
                     if ready:
                         if not login:  # you've already looked: nothing to file
-                            to_file.append((number, head, reason, "reviewer"))
+                            to_file.append((number, head, reason, "reviewer", pr_owner(pr)))
                         state, description = "pending", f"human review required: {reason}"
                     else:
                         # Held, but nobody is pinged until the author has done what's required.
@@ -728,7 +746,7 @@ def sync(minter, repo, desired, reviewer, recheck=None, humans=(), link=None, tr
                 elif trigger:
                     reason, fileable = trigger
                     if fileable and not login:
-                        to_file.append((number, head, reason, "code"))
+                        to_file.append((number, head, reason, "code", pr_owner(pr)))
                     state, description = "pending", f"human review required: {reason}"
             if state in ("pending", "failure") and login:
                 # Worded as human_review_state words the request it signs off,
