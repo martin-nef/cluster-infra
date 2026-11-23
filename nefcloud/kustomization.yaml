@@ -4,7 +4,6 @@ resources:
   - flux-system
   - tailscale
   - apps
-  - longhorn
   - oauth2-proxy
   - cloudflared
   - traefik
