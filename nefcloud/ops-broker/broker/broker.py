@@ -599,10 +599,12 @@ def human_review_state(head, reqs):
     return "pending", f"flag {p.lower()} without a sign-off: flag it again", True
 
 
-def review_url(reqs):
-    """The ops page of a PR's newest human-review request, or None if it has
-    none: the human-review check's Details link."""
-    return f"{PUBLIC_URL}/r/{reqs[-1]['metadata']['name']}" if reqs else None
+def review_url(reqs, head):
+    """The ops page of the newest human-review request for exactly this head, or
+    None if it has none: the human-review check's Details link. An earlier
+    head's request has expired or been superseded, so it isn't linked."""
+    mine = [r for r in reqs if r["spec"]["github"]["headSHA"] == head]
+    return f"{PUBLIC_URL}/r/{mine[-1]['metadata']['name']}" if mine else None
 
 
 def file_human_review(repo, pr, head, reason, whose="reviewer"):
@@ -680,7 +682,7 @@ def sync_human_review(rulesets=False):
         try:
             to_file, OPEN_PRS[repo], approved = githubops.sync(
                 MINTER, repo, lambda pr, head: human_review_state(head, reqs.get(pr, [])), REVIEWER_LOGIN, recheck,
-                HUMAN_REVIEWERS, link=lambda pr, head: review_url(reqs.get(pr, [])), triggers=triggers)
+                HUMAN_REVIEWERS, link=lambda pr, head: review_url(reqs.get(pr, []), head), triggers=triggers)
             for pr, head, reason, whose in to_file:
                 if room[0] <= 0:
                     print(f"human-review {repo}#{pr}: no free slot; filed on a later pass", flush=True)
