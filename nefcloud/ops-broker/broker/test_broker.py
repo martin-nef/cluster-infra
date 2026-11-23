@@ -35,6 +35,9 @@ os.environ.update(
     MAX_PENDING="2",
     RETENTION_DAYS="90",
     GITHUB_OWNER="owner",
+    # broker.SELF comes from it; a pod's own namespace (claude-remote's, say)
+    # must not leak into the broker's identity here.
+    POD_NAMESPACE="ops-broker",
     # Announced on the scan that admits them, unless a test says otherwise.
     NOTIFY_DEBOUNCE="0",
     NOTIFY_INTERVAL="0",
