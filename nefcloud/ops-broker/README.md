@@ -1,6 +1,6 @@
 # ops-broker: break-glass
 
-> **Moving to its own app.** [martin-nef/ops-broker](https://github.com/martin-nef/ops-broker) is the broker as a Flux app, with its own storage and API instead of these CRDs and admission policies. It runs beside this one (`ops-next.nefcloud.top`, the same namespace and GitHub App) until the switch. This directory keeps its limits: the namespace, the ServiceAccount and RBAC (including `ops-broker-tokenreview` and `ops-broker-deployer`), the NetworkPolicy (`allow-broker-app`) and the Secrets.
+> **Moving to its own app.** [martin-nef/ops-broker](https://github.com/martin-nef/ops-broker) is the broker as a Flux app, with its own storage and API instead of these CRDs and admission policies. It runs beside this one (`ops-next.nefcloud.top`, the same namespace and GitHub App) until the switch. This directory keeps its limits: the namespace, the ServiceAccount and RBAC (including `ops-broker-deployer`), the NetworkPolicy (`allow-broker-app`) and the Secrets.
 
 Some fixes can't wait for a PR, or can't be made by one: a pod stuck after a strategy change, a suspended Kustomization, a release that needs a nudge. In v0 the agent (claude-remote) stops and tells you the command, and you run it in Headlamp. v1 keeps you as the one who decides, but turns "find it in Headlamp and do it" into "read one page, press Approve".
 

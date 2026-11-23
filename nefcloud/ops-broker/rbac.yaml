@@ -120,31 +120,6 @@ subjects:
     name: ops-broker
     namespace: ops-broker
 ---
-# The broker app (martin-nef/ops-broker) checks who calls its API: a
-# TokenReview of the caller's ServiceAccount token. Only create on
-# tokenreviews, not system:auth-delegator's SubjectAccessReviews too.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ops-broker-tokenreview
-rules:
-  - apiGroups: [authentication.k8s.io]
-    resources: [tokenreviews]
-    verbs: [create]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ops-broker-tokenreview
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: ops-broker-tokenreview
-subjects:
-  - kind: ServiceAccount
-    name: ops-broker
-    namespace: ops-broker
----
 # The account Flux impersonates to apply martin-nef/ops-broker's deploy/
 # (spec.serviceAccountName of nefcloud/apps/ops-broker.yaml). The app's own
 # kinds only: no RBAC, NetworkPolicies, Secrets, quotas or namespaces, so a

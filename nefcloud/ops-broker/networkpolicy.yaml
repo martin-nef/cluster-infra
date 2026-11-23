@@ -93,8 +93,8 @@ spec:
 ---
 # The broker app (martin-nef/ops-broker, pods app: broker) has two ports.
 # 8080, the approval pages, trusts oauth2-proxy's email header: Traefik only,
-# as for the CRD broker above. 8081, the agents' API (a ServiceAccount token
-# proves who calls): the agents' pods only. Neither may reach the other's port.
+# as for the CRD broker above. 8081, the agents' API (each agent's key says who
+# calls): the agents' pods only. Neither may reach the other's port.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
