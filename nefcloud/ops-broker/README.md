@@ -37,7 +37,7 @@ v3 covers what GitHub only lets *you* do, not an App: creating a repo. Approving
 | `create-sops-age-key` | Secret `flux-system/<app>-sops-age` | Makes a new Flux app's age key in the broker and stores it there, as cluster-infra's CLAUDE.md (SOPS) says. The request's status gives the public key, for the app's `.sops.yaml`. See [SOPS keys](#sops-keys). |
 | `github-*` | a repo | See [GitHub verbs](#github-verbs-v2). |
 
-A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired`, or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 4 hours unless they ask for something else (`spec.ttlSeconds`, up to 12 hours). Flags (`github-human-review`) don't expire: they end `Superseded` or `Rejected` when their PR gets new commits or is closed ([Human review required](#human-review-required)). Each requester named in `PENDING_CAPS` has its own pending slots (the interactive agent: 10), and everyone else shares 3. Flags have slots of their own, `PENDING_FLAGS` (20) per requester. Finished ones are kept 90 days, or 7 for `Rejected`, `Expired` and `Superseded`, which decided nothing (`config.env`). Approving checks the target again first. If it has gone, been replaced, or moved on (a branch that has new commits, a rule someone already set), the request ends `Rejected` and nothing runs.
+A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired`, or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 4 hours unless they ask for something else (`spec.ttlSeconds`, up to 12 hours). Flags (`github-human-review`) don't expire: they end `Superseded` or `Rejected` when their PR gets new commits or is closed ([Human review required](#human-review-required)). Each requester named in `PENDING_CAPS` has its own pending slots (the interactive agent: 10), and everyone else shares 3. Flags have slots of their own, `PENDING_FLAGS` (20) per requester. Finished ones are kept 90 days, or 7 for `Rejected`, `Expired`, `Superseded` and `Withdrawn`, which decided nothing (`config.env`). A requester can withdraw a request that still waits ([Withdrawing a request](#withdrawing-a-request)). Approving checks the target again first. If it has gone, been replaced, or moved on (a branch that has new commits, a rule someone already set), the request ends `Rejected` and nothing runs.
 
 A request that will still be waiting at 07:00 doesn't notify you between 22:00 and 07:00 (London time); the first summary after 07:00 lists them all. See [Async requesters](#async-requesters).
 
@@ -125,6 +125,31 @@ Decided against:
 - **Refusing a TTL above the cap.** Refusing would make an agent's request fail at 2am over a config value it can't see. Clamping, with `expiresAt` in the status, tells it the outcome instead.
 
 Can't be tested without a cluster: the mutating policy itself. After the merge, create a request and check `kubectl -n ops-broker get opsrequest <name> -o jsonpath='{.spec.requester}'` is `system:serviceaccount:claude-remote:claude-remote`. Also check that a request with a `requester` of something else still comes back with yours. If the policy fails, every create is refused (`failurePolicy: Fail`), and Headlamp is the fallback until it's fixed.
+
+## Withdrawing a request
+
+A requester can say it no longer needs a request that still waits: it fixed the problem another way, or the session that asked has ended. It creates an `OpsWithdrawal`:
+
+```yaml
+apiVersion: ops.nefcloud.top/v1alpha1
+kind: OpsWithdrawal
+metadata:
+  generateName: withdraw-
+  namespace: ops-broker
+spec:
+  request: restart-x7k2p      # one request, by name
+  # session: <session id>     # or every waiting request of a session, but its flags
+  reason: Fixed by valheim#13 instead.   # optional, shown on the request
+```
+
+On its next scan (within 5 seconds) the broker ends each of them `Withdrawn`, with the reason. They leave the queue and the next summary, and free their slots. The withdrawal's status says `Done` and which requests it ended (`status.withdrawn`), or `Refused` and why.
+
+- **Only your own.** Admission stamps `spec.requester` on withdrawals as on requests, and the broker only ends requests with the same requester. Anyone else's, or one with no requester, is `Refused`.
+- **Only while it waits.** A request that is decided, running or finished can't be withdrawn. A withdrawn one can't be approved: approval needs `Pending`. If you approve it in the seconds before the scan, the approval wins.
+- **A session's flags stay.** A `github-human-review` flag is about a PR, not a session, and its PR ends it ([Human review required](#human-review-required)). To withdraw a flag, name it.
+- **Withdrawals are kept `SHORT_RETENTION_DAYS`** (7) from when they're made (the broker acts on them within seconds), and `Withdrawn` requests the same, since they decided nothing. The request keeps the record: which withdrawal ended it, and why.
+
+Decided against: a mutable `spec.withdrawn` on the request. The CRD's `self == oldSelf` rule would have to name every other field, and the requesters would need `patch`, which can also change metadata (finalizers, owners) that admission would then have to lock down on update too. A separate object keeps `spec` immutable and hash-checked, and the requesters' RBAC create-and-read. It also lets the night shift runner withdraw a whole session's requests without listing them.
 
 ## SOPS keys
 
@@ -253,9 +278,9 @@ Trade-offs:
 
 - The schema is the verb list. CEL rules tie each verb to its kinds, so `kubectl create` refuses anything else before the broker sees it. The broker checks again, in case the CRD is ever loosened.
 - `spec` is immutable (`self == oldSelf`), so what you read on the page is what runs. The page also posts the spec's hash back, and a mismatch is refused.
-- `status` is a subresource. The agent's Role is `create/get/list/watch` on `opsrequests` only, so it can't mark its own request approved, edit it, or delete it from the audit trail.
+- `status` is a subresource. The agent's Role is `create/get/list/watch` on `opsrequests` and `opswithdrawals` only, so it can't mark its own request approved, edit it, or delete it from the audit trail. It can only ask the broker to withdraw it ([Withdrawing a request](#withdrawing-a-request)).
 - An admission policy (`admission.yaml`) refuses `ownerReferences` and `finalizers` on new requests. Either would let a requester undo the audit trail: an owner, even a made-up one, hands the record to the garbage collector, and a finalizer blocks its cleanup and holds quota.
-- A ResourceQuota caps the namespace at 200 requests, even if the broker is down. Junk (`Rejected`, `Expired`, `Superseded`) is deleted after 7 days, so filling it takes sustained, visible effort, and the fallback is Headlamp.
+- A ResourceQuota caps the namespace at 200 requests, even if the broker is down. Junk (`Rejected`, `Expired`, `Superseded`, `Withdrawn`) is deleted after 7 days, so filling it takes sustained, visible effort, and the fallback is Headlamp.
 
 **It lives in cluster-infra, code in a ConfigMap.** The broker holds cluster-wide delete and patch rights. If it lived in a repo the agent can open PRs to and Flux deploys without impersonation, one rushed merge could widen what it does. Here it sits with the sandbox it extends, on the same protected `main`. `broker.py` is stdlib Python on the stock `python:3.13-slim` image (pinned by digest, the one cv-current uses), mounted from a hashed ConfigMap, so there is no image to build and no workflow to change. An edit rolls the pod.
 

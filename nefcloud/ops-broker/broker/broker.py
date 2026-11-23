@@ -44,8 +44,9 @@ approve anything, so it doesn't matter who else reads the topic: the agent can
 reach ntfy.sh too, but it can't log in as you.
 
 Every transition is written to the request's status (the audit trail, kept for
-RETENTION_DAYS; Rejected, Expired and Superseded ones, which decided nothing,
-for SHORT_RETENTION_DAYS) and printed as one JSON line.
+RETENTION_DAYS; Rejected, Expired, Superseded and Withdrawn ones, which decided
+nothing, for SHORT_RETENTION_DAYS) and printed as one JSON line. A requester
+withdraws its own waiting requests with an OpsWithdrawal (withdraw).
 
 Requests from agents that run while you sleep (README, "Async requesters"):
 
@@ -145,6 +146,7 @@ SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 K8S_API = "https://kubernetes.default.svc"
 NAMESPACE = "ops-broker"
 REQUESTS = f"/apis/ops.nefcloud.top/v1alpha1/namespaces/{NAMESPACE}/opsrequests"
+WITHDRAWALS = f"/apis/ops.nefcloud.top/v1alpha1/namespaces/{NAMESPACE}/opswithdrawals"
 # The token minter sidecar, the only container that holds the GitHub App's key
 # (minter.py). Its socket is in an emptyDir the two containers share.
 MINTER = githubops.Minter(os.environ.get("MINTER_SOCKET", "/run/minter/minter.sock"), GITHUB_OWNER)
@@ -185,8 +187,8 @@ GITHUB_VERBS = set(githubops.VERBS) | set(githubops.RETIRED)
 USER_VERBS = set(githubops.USER_VERBS)
 # Pods these recreate under a controller; Job pods and bare pods may not come back.
 POD_OWNERS = {"ReplicaSet", "StatefulSet", "DaemonSet"}
-FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected", "Superseded"}
-SHORT_LIVED = {"Expired", "Rejected", "Superseded"}
+FINISHED = {"Succeeded", "Failed", "Unknown", "Denied", "Expired", "Rejected", "Superseded", "Withdrawn"}
+SHORT_LIVED = {"Expired", "Rejected", "Superseded", "Withdrawn"}
 
 # Serialises every status change, so a request is decided and run at most once.
 # The Deployment is Recreate, so this process is the only broker.
@@ -937,6 +939,56 @@ def tidy(req):
         k8s("DELETE", f"{REQUESTS}/{req['metadata']['name']}")
 
 
+def withdraw(items):
+    """Act on each OpsWithdrawal not acted on yet: its requester's requests
+    that still wait end Withdrawn, so they leave the queue and the summary and
+    free their slots. It names one request, or a session: each of that
+    session's requests that still waits, but its flags, which their PRs end.
+    Only the requester that filed a request may withdraw it: admission stamps
+    spec.requester on both. items: every request, read under the lock.
+    Withdrawals acted on are deleted SHORT_RETENTION_DAYS after they were
+    made; the requests keep the record."""
+    def act(w):
+        st, ws = w.get("status", {}), w["spec"]
+        if st.get("phase"):
+            if age(w) > 86400 * SHORT_RETENTION_DAYS:
+                k8s("DELETE", f"{WITHDRAWALS}/{w['metadata']['name']}")
+            return
+        who = ws.get("requester", "")
+        if ws.get("request"):
+            mine = [r for r in items if r["metadata"]["name"] == ws["request"]]
+            if not mine:
+                problem = f"there is no request {ws['request']}"
+            elif not who or requester(mine[0]) != who:
+                problem = (f"{ws['request']} was filed by {requester(mine[0]) or 'nobody known'}; "
+                           "only they can withdraw it")
+            elif phase(mine[0]) not in ("", "Pending"):
+                problem = f"{ws['request']} is {phase(mine[0])}, not waiting"
+            else:
+                problem = None
+        else:
+            mine = [r for r in items if who and requester(r) == who and session(r) == ws.get("session")
+                    and phase(r) in ("", "Pending") and not is_flag(r)]
+            problem = None
+        if problem:
+            set_withdrawal_status(w, phase="Refused", message=problem, finishedAt=stamp())
+            return
+        why = f"withdrawn by its requester ({w['metadata']['name']})"
+        why += f": {ws['reason']}" if ws.get("reason") else ""
+        for r in mine:
+            set_status(r, phase="Withdrawn", finishedAt=stamp(), message=why)
+            audit("withdrawn", r, withdrawal=w["metadata"]["name"])
+        set_withdrawal_status(w, phase="Done", finishedAt=stamp(), withdrawn=[r["metadata"]["name"] for r in mine],
+                              message=f"withdrew {plural(len(mine), 'request')}")
+    each(k8s("GET", WITHDRAWALS)["items"], act)
+
+
+def set_withdrawal_status(w, **status):
+    """set_status for an OpsWithdrawal."""
+    patch = {"metadata": {"resourceVersion": w["metadata"]["resourceVersion"]}, "status": status}
+    k8s("PATCH", f"{WITHDRAWALS}/{w['metadata']['name']}/status", patch)
+
+
 def supersede(items):
     """End every github-human-review request that still waits while a newer
     one exists for the same PR (a flag for a later head, or the same one filed
@@ -1036,8 +1088,9 @@ def each(items, fn):
 
 
 def scan():
-    """One pass over the queue: expire, recover and delete old requests first,
-    so stale ones never take a pending slot, then admit new ones.
+    """One pass over the queue: expire, recover, withdraw and delete old
+    requests first, so stale ones never take a pending slot, then admit new
+    ones.
 
     The checks of new requests call GitHub and can take seconds, so they run
     outside the lock, and an approval doesn't wait for them. That's safe: a
@@ -1047,6 +1100,7 @@ def scan():
     between is left for the next scan."""
     with lock:
         each(list_requests(), tidy)
+        withdraw(list_requests())
         items = list_requests()
         supersede(items)
         new = [r for r in items if phase(r) == ""]

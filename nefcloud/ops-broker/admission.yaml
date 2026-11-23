@@ -5,7 +5,8 @@
 # rules can't see metadata, so this refuses both on create, for every requester.
 # Only CREATE: nothing but admins may update requests, and the API server's own
 # foreground-deletion finalizer must keep working. It also checks the requester
-# stamp below took.
+# stamp below took. The same for withdrawals (OpsWithdrawal), whose stamp says
+# whose requests they may end.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -17,12 +18,12 @@ spec:
       - apiGroups: [ops.nefcloud.top]
         apiVersions: ["*"]
         operations: [CREATE]
-        resources: [opsrequests]
+        resources: [opsrequests, opswithdrawals]
   validations:
     - expression: "!has(object.metadata.ownerReferences) || size(object.metadata.ownerReferences) == 0"
-      message: OpsRequests may not have ownerReferences (they would let the garbage collector delete the audit record)
+      message: OpsRequests and OpsWithdrawals may not have ownerReferences (they would let the garbage collector delete the audit record)
     - expression: "!has(object.metadata.finalizers) || size(object.metadata.finalizers) == 0"
-      message: OpsRequests may not have finalizers (they would block retention cleanup)
+      message: OpsRequests and OpsWithdrawals may not have finalizers (they would block retention cleanup)
     # Set by the mutating policy below, which runs first. If that policy is
     # missing or broken, requests are refused rather than taken at their word.
     - expression: "has(object.spec.requester) && object.spec.requester == request.userInfo.username"
@@ -38,7 +39,8 @@ spec:
 ---
 # Who asked, as the API server authenticated them, so the approval page and the
 # per-requester pending caps (config.env PENDING_CAPS) don't rest on the
-# requester's word. Overwrites whatever spec.requester the request carried.
+# requester's word, and a withdrawal can only end its own requester's requests.
+# Overwrites whatever spec.requester the request carried.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
@@ -51,7 +53,7 @@ spec:
       - apiGroups: [ops.nefcloud.top]
         apiVersions: ["*"]
         operations: [CREATE]
-        resources: [opsrequests]
+        resources: [opsrequests, opswithdrawals]
   mutations:
     - patchType: ApplyConfiguration
       applyConfiguration:

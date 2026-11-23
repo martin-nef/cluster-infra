@@ -63,6 +63,7 @@ class FakeAPI:
         self.put("Deployment", "app", "web")
         self.put("Kustomization", "flux-system", "web")
         self.requests = {}
+        self.withdrawals = {}
         self.calls = []
         self.versions = itertools.count(1)
         self.fail = {}  # (method, path) -> exception to raise once
@@ -86,6 +87,20 @@ class FakeAPI:
             raise self.fail.pop((method, path))
         if path == broker.REQUESTS and method == "GET":
             return {"items": copy.deepcopy(list(self.requests.values()))}
+        if path == broker.WITHDRAWALS and method == "GET":
+            return {"items": copy.deepcopy(list(self.withdrawals.values()))}
+        if path.startswith(broker.WITHDRAWALS + "/"):
+            name, _, sub = path[len(broker.WITHDRAWALS) + 1:].partition("/")
+            w = self.withdrawals[name]
+            if method == "PATCH" and sub == "status":
+                if body["metadata"]["resourceVersion"] != w["metadata"]["resourceVersion"]:
+                    raise broker.K8sError(409, "the object has been modified")
+                w.setdefault("status", {}).update(body["status"])
+                w["metadata"]["resourceVersion"] = str(next(self.versions))
+                return copy.deepcopy(w)
+            if method == "DELETE":
+                del self.withdrawals[name]
+                return {}
         if path == broker.REQUESTS and method == "POST":
             # As the API server and the admission policy make it.
             name = f"{body['metadata']['generateName']}{len(self.requests)}"
@@ -133,7 +148,8 @@ class FakeAPI:
 
     def actions(self):
         """Calls that touched something other than the request queue."""
-        return [(m, p, b) for m, p, b in self.calls if m != "GET" and not p.startswith(broker.REQUESTS)]
+        return [(m, p, b) for m, p, b in self.calls
+                if m != "GET" and not p.startswith((broker.REQUESTS, broker.WITHDRAWALS))]
 
 
 class Base(unittest.TestCase):
@@ -1318,6 +1334,97 @@ class TestAsync(Base):
         broker.scan()
         lines = [json.loads(c.args[0]) for c in print.call_args_list if c.args and c.args[0].startswith("{")]
         self.assertEqual({l["requester"] for l in lines}, {NIGHT})
+
+
+class TestWithdraw(Base):
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(broker, "PENDING_CAPS", {AGENT: 2, NIGHT: 2})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def add(self, name, who=AGENT, session="s1", flag=False, **status):
+        if flag:
+            self.api.add(name, "github-human-review", "Pod", "x", "x", **status)
+            spec = self.api.requests[name]["spec"]
+            del spec["target"]
+            spec["github"] = {"repo": "web", "pr": 5, "headSHA": "a" * 40}
+        else:
+            self.api.add(name, "rollout-restart", "Deployment", "app", "web", **status)
+        self.api.requests[name]["spec"].update(requester=who, session=session)
+
+    def withdrawal(self, name, who=AGENT, age=0, **spec):
+        self.api.withdrawals[name] = {
+            "metadata": {"name": name, "resourceVersion": str(next(self.api.versions)),
+                         "creationTimestamp": broker.stamp(broker.now() - timedelta(seconds=age))},
+            "spec": {**spec, "requester": who}}
+
+    def withdrawal_status(self, name):
+        return self.api.withdrawals[name].get("status", {})
+
+    def test_the_requester_withdraws_its_request(self):
+        self.add("r1")
+        self.add("r2")
+        broker.scan()
+        h = self.api.status("r1")["specHash"]
+        self.add("r3")
+        broker.scan()
+        self.assertEqual(self.api.status("r3")["phase"], "Rejected")  # both slots taken
+        self.withdrawal("w1", request="r1", reason="fixed it by a PR")
+        self.add("r4")
+        broker.scan()
+        st = self.api.status("r1")
+        self.assertEqual(st["phase"], "Withdrawn")
+        self.assertIn("withdrawn by its requester (w1): fixed it by a PR", st["message"])
+        self.assertEqual(self.withdrawal_status("w1")["phase"], "Done")
+        self.assertEqual(self.withdrawal_status("w1")["withdrawn"], ["r1"])
+        self.assertEqual(self.api.status("r4")["phase"], "Pending")  # the slot it held is free
+        self.assertEqual(broker.decide("r1", "approve", h, APPROVER)[0], 409)
+        self.assertEqual(self.api.actions(), [])
+
+    def test_only_the_requester_can_withdraw(self):
+        self.add("r1")
+        broker.scan()
+        self.withdrawal("w1", who=NIGHT, request="r1")
+        self.withdrawal("w2", who="", request="r1")  # made without the admission policy
+        broker.scan()
+        for w in ("w1", "w2"):
+            st = self.withdrawal_status(w)
+            self.assertEqual(st["phase"], "Refused")
+            self.assertIn("only they can withdraw it", st["message"])
+        self.assertEqual(self.api.status("r1")["phase"], "Pending")
+
+    def test_only_a_waiting_request_can_be_withdrawn(self):
+        self.add("done", phase="Succeeded")
+        self.withdrawal("w1", request="done")
+        self.withdrawal("w2", request="missing")
+        broker.scan()
+        self.assertEqual(self.api.status("done")["phase"], "Succeeded")
+        self.assertIn("is Succeeded, not waiting", self.withdrawal_status("w1")["message"])
+        self.assertIn("no request missing", self.withdrawal_status("w2")["message"])
+
+    def test_a_session_is_withdrawn_but_its_flags(self):
+        self.add("r1", phase="Pending")
+        self.add("r2")  # not admitted yet
+        self.add("flag", flag=True, phase="Pending")  # its PR ends it
+        self.add("other-session", session="s2", phase="Pending")
+        self.add("other-requester", who=NIGHT, phase="Pending")
+        self.add("decided", phase="Denied")
+        self.withdrawal("w1", session="s1")
+        broker.scan()
+        self.assertEqual(sorted(self.withdrawal_status("w1")["withdrawn"]), ["r1", "r2"])
+        phases = {n: self.api.status(n).get("phase") for n in self.api.requests}
+        self.assertEqual(phases, {"r1": "Withdrawn", "r2": "Withdrawn", "flag": "Pending", "other-session": "Pending",
+                                  "other-requester": "Pending", "decided": "Denied"})
+
+    def test_withdrawals_go_after_short_retention(self):
+        self.withdrawal("old", age=8 * 86400, session="s1")
+        self.withdrawal("recent", age=6 * 86400, session="s1")
+        broker.scan()
+        self.assertEqual(sorted(self.api.withdrawals), ["old", "recent"])  # acted on now
+        self.api.withdrawals["old"]["status"]["phase"] = "Done"
+        broker.scan()
+        self.assertEqual(sorted(self.api.withdrawals), ["recent"])
 
 
 class TestNotify(unittest.TestCase):
