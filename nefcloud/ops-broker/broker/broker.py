@@ -946,8 +946,8 @@ def withdraw(items):
     session's requests that still waits, but its flags, which their PRs end.
     Only the requester that filed a request may withdraw it: admission stamps
     spec.requester on both. items: every request, read under the lock.
-    Withdrawals acted on are deleted after SHORT_RETENTION_DAYS; the requests
-    keep the record."""
+    Withdrawals acted on are deleted SHORT_RETENTION_DAYS after they were
+    made; the requests keep the record."""
     def act(w):
         st, ws = w.get("status", {}), w["spec"]
         if st.get("phase"):

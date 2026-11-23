@@ -147,7 +147,7 @@ On its next scan (within 5 seconds) the broker ends each of them `Withdrawn`, wi
 - **Only your own.** Admission stamps `spec.requester` on withdrawals as on requests, and the broker only ends requests with the same requester. Anyone else's, or one with no requester, is `Refused`.
 - **Only while it waits.** A request that is decided, running or finished can't be withdrawn. A withdrawn one can't be approved: approval needs `Pending`. If you approve it in the seconds before the scan, the approval wins.
 - **A session's flags stay.** A `github-human-review` flag is about a PR, not a session, and its PR ends it ([Human review required](#human-review-required)). To withdraw a flag, name it.
-- **Withdrawals are kept `SHORT_RETENTION_DAYS`** (7) after the broker acts on them, and `Withdrawn` requests the same, since they decided nothing. The request keeps the record: which withdrawal ended it, and why.
+- **Withdrawals are kept `SHORT_RETENTION_DAYS`** (7) from when they're made (the broker acts on them within seconds), and `Withdrawn` requests the same, since they decided nothing. The request keeps the record: which withdrawal ended it, and why.
 
 Decided against: a mutable `spec.withdrawn` on the request. The CRD's `self == oldSelf` rule would have to name every other field, and the requesters would need `patch`, which can also change metadata (finalizers, owners) that admission would then have to lock down on update too. A separate object keeps `spec` immutable and hash-checked, and the requesters' RBAC create-and-read. It also lets the night shift runner withdraw a whole session's requests without listing them.
 
