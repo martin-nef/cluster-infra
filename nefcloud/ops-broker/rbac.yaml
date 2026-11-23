@@ -41,7 +41,7 @@ subjects:
     name: ops-broker
     namespace: ops-broker
 ---
-# Its own queue: read requests, write their status, delete old ones.
+# Its own queue: read requests and withdrawals, write their status, delete old ones.
 # The pod's two containers (broker and minter) share this ServiceAccount.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -60,6 +60,14 @@ rules:
     verbs: [create]
   - apiGroups: [ops.nefcloud.top]
     resources: [opsrequests/status]
+    verbs: [get, patch]
+  # Withdrawals: act on them (their status), delete them after
+  # SHORT_RETENTION_DAYS.
+  - apiGroups: [ops.nefcloud.top]
+    resources: [opswithdrawals]
+    verbs: [get, list, watch, delete]
+  - apiGroups: [ops.nefcloud.top]
+    resources: [opswithdrawals/status]
     verbs: [get, patch]
   # The GitHub App's key and OAuth client: the minter sidecar stores them from the setup page
   # (create can't be limited to a name, so any Secret in this namespace). No

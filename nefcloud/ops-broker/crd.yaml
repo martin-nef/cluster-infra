@@ -221,7 +221,7 @@ spec:
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected, Superseded]
+                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected, Superseded, Withdrawn]
                 message: {type: string}
                 specHash: {type: string}
                 expiresAt: {type: string, format: date-time}
@@ -234,4 +234,81 @@ spec:
                 targetUID: {type: string}
                 decidedBy: {type: string}
                 decidedAt: {type: string, format: date-time}
+                finishedAt: {type: string, format: date-time}
+---
+# An OpsWithdrawal says a requester no longer needs its own waiting requests:
+# one by name, or every one of a session (but its flags, which their PRs end).
+# The broker ends them Withdrawn, which frees their slots. A separate object,
+# so OpsRequest.spec stays immutable and the requesters' RBAC stays create
+# and read. spec.requester is stamped by admission.yaml, and the broker acts
+# only on requests with the same requester.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: opswithdrawals.ops.nefcloud.top
+spec:
+  group: ops.nefcloud.top
+  scope: Namespaced
+  names:
+    kind: OpsWithdrawal
+    listKind: OpsWithdrawalList
+    plural: opswithdrawals
+    singular: opswithdrawal
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Request, type: string, jsonPath: .spec.request}
+        - {name: Session, type: string, jsonPath: .spec.session}
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Message, type: string, jsonPath: .status.message}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: spec is immutable; create a new OpsWithdrawal
+                - rule: has(self.request) != has(self.session)
+                  message: give either request or session
+              properties:
+                request:
+                  description: The name of one of your OpsRequests that still waits.
+                  type: string
+                  maxLength: 253
+                  pattern: ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$
+                session:
+                  description: >-
+                    Every OpsRequest of yours with this spec.session that still waits, but flags
+                    (github-human-review): their PRs end them.
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  pattern: ^[A-Za-z0-9_.:-]+$
+                reason:
+                  description: Why it's no longer needed; shown on the requests.
+                  type: string
+                  maxLength: 500
+                requester:
+                  description: Who created it. Stamped by the opsrequests-requester admission policy; don't set it.
+                  type: string
+                  maxLength: 253
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Done, Refused]
+                message: {type: string}
+                withdrawn:
+                  description: The requests it ended.
+                  type: array
+                  items: {type: string}
                 finishedAt: {type: string, format: date-time}

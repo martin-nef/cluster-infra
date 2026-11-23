@@ -16,3 +16,4 @@ metadata:
 spec:
   hard:
     count/opsrequests.ops.nefcloud.top: "200"
+    count/opswithdrawals.ops.nefcloud.top: "100"

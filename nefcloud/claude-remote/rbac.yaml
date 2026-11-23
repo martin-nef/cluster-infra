@@ -115,7 +115,8 @@ subjects:
 # Break-glass v1: the agent may ask the ops broker (nefcloud/ops-broker/) for
 # one of its fixed actions. It can file and read requests, not change, delete
 # or approve them: status is a subresource it has no access to, and approval
-# happens on a page behind your Google login.
+# happens on a page behind your Google login. It can withdraw its own waiting
+# requests with an OpsWithdrawal, which the broker acts on.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -123,7 +124,7 @@ metadata:
   namespace: ops-broker
 rules:
   - apiGroups: [ops.nefcloud.top]
-    resources: [opsrequests]
+    resources: [opsrequests, opswithdrawals]
     verbs: [create, get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
