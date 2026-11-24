@@ -102,3 +102,26 @@ spec:
               app.kubernetes.io/name: vmauth
       ports:
         - {protocol: TCP, port: 8427}
+---
+# The ops broker's API (martin-nef/ops-broker, port 8081): requests, push
+# records. Not its approval pages (8080), which only Traefik may reach.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ops-broker-api
+  namespace: night-shift
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: night-shift-runner
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ops-broker
+          podSelector:
+            matchLabels:
+              app: broker
+      ports:
+        - {protocol: TCP, port: 8081}

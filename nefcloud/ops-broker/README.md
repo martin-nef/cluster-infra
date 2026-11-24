@@ -1,5 +1,7 @@
 # ops-broker: break-glass
 
+> **Moving to its own app.** [martin-nef/ops-broker](https://github.com/martin-nef/ops-broker) is the broker as a Flux app, with its own storage and API instead of these CRDs and admission policies. It runs beside this one (`ops-next.nefcloud.top`, the same namespace and GitHub App) until the switch. This directory keeps the namespace, the ServiceAccount and its RBAC (the cluster verbs) and the Secrets. The broker has no NetworkPolicy: it isn't what needs containing. The agents' own egress policies (claude-remote, night-shift) let them reach only its API port, 8081, not its approval pages.
+
 Some fixes can't wait for a PR, or can't be made by one: a pod stuck after a strategy change, a suspended Kustomization, a release that needs a nudge. In v0 the agent (claude-remote) stops and tells you the command, and you run it in Headlamp. v1 keeps you as the one who decides, but turns "find it in Headlamp and do it" into "read one page, press Approve".
 
 v2 does the same for GitHub. The agent's own App can push branches and open PRs, but it deliberately can't change CI workflows, repo settings or workflow runs (claude-remote `docs/design.md` §1, §3). Those were the remaining things that needed your PC. Now the agent asks, and the broker does them with a separate App whose key only the broker's token minter holds ([GitHub verbs](#github-verbs-v2)).
@@ -292,7 +294,7 @@ Trade-offs:
 
 A lost ntfy message only costs time: the page lists every waiting request first. Without the ntfy Secret the broker still runs; requests just wait unannounced.
 
-**The page trusts a header, so only Traefik may reach it.** `X-Auth-Request-Email` is set by the oauth2-proxy forwardAuth. A NetworkPolicy lets only Traefik's pods connect, as for headlamp-auth. POSTs must also carry `Origin: https://ops.nefcloud.top`, which stops cross-site form posts. The oauth2-proxy cookie is `SameSite=Lax`, which mostly does too. The page escapes everything the agent wrote and sends a strict CSP.
+**The page trusts a header, so the agents can't reach it.** `X-Auth-Request-Email` is set by the oauth2-proxy forwardAuth. The broker itself has no NetworkPolicy (it isn't what needs containing); the agents' egress policies (claude-remote, night-shift) refuse in-cluster addresses but the new broker's API port. POSTs must also carry `Origin: https://ops.nefcloud.top`, which stops cross-site form posts. The oauth2-proxy cookie is `SameSite=Lax`, which mostly does too. The page escapes everything the agent wrote and sends a strict CSP.
 
 **GitHub: a third App, its key born in the minter.** The agent's App (`martin-nef-agent`) lacks `workflows` on purpose: with it, any branch it pushes could change a workflow and run it with the repo's secrets before anyone looks. `administration` would let it lift branch protection. Rather than widening that App, a third one holds those permissions, and its key never enters the agent's pod:
 

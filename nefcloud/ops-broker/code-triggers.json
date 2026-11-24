@@ -33,6 +33,7 @@
      "paths": ["^deploy/policy/", "^image/bin/agent-pr$"]},
     {"what": "an agent's profile or limits", "repos": ["agent-harness"],
      "paths": ["^harness/(profile|paths|steps)\\.py$", "^profiles/"]},
-    {"what": "the PR reviewer (any change to it)", "repos": ["pr-reviewer"], "paths": ["."]}
+    {"what": "the PR reviewer (any change to it)", "repos": ["pr-reviewer"], "paths": ["."]},
+    {"what": "the ops broker (any change to it)", "repos": ["ops-broker"], "paths": ["."]}
   ]
 }
