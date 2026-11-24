@@ -19,7 +19,6 @@ spec:
     requests.ephemeral-storage: 3Gi
     limits.ephemeral-storage: 13Gi
     pods: "4"
-    # Running, queued and finished (kept a day): a receiver bug can't flood etcd.
     count/jobs.batch: "60"
     persistentvolumeclaims: "0"
     services: "1"
