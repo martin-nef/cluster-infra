@@ -24,3 +24,9 @@ spec:
   sourceRef:
     kind: GitRepository
     name: ops-broker
+  # The agents' API key hashes (deploy/api-keys.secrets.yaml there). The key
+  # was made in the cluster by the ops broker (create-sops-age-key-rj5xp).
+  decryption:
+    provider: sops
+    secretRef:
+      name: ops-broker-sops-age
