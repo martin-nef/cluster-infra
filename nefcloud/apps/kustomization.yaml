@@ -10,3 +10,4 @@ resources:
   - claude-remote.yaml
   - pr-reviewer.yaml
   - night-shift.yaml
+  - ops-broker.yaml
