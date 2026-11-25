@@ -9,7 +9,7 @@ resources:
   - rbac.yaml
   - secrets.yaml
   - deployment.yaml
-  - ingress.yaml
+  # ingress.yaml: ops.nefcloud.top is the new broker's (martin-nef/ops-broker deploy/ingress.yaml).
 configMapGenerator:
   # Hashed: an edit to any of them rolls the pod.
   - name: ops-broker-config

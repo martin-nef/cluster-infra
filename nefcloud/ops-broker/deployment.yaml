@@ -4,7 +4,10 @@ metadata:
   name: ops-broker
   namespace: ops-broker
 spec:
-  replicas: 1
+  # The cutover (roadmap: the ops broker switch): martin-nef/ops-broker's
+  # broker owns the human-review check and ops.nefcloud.top now. Kept, stopped,
+  # until the retirement removes it, so going back is one line.
+  replicas: 0
   # One broker at a time: its lock is what makes approve-then-run happen once.
   strategy:
     type: Recreate
