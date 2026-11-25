@@ -191,7 +191,7 @@ spec:
                   maxLength: 253
                 session:
                   description: >-
-                    The requester's session: the Claude session id for claude-remote (CLAUDE_CODE_SESSION_ID),
+                    The requester's session: the claude.ai session id for claude-remote (session_01...),
                     the workstream's session for the night shift. A session's requests are one group on the ops
                     page and in the notification. Optional; without it, requests group by workstream.
                   type: string
