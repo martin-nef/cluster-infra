@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scratchpad
+  labels:
+    # Non-root, no privilege escalation, no privileged, hostPath or
+    # host-network pods, whatever image an agent runs.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

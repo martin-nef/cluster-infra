@@ -1,0 +1,79 @@
+# Live game servers share shitbox and oci-big-1, the only nodes with room, so
+# no node is free of them. Two limits keep them safe instead:
+# - this quota: about a quarter of shitbox's spare requests;
+# - the scratchpad PriorityClass: lower than every other pod (game servers run
+#   at the default 0), and it never preempts. When a node is short, the
+#   scheduler evicts scratch pods first. The `other-priorities` quota allows
+#   no pod without it, so a pod that leaves out priorityClassName is refused.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: scratchpad
+value: -100
+preemptionPolicy: Never
+description: Agents' test workloads (nefcloud/scratchpad). Evicted first, preempt nothing.
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: scratchpad
+  namespace: scratchpad
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 4Gi
+    limits.cpu: "4"
+    limits.memory: 8Gi
+    requests.ephemeral-storage: 4Gi
+    limits.ephemeral-storage: 10Gi
+    requests.storage: 20Gi
+    persistentvolumeclaims: "3"
+    pods: "10"
+    # Object counts, so a loop can't flood etcd.
+    count/deployments.apps: "10"
+    count/statefulsets.apps: "5"
+    count/replicasets.apps: "30"
+    count/jobs.batch: "20"
+    count/cronjobs.batch: "5"
+    configmaps: "20"
+    secrets: "20"
+    services: "10"
+    # k3s's ServiceLB would open a LoadBalancer's port on every node, and a
+    # NodePort is open on every node too: neither may leave the namespace.
+    services.loadbalancers: "0"
+    services.nodeports: "0"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: other-priorities
+  namespace: scratchpad
+spec:
+  hard:
+    pods: "0"
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: NotIn
+        values: [scratchpad]
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: scratchpad
+  namespace: scratchpad
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+        ephemeral-storage: 64Mi
+      default:
+        cpu: 500m
+        memory: 512Mi
+        ephemeral-storage: 512Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
+        ephemeral-storage: 4Gi
