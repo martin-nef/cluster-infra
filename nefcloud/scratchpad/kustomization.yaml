@@ -2,7 +2,7 @@
 # They may create, change and delete workloads here and nowhere else. What
 # keeps it safe lives here, out of their reach: pod security (namespace.yaml),
 # a quota and a low priority (quota.yaml), and network isolation
-# (networkpolicy.yaml). No Ingress yet: that needs a host and login check first.
+# (networkpolicy.yaml). See README.md. No Ingress yet: that needs a host and login check first.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
