@@ -38,8 +38,9 @@ v3 covers what GitHub only lets *you* do, not an App: creating a repo. Approving
 | `flux-suspend` / `flux-resume` | same | Sets `spec.suspend`. |
 | `create-sops-age-key` | Secret `flux-system/<app>-sops-age` | Makes a new Flux app's age key in the broker and stores it there, as cluster-infra's CLAUDE.md (SOPS) says. The request's status gives the public key, for the app's `.sops.yaml`. See [SOPS keys](#sops-keys). |
 | `github-*` | a repo | See [GitHub verbs](#github-verbs-v2). |
+| `question` | none: `spec.question` | Asks you something before the work starts. Nothing runs: your answer goes to `status.answer`. See [Questions](#questions). |
 
-A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired`, or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 24 hours unless they ask for less (`spec.ttlSeconds`). Flags (`github-human-review`) don't expire: they end `Superseded` or `Rejected` when their PR gets new commits or is closed ([Human review required](#human-review-required)). Each requester named in `PENDING_CAPS` has its own pending slots (the interactive agent: 10), and everyone else shares 3. Flags have slots of their own, `PENDING_FLAGS` (20) per requester. Finished ones are kept 90 days, or 7 for `Rejected`, `Expired`, `Superseded` and `Withdrawn`, which decided nothing (`config.env`). A requester can withdraw a request that still waits ([Withdrawing a request](#withdrawing-a-request)). Approving checks the target again first. If it has gone, been replaced, or moved on (a branch that has new commits, a rule someone already set), the request ends `Rejected` and nothing runs.
+A request is `Pending` → `Succeeded` / `Failed` / `Unknown` / `Denied` / `Expired` (a question: `Answered` / `Expired`), or `Rejected` straight away (target missing, a pod that may not come back, too many pending). `Unknown` means the action may or may not have taken effect: check the target before asking again. Requests expire after 24 hours unless they ask for less (`spec.ttlSeconds`). Flags (`github-human-review`) don't expire: they end `Superseded` or `Rejected` when their PR gets new commits or is closed ([Human review required](#human-review-required)). Each requester named in `PENDING_CAPS` has its own pending slots (the interactive agent: 10), and everyone else shares 3. Flags have slots of their own, `PENDING_FLAGS` (20) per requester, and so do questions, `PENDING_QUESTIONS` (3). Finished ones are kept 90 days, or 7 for `Rejected`, `Expired`, `Superseded` and `Withdrawn`, which decided nothing (`config.env`). A requester can withdraw a request that still waits ([Withdrawing a request](#withdrawing-a-request)). Approving checks the target again first. If it has gone, been replaced, or moved on (a branch that has new commits, a rule someone already set), the request ends `Rejected` and nothing runs.
 
 A request that will still be waiting at 07:00 doesn't notify you between 22:00 and 07:00 (London time); the first summary after 07:00 lists them all. See [Async requesters](#async-requesters).
 
@@ -152,6 +153,44 @@ On its next scan (within 5 seconds) the broker ends each of them `Withdrawn`, wi
 - **Withdrawals are kept `SHORT_RETENTION_DAYS`** (7) from when they're made (the broker acts on them within seconds), and `Withdrawn` requests the same, since they decided nothing. The request keeps the record: which withdrawal ended it, and why.
 
 Decided against: a mutable `spec.withdrawn` on the request. The CRD's `self == oldSelf` rule would have to name every other field, and the requesters would need `patch`, which can also change metadata (finalizers, owners) that admission would then have to lock down on update too. A separate object keeps `spec` immutable and hash-checked, and the requesters' RBAC create-and-read. It also lets the night shift runner withdraw a whole session's requests without listing them.
+
+## Questions
+
+An agent with an ambiguous task either guesses, and code gets written and thrown out, or stops `blocked` on a note nobody sees until morning. A `question` reaches you on the phone before there's a PR, and the answer comes back to the agent that asked.
+
+```yaml
+apiVersion: ops.nefcloud.top/v1alpha1
+kind: OpsRequest
+metadata: {generateName: question-, namespace: ops-broker}
+spec:
+  verb: question
+  reason: The roadmap item says "drop the old API" but cv-current still calls it.
+  session: <your session id>
+  workstream: API cleanup
+  ttlSeconds: 43200          # optional, as for every request: how long the question is worth asking
+  question:
+    text: Drop /v1 now, or keep it until cv-current moves to /v2?
+    multiple: false          # optional: true lets you tick any number of the options
+    options:                 # optional, 2 to 8; none makes it a plain-text question
+      - {label: Drop it now, then: Remove /v1 and fix cv-current in the same PR set.}
+      - {label: Keep it, then: Mark /v1 deprecated and file an issue to move cv-current.}
+    ifUnanswered: Keep it, and say so in the PR.
+```
+
+- **Three formats.** Pick one option, tick any number (`multiple: true`), or plain text (no options). You can always answer in your own words as well, or instead.
+- **The page.** The question, each option with what the agent then does, and what it does if nobody answers, all as plain text: nothing the agent wrote becomes a link. One form: the options (radio buttons, or tickboxes if multiple) and a free-text field. **Answer** takes the place of Approve and Deny. Behind the same Google login, from the same `ALLOWED_APPROVERS`. The group page shows an **Answer** button that opens the question's own page, since the options and what follows them only fit there.
+- **The answer** goes to `status.answer`: `question` (its text, options and `multiple`, as asked, so the answer reads on its own), `picked` (the labels you picked, in the question's order), `text` (what you wrote), `by` and `at`, and the request ends `Answered`. One answer only: a second one is refused, as a second Approve is. The requester reads it with `kubectl -n ops-broker get opsrequest <name> -o jsonpath='{.status.answer}'` when it suits it: at once, after other work, or in a later session. The broker doesn't assume how long you take.
+- **Lifetime.** Open until you answer it, the agent withdraws it (it found the answer elsewhere: [Withdrawing a request](#withdrawing-a-request)), or it expires (`ttlSeconds`, 24 h at most). Expired, the agent does what it said in `ifUnanswered`. Quiet hours apply as to any request: a question that will still be open at 07:00 waits for the morning summary.
+- **Its own slots.** `PENDING_QUESTIONS` (3) per requester, apart from `PENDING_CAPS`, as flags have theirs. So questions can't crowd out break-glass requests, and the reverse. A fourth is `Rejected`: an agent with that many open questions should wait for answers, not ask more.
+- **The answer is your input; the question is the agent's.** The answer is typed behind your login, so the agent can take it as yours. The question, the options and their `then` are the agent's own text, and so is anything it quoted in them: the page shows them as its claim, and an agent reading the request back treats them as its own words, not yours.
+- **One row per question.** A question's subject is its text, so the same question asked again folds under the newest one.
+- **The summary** says what's new: *1 question and 2 ops requests to answer or approve*.
+
+Decided against:
+
+- **A separate CRD.** A question has the same life as a request (who asked, session, TTL, quiet hours, withdrawal, retention), so it reuses all of it. Only the page and the final phase differ.
+- **Approve and Deny for a question.** Deny would mean "no answer", which is what expiry already says, with the default the agent stated. A free-text answer can say "don't do this at all".
+- **Answering from the ntfy notification.** Its action buttons would carry the answer without the login, which is the rule the approvals keep ([Design decisions](#design-decisions)).
 
 ## SOPS keys
 
@@ -357,7 +396,7 @@ Decided against, for now:
 - **The App key isn't in git.** Like the apps' `<name>-sops-age` keys, it lives only in the cluster. If it's lost (namespace deleted, cluster rebuilt), delete the App on GitHub and run the setup again. That is three taps, and safer than a restore copy somewhere.
 - **The ops App is powerful.** It can change any workflow, protection rule or setting on every repo it's installed on. Only the minter holds the key, and only approved requests reach the code that writes. A bug in the broker gets scoped tokens (above); a compromise of the minter container, or of the node, would have the App's full permissions. Its commits and changes show up on GitHub as `martin-nef-ops[bot]`, and each request's status says who approved it.
 - **The diff is as good as your reading of it on a phone.** Long workflow changes are hard to review on a small screen. Keep them small: the agent can split them across requests.
-- **The verb list is short on purpose.** Things like removing a finalizer or scaling to zero are left out. They can lose data or take a service down, they're rare, and Headlamp still covers them. Adding a verb means a PR here that touches the CRD, the ClusterRole and `broker.py` (for a GitHub verb: `githubops.py` and its token permissions in `minter.py`; for a user action, `minter.USER_ACTIONS`).
+- **The verb list is short on purpose.** Things like removing a finalizer or scaling to zero are left out. They can lose data or take a service down, they're rare, and Headlamp still covers them. Adding a verb means a PR here that touches the CRD, the ClusterRole (if it acts on the cluster) and `broker.py` (for a GitHub verb: `githubops.py` and its token permissions in `minter.py`; for a user action, `minter.USER_ACTIONS`).
 
 ## Later
 

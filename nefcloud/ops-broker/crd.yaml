@@ -46,8 +46,11 @@ spec:
               x-kubernetes-validations:
                 - rule: self == oldSelf
                   message: spec is immutable; create a new OpsRequest
-                - rule: "self.verb.startsWith('github-') ? (has(self.github) && !has(self.target)) : (has(self.target) && !has(self.github))"
-                  message: GitHub verbs take spec.github, the others spec.target
+                - rule: >-
+                    self.verb == 'question' ? (has(self.question) && !has(self.target) && !has(self.github)) :
+                    !has(self.question) && (self.verb.startsWith('github-') ? (has(self.github) && !has(self.target)) :
+                    (has(self.target) && !has(self.github)))
+                  message: question takes spec.question, GitHub verbs spec.github, the others spec.target
                 - rule: >-
                     !has(self.github) || self.verb != 'github-commit-workflows' || (has(self.github.branch) && has(self.github.baseSHA) &&
                     has(self.github.message) && has(self.github.files))
@@ -78,7 +81,7 @@ spec:
                   type: string
                   enum: [delete-pod, rollout-restart, flux-reconcile, flux-suspend, flux-resume, create-sops-age-key,
                          github-commit-workflows, github-protect-branch, github-rerun-workflow, github-dispatch-workflow,
-                         github-create-repo, github-human-review, github-require-human-review]
+                         github-create-repo, github-human-review, github-require-human-review, question]
                 target:
                   type: object
                   required: [kind, namespace, name]
@@ -178,6 +181,53 @@ spec:
                       description: github-create-repo; the repo's description.
                       type: string
                       maxLength: 350
+                question:
+                  description: >-
+                    question; what to ask the user before the work starts. Nothing runs: the answer is
+                    written to status.answer.
+                  type: object
+                  required: [text, ifUnanswered]
+                  x-kubernetes-validations:
+                    - rule: "!has(self.multiple) || !self.multiple || has(self.options)"
+                      message: multiple needs options to tick
+                  properties:
+                    text:
+                      description: The question, as plain text.
+                      type: string
+                      minLength: 1
+                      maxLength: 2000
+                    options:
+                      description: >-
+                        Optional answers to pick from (2-8), each with what the agent then does. The user
+                        can always answer in their own words too.
+                      type: array
+                      minItems: 2
+                      maxItems: 8
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [label]
+                      items:
+                        type: object
+                        required: [label, then]
+                        properties:
+                          label:
+                            description: The answer, short, e.g. "A" or "Keep the old API".
+                            type: string
+                            minLength: 1
+                            maxLength: 100
+                            pattern: ^[^\r\n]+$
+                          then:
+                            description: What the agent does with this answer.
+                            type: string
+                            minLength: 1
+                            maxLength: 500
+                    multiple:
+                      description: True to let the user tick any number of the options; else they pick one.
+                      type: boolean
+                    ifUnanswered:
+                      description: What the agent does if nobody answers before it expires.
+                      type: string
+                      minLength: 1
+                      maxLength: 500
                 reason:
                   description: Why, in a sentence or two. Shown to the approver as the requester's claim.
                   type: string
@@ -221,7 +271,8 @@ spec:
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected, Superseded, Withdrawn]
+                  enum: [Pending, Approved, Succeeded, Failed, Unknown, Denied, Expired, Rejected, Superseded, Withdrawn,
+                         Answered]
                 message: {type: string}
                 specHash: {type: string}
                 expiresAt: {type: string, format: date-time}
@@ -235,6 +286,36 @@ spec:
                 decidedBy: {type: string}
                 decidedAt: {type: string, format: date-time}
                 finishedAt: {type: string, format: date-time}
+                answer:
+                  description: >-
+                    question; the user's answer (phase Answered), with the question and its options as
+                    they were asked, so it reads on its own.
+                  type: object
+                  properties:
+                    question:
+                      description: The question as asked (the agent's text).
+                      type: object
+                      properties:
+                        text: {type: string}
+                        multiple: {type: boolean}
+                        options:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              label: {type: string}
+                              then: {type: string}
+                    picked:
+                      description: The labels of the options picked, in the question's order.
+                      type: array
+                      items: {type: string}
+                    text:
+                      description: What the user wrote, if anything.
+                      type: string
+                    by:
+                      description: Who answered (their login email).
+                      type: string
+                    at: {type: string, format: date-time}
 ---
 # An OpsWithdrawal says a requester no longer needs its own waiting requests:
 # one by name, or every one of a session (but its flags, which their PRs end).
