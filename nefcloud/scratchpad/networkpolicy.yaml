@@ -1,0 +1,74 @@
+# Isolated from the rest of the cluster: default deny, then the namespace's
+# own pods, DNS and the public internet. No API server, LAN, tailnet, node or
+# other namespace. Agents reach what they deploy with kubectl port-forward
+# (rbac.yaml), which goes through the API server, not the pod network.
+# Replace with the `restricted` mark once *Network policy: open by default*
+# adds it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: scratchpad
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# A test may span pods: a web app and its database.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: scratchpad
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: scratchpad
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# Images pull through the node, not the pod. This is for the workload itself:
+# package registries, APIs. Public addresses only, as in claude-remote/.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-internet-web
+  namespace: scratchpad
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8      # k3s pods and Services, any 10.x LAN or OCI VCN
+              - 172.16.0.0/12   # Docker bridges on the nodes
+              - 192.168.0.0/16  # home LAN
+              - 100.64.0.0/10   # tailnet, and the API server's endpoints
+              - 169.254.0.0/16  # cloud instance metadata
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 80}
