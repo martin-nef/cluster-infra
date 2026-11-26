@@ -1,8 +1,9 @@
 # The scratchpad: a namespace where agents try a deploy before they open a PR.
 # They may create, change and delete workloads here and nowhere else. What
 # keeps it safe lives here, out of their reach: pod security (namespace.yaml),
-# a quota and a low priority (quota.yaml), and network isolation
-# (networkpolicy.yaml). See README.md. No Ingress yet: that needs a host and login check first.
+# a quota and a low priority (quota.yaml), network isolation
+# (networkpolicy.yaml), and Service limits RBAC can't express (admission.yaml).
+# See README.md. No Ingress yet: that needs a host and login check first.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -10,3 +11,4 @@ resources:
   - quota.yaml
   - networkpolicy.yaml
   - rbac.yaml
+  - admission.yaml
