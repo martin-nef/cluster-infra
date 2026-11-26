@@ -1491,7 +1491,8 @@ class TestNotify(unittest.TestCase):
         urlopen.assert_not_called()
 
 
-SESSION = "b1b3da34-05d3-461e-8ad8-c05f03d16ef2"  # claude.ai's session_01Nwipye4RvcaycGKTP4dbr1
+SESSION = "b1b3da34-05d3-461e-8ad8-c05f03d16ef2"  # a CLAUDE_CODE_SESSION_ID
+CLAUDE_AI = "session_01Nwipye4RvcaycGKTP4dbr1"  # a claude.ai session id
 
 
 class TestSessions(Served, Base):
@@ -1586,16 +1587,17 @@ class TestSessions(Served, Base):
         with mock.patch.object(broker, "CLAUDE_AI_SESSIONS", {AGENT}):
             def link(sid, who=AGENT):
                 return broker.session_url((None, sid), [{"spec": {"requester": who, "session": sid}}])
-            self.assertEqual(link(SESSION), url)
+            self.assertEqual(link(CLAUDE_AI), url)
             self.assertEqual(link("cse_01Nwipye4RvcaycGKTP4dbr1"), url)
-            for bad in ("s1", "session_01Nwipye4Rv", "https://evil.test/", SESSION.upper()):
+            # SESSION: a CLAUDE_CODE_SESSION_ID, a uuidv5 of the claude.ai id, so no way back to it.
+            for bad in ("s1", "session_01Nwipye4Rv", "https://evil.test/", SESSION, CLAUDE_AI + "x"):
                 self.assertIsNone(link(bad), bad)
-            self.assertIsNone(link(SESSION, NIGHT))  # not a claude.ai requester
+            self.assertIsNone(link(CLAUDE_AI, NIGHT))  # not a claude.ai requester
             self.assertIsNone(broker.session_url((AGENT, "fix valheim"), []))
-            self.restart("a1", AGENT, SESSION, "ops page")
-            body = self.request("GET", f"/g/{broker.group_id((None, SESSION))}")[1]
+            self.restart("a1", AGENT, CLAUDE_AI, "ops page")
+            body = self.request("GET", f"/g/{broker.group_id((None, CLAUDE_AI))}")[1]
         self.assertIn(f'<a href="{url}">Open the session on claude.ai</a>', body)
-        self.assertIsNone(link(SESSION))  # CLAUDE_AI_SESSIONS empty
+        self.assertIsNone(link(CLAUDE_AI))  # CLAUDE_AI_SESSIONS empty
 
     def test_the_summary_shows_the_newest_per_subject(self):
         self.flag("mid", AGENT, 5, "s1", "ops page", age=20)

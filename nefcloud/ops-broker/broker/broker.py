@@ -352,27 +352,19 @@ def group_title(key, reqs):
 
 
 BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TAGGED = re.compile(rf"(?:session|cse)_(01[{BASE58}]{{22}})")
 
 
 def session_url(key, reqs):
     """A claude.ai Remote Control session's page, for a session named by a
     requester in CLAUDE_AI_SESSIONS; else None. Built here from the id, never
-    taken from the request. claude.ai's id, session_01<base58>, is the same 128
-    bits as the session's own CLAUDE_CODE_SESSION_ID (a UUID): either works."""
+    taken from the request. Only claude.ai's own id (session_01<base58>, or
+    cse_01<base58>, the same id) links: a session's CLAUDE_CODE_SESSION_ID is
+    a uuidv5 of it, which can't be turned back into it."""
     if key[0] is not None or not CLAUDE_AI_SESSIONS & set(workers(key, reqs)):
         return None
-    sid = key[1]
-    if m := TAGGED.fullmatch(sid):
-        return f"https://claude.ai/code/session_{m.group(1)}"
-    if not UUID.fullmatch(sid):
-        return None
-    n, out = int(sid.replace("-", ""), 16), ""
-    for _ in range(22):
-        n, d = divmod(n, 58)
-        out = BASE58[d] + out
-    return f"https://claude.ai/code/session_01{out}"
+    m = TAGGED.fullmatch(key[1])
+    return f"https://claude.ai/code/session_{m.group(1)}" if m else None
 
 
 def groups(items, keys=None):
