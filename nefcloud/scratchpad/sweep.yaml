@@ -1,0 +1,100 @@
+# The nightly sweep (sweep/sweep.py): deletes what agents left in scratchpad
+# more than a day ago (a week with the keep label). It runs in a namespace of
+# its own: in scratchpad, agents could edit its CronJob or run a pod as its
+# ServiceAccount, and the NetworkPolicy there blocks the API server.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scratchpad-sweep
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scratchpad-sweep
+  namespace: scratchpad-sweep
+---
+# List and delete only, for what the agents' Role lets them create. List on
+# Secrets could read their data; the sweep asks for metadata only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sweep
+  namespace: scratchpad
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, configmaps, secrets, persistentvolumeclaims]
+    verbs: [list, delete]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, replicasets]
+    verbs: [list, delete]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [list, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sweep
+  namespace: scratchpad
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sweep
+subjects:
+  - kind: ServiceAccount
+    name: scratchpad-sweep
+    namespace: scratchpad-sweep
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scratchpad-sweep
+  namespace: scratchpad-sweep
+spec:
+  # By age, not by the clock: what an agent deploys at 05:29 stays a day.
+  schedule: "30 5 * * *"
+  timeZone: Europe/London
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: scratchpad-sweep
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: sweep
+              # The same multi-arch digest as the ops broker.
+              image: python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+              command: [python, -I, /app/sweep.py]
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {cpu: 200m, memory: 64Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              volumeMounts:
+                - name: code
+                  mountPath: /app
+                  readOnly: true
+          volumes:
+            - name: code
+              configMap:
+                name: scratchpad-sweep
