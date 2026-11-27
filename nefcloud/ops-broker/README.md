@@ -1,5 +1,7 @@
 # ops-broker: break-glass
 
+> **Stopped (cutover):** the broker below is at 0 replicas and has no Ingress; [martin-nef/ops-broker](https://github.com/martin-nef/ops-broker) owns the `human-review` check and ops.nefcloud.top. The CRDs, admission policies and this directory go at the retirement.
+>
 > **Moving to its own app.** [martin-nef/ops-broker](https://github.com/martin-nef/ops-broker) is the broker as a Flux app, with its own storage and API instead of these CRDs and admission policies. It runs beside this one (`ops-next.nefcloud.top`, the same namespace and GitHub App) until the switch. This directory keeps the namespace, the ServiceAccount and its RBAC (the cluster verbs) and the Secrets. The broker has no NetworkPolicy: it isn't what needs containing. The agents' own egress policies (claude-remote, night-shift) let them reach only its API port, 8081, not its approval pages.
 
 Some fixes can't wait for a PR, or can't be made by one: a pod stuck after a strategy change, a suspended Kustomization, a release that needs a nudge. In v0 the agent (claude-remote) stops and tells you the command, and you run it in Headlamp. v1 keeps you as the one who decides, but turns "find it in Headlamp and do it" into "read one page, press Approve".
