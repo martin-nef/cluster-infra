@@ -2,8 +2,10 @@
 # They may create, change and delete workloads here and nowhere else. What
 # keeps it safe lives here, out of their reach: pod security (namespace.yaml),
 # a quota and a low priority (quota.yaml), network isolation
-# (networkpolicy.yaml), and Service limits RBAC can't express (admission.yaml).
-# See README.md. No Ingress yet: that needs a host and login check first.
+# (networkpolicy.yaml), Service limits RBAC can't express (admission.yaml),
+# and the limits on the nightly sweep of old objects (sweep.yaml; its CronJob
+# is the scratchpad app's, martin-nef/scratchpad). See README.md. No Ingress
+# yet: that needs a host and login check first.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -12,3 +14,4 @@ resources:
   - networkpolicy.yaml
   - rbac.yaml
   - admission.yaml
+  - sweep.yaml

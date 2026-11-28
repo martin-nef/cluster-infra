@@ -1,0 +1,65 @@
+# The limits on the nightly sweep, which deletes what agents left in
+# scratchpad more than a day ago (a week with the keep label). Its CronJob and
+# code are the scratchpad app's (martin-nef/scratchpad deploy/). It runs in a
+# namespace of its own: in scratchpad, agents could edit its CronJob or run a
+# pod as its ServiceAccount, and the NetworkPolicy there blocks the API server.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scratchpad-sweep
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+# One Job at a time, small (the CronJob asks 10m/16Mi, at most 200m/64Mi).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: scratchpad-sweep
+  namespace: scratchpad-sweep
+spec:
+  hard:
+    pods: "2"
+    requests.cpu: 100m
+    requests.memory: 128Mi
+    limits.cpu: 500m
+    limits.memory: 256Mi
+    count/cronjobs.batch: "1"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scratchpad-sweep
+  namespace: scratchpad-sweep
+---
+# List and delete only, for what the agents' Role lets them create. List on
+# Secrets could read their data; the sweep asks for metadata only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sweep
+  namespace: scratchpad
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, configmaps, secrets, persistentvolumeclaims]
+    verbs: [list, delete]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, replicasets]
+    verbs: [list, delete]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [list, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sweep
+  namespace: scratchpad
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sweep
+subjects:
+  - kind: ServiceAccount
+    name: scratchpad-sweep
+    namespace: scratchpad-sweep
