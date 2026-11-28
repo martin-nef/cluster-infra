@@ -5,18 +5,3 @@ metadata:
   labels:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
----
-# The pending cap in the broker keeps notifications down; this keeps the
-# number of stored requests bounded even if the broker is down. The broker
-# keeps finished requests RETENTION_DAYS (90): at about 10 a day that's some
-# 900, so 1500 leaves room. 200 filled up in three weeks and refused every
-# new request.
-apiVersion: v1
-kind: ResourceQuota
-metadata:
-  name: opsrequests
-  namespace: ops-broker
-spec:
-  hard:
-    count/opsrequests.ops.nefcloud.top: "1500"
-    count/opswithdrawals.ops.nefcloud.top: "100"

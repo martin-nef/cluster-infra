@@ -51,7 +51,7 @@ flowchart LR
 | vmauth | `vmauth.yaml`, `vmauth-config.yaml` | v1.155.0, VictoriaMetrics' proxy. Passes the read-only query paths only. 10m/32Mi requests, 200m/128Mi limits. |
 | Egress allows | `../claude-remote/`, `../night-shift/`, `../pr-reviewer/` `networkpolicy.yaml` | `allow-observability`: the agents' pods may reach the collector and vmauth. |
 
-Flux applies this directory from `main` through `nefcloud/kustomization.yaml`, as plain manifests. It is not a Flux app with its own repo: nothing here is built, and like `ops-broker/` it stays out of the agents' own repos.
+Flux applies this directory from `main` through `nefcloud/kustomization.yaml`, as plain manifests. It is not a Flux app with its own repo: nothing here is built, and it stays out of the agents' own repos.
 
 ## Design decisions
 

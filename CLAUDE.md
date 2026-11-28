@@ -17,7 +17,7 @@ Everything else of a Flux app goes in its own repo's `deploy/`: Deployments, Ser
 
 An app is its own GitHub repo under `martin-nef/` with its manifests in `deploy/`. Registering it here is one line plus CI. Do not hand-write `nefcloud/apps/<name>.yaml` for a new app, `flux.sh` generates it.
 
-1. Make sure the app repo exists on GitHub (`martin-nef/<repo>`); `flux.sh` registers a deploy key on it. It does not need a `deploy/` yet, that comes in step 6. Its default branch must be protected before Flux deploys from it, since a push to `main` is a deploy: check `gh api repos/martin-nef/<repo>/branches/main --jq .protected`, and if it says `false`, file a `github-protect-branch` OpsRequest (`nefcloud/ops-broker/README.md`) and wait for it to succeed.
+1. Make sure the app repo exists on GitHub (`martin-nef/<repo>`); `flux.sh` registers a deploy key on it. It does not need a `deploy/` yet, that comes in step 6. Its default branch must be protected before Flux deploys from it, since a push to `main` is a deploy: check `gh api repos/martin-nef/<repo>/branches/main --jq .protected`, and if it says `false`, file a `github-protect-branch` request with the ops broker (`agent-pr request`; martin-nef/ops-broker `docs/verbs.md`) and wait for it to succeed.
 2. Add one line to `flux-apps`: `name [repo] [branch] [path]`. Use `-` to keep a default. Defaults: `repo=name`, `branch=main`, `path=./deploy`. Example: `playit playit-gg` for app `playit` in repo `playit-gg`.
 3. Commit and push to `main`. Previous registrations were committed straight to `main` (e.g. `add project-zomboid app`).
 4. The `Flux` workflow (`.github/workflows/flux.yml`, runs on push to `main`) pipes `flux.sh` over SSH to shitbox. For each app in `flux-apps` it:
@@ -74,7 +74,7 @@ Do this after the Flux PR is merged and step 6 is done. Each app has its own age
        age: <public key>
    ```
 
-3. Give Flux the private key. The data key must end in `.agekey`. Or skip steps 1 and 3: an agent files a `create-sops-age-key` OpsRequest for `flux-system/<name>-sops-age` (`nefcloud/ops-broker/README.md`, SOPS keys), and its status gives the public key for step 2. The private key then never leaves the cluster.
+3. Give Flux the private key. The data key must end in `.agekey`. Or skip steps 1 and 3: an agent files a `create-sops-age-key` request for `flux-system/<name>-sops-age` (martin-nef/ops-broker `docs/verbs.md`, SOPS keys), and its status gives the public key for step 2. The private key then never leaves the cluster.
 
    ```bash
    kubectl -n flux-system create secret generic <name>-sops-age --from-file=age.agekey=age.agekey
