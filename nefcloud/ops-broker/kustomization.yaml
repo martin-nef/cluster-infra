@@ -1,5 +1,7 @@
-# Break-glass: a fixed set of imperative actions, in the cluster and on GitHub,
-# that the agent can request and you approve from your phone. See README.md for the design and trade-offs.
+# The ops broker's limits: its namespace, ServiceAccount, RBAC (the cluster
+# verbs), the admission policy pinning its SOPS keys, and its ntfy Secret.
+# The broker itself is its own Flux app, martin-nef/ops-broker
+# (nefcloud/apps/ops-broker.yaml). See README.md.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -8,23 +10,3 @@ resources:
   - admission.yaml
   - rbac.yaml
   - secrets.yaml
-  - deployment.yaml
-  # ingress.yaml: ops.nefcloud.top is the new broker's (martin-nef/ops-broker deploy/ingress.yaml).
-configMapGenerator:
-  # Hashed: an edit to any of them rolls the pod.
-  - name: ops-broker-config
-    namespace: ops-broker
-    envs:
-      - config.env
-  - name: ops-broker-code
-    namespace: ops-broker
-    files:
-      - broker/broker.py
-      - broker/githubops.py
-      - broker/agekey.py
-      - code-triggers.json
-  # Its own ConfigMap, so the minter container mounts only its own code.
-  - name: ops-broker-minter
-    namespace: ops-broker
-    files:
-      - broker/minter.py

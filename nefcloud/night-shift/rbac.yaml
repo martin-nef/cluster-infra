@@ -6,8 +6,9 @@
 # The pod runs as `worker`, whose token only the worker container mounts
 # (automountServiceAccountToken: false; a projected volume there). The agent
 # works like the interactive agent: it reads the cluster as claude-remote does,
-# to follow what it merged and investigate (pod logs included), and files
-# OpsRequests (flags, break-glass). Read-only: no secrets, exec or writes.
+# to follow what it merged and investigate (pod logs included). It files
+# flags and break-glass requests on the ops broker's API, not here.
+# Read-only: no secrets, exec or writes.
 # What it may merge is held by the ops broker's human-review check.
 apiVersion: v1
 kind: ServiceAccount
@@ -36,35 +37,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: claude-remote-read  # nodes, CRDs, RBAC, metrics: what view leaves out (claude-remote/rbac.yaml)
-subjects:
-  - kind: ServiceAccount
-    name: worker
-    namespace: night-shift
----
-# The ops broker (nefcloud/ops-broker/): the worker files human-review flags
-# and break-glass requests (agent-pr flag, or kubectl create), and reads them.
-# File and read only; approval stays on the page behind your Google login. It
-# has its own PENDING_CAPS slots there. It may withdraw its own waiting requests
-# (an OpsWithdrawal: the broker checks they're its own), e.g. when a stream ends.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: night-shift-ops-requests
-  namespace: ops-broker
-rules:
-  - apiGroups: [ops.nefcloud.top]
-    resources: [opsrequests, opswithdrawals]
-    verbs: [create, get]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: night-shift-ops-requests
-  namespace: ops-broker
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: night-shift-ops-requests
 subjects:
   - kind: ServiceAccount
     name: worker

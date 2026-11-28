@@ -6,7 +6,7 @@ metadata:
 ---
 # The verbs, and nothing else: no create, no update, no Secrets, no exec.
 # patch is still a broad permission on these kinds; the broker's code only
-# ever sends the fixed patches in broker.py (see README.md, trade-offs).
+# ever sends its fixed patches (martin-nef/ops-broker internal/verbs).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -36,56 +36,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: ops-broker-actions
-subjects:
-  - kind: ServiceAccount
-    name: ops-broker
-    namespace: ops-broker
----
-# Its own queue: read requests and withdrawals, write their status, delete old ones.
-# The pod's two containers (broker and minter) share this ServiceAccount.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: ops-broker
-  namespace: ops-broker
-rules:
-  - apiGroups: [ops.nefcloud.top]
-    resources: [opsrequests]
-    verbs: [get, list, watch, delete]
-  # Files a github-human-review request for the PR reviewer's needs_human
-  # flag (its Jobs have no API access). Admission stamps this ServiceAccount as
-  # the requester, so they're requests like any other: you still decide them.
-  - apiGroups: [ops.nefcloud.top]
-    resources: [opsrequests]
-    verbs: [create]
-  - apiGroups: [ops.nefcloud.top]
-    resources: [opsrequests/status]
-    verbs: [get, patch]
-  # Withdrawals: act on them (their status), delete them after
-  # SHORT_RETENTION_DAYS.
-  - apiGroups: [ops.nefcloud.top]
-    resources: [opswithdrawals]
-    verbs: [get, list, watch, delete]
-  - apiGroups: [ops.nefcloud.top]
-    resources: [opswithdrawals/status]
-    verbs: [get, patch]
-  # The GitHub App's key and OAuth client: the minter sidecar stores them from the setup page
-  # (create can't be limited to a name, so any Secret in this namespace). No
-  # get: only the minter reads it, through its Secret volume, which the kubelet
-  # fills in. Not the ntfy Secret, which Flux gives the pod as an env var.
-  - apiGroups: [""]
-    resources: [secrets]
-    verbs: [create]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ops-broker
-  namespace: ops-broker
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: ops-broker
 subjects:
   - kind: ServiceAccount
     name: ops-broker
