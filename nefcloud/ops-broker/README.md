@@ -10,13 +10,12 @@ This directory holds what the broker may do, kept here and out of its own repo s
 | `rbac.yaml` | The `ops-broker` ServiceAccount. `ops-broker-actions` (cluster-wide): the cluster verbs, `get` and `delete` on pods, `get` and `patch` on Deployments, StatefulSets, DaemonSets and the four Flux kinds. `ops-broker-sops-keys` (`flux-system`): `create` on Secrets, for `create-sops-age-key`. No `get` or `list` on Secrets anywhere. |
 | `admission.yaml` | `ops-broker-sops-keys-only`: RBAC can't limit `create` to a name, so this does. In `flux-system`, the broker may only create `<app>-sops-age` Secrets holding exactly one key, `age.agekey`. |
 | `secrets.yaml` | `ops-broker-ntfy`, the ntfy topic URL (SOPS). |
-| `crd.yaml` | The CRD broker's `OpsRequest` and `OpsWithdrawal` kinds, kept until their old records are dealt with. Nothing creates them any more. |
 
 The GitHub App's Secrets (`ops-broker-github-app`, `ops-broker-github-oauth`) are not in git: the CRD broker's setup page made them once in the cluster. The agents reach only the broker's API port (8081), through their own egress NetworkPolicies (`nefcloud/claude-remote/`, `nefcloud/night-shift/`).
 
 ## History
 
-Until 2026-11 the broker was a Python service in this directory, with `OpsRequest` objects as its store and its API, and admission policies that stamped who asked. It moved to its own app (roadmap: *Ops broker app*) so that features stop being new CRD fields and policies. The two ran side by side (the new one in `shadow` mode at `ops-next.nefcloud.top`), then the new one took over `ops.nefcloud.top` and the `human-review` check (cutover: cluster-infra#101, ops-broker#9, claude-remote#37), then the old one went (this change). The old design and trade-offs are in git history (`nefcloud/ops-broker/README.md` before the retirement).
+Until 2026-11 the broker was a Python service in this directory, with `OpsRequest` objects as its store and its API, and admission policies that stamped who asked. It moved to its own app (roadmap: *Ops broker app*) so that features stop being new CRD fields and policies. The two ran side by side (the new one in `shadow` mode at `ops-next.nefcloud.top`), then the new one took over `ops.nefcloud.top` and the `human-review` check (cutover: cluster-infra#101, ops-broker#9, claude-remote#37), then the old one went, with its CRDs and their records (cluster-infra#104). The old design and trade-offs are in git history (`nefcloud/ops-broker/README.md` before the retirement).
 
 ## Trade-offs
 
