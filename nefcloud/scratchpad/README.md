@@ -11,7 +11,7 @@ A namespace where agents (`claude-remote/claude-remote`, `night-shift/worker`) t
 | PriorityClass `scratchpad` (-100, never preempts) | `quota.yaml` | Game servers share the nodes. Scratch pods are evicted first. |
 | NetworkPolicy | `networkpolicy.yaml` | Default deny. Allowed: pods in the namespace, DNS, public addresses on 80/443. No API server, LAN, tailnet or other namespace. |
 | ValidatingAdmissionPolicy `scratchpad-services` | `admission.yaml` | Services are ClusterIP only, with no `externalIPs` (they would capture traffic to those IPs cluster-wide). |
-| CronJob `scratchpad-sweep/scratchpad-sweep` | `sweep.yaml`, `sweep/sweep.py` | Every night at 05:30 (London) it deletes objects older than 24 h, or 7 days with the keep label. |
+| Namespace `scratchpad-sweep`, Role `sweep` | `sweep.yaml` | The nightly sweep's ServiceAccount may list and delete (metadata only) what agents can make here. Its CronJob and code are the scratchpad app's: [martin-nef/scratchpad](https://github.com/martin-nef/scratchpad). |
 | Role `agent` | `rbac.yaml` | Workloads, config, Secrets, logs, exec, port-forward. No RBAC, NetworkPolicy, quota, ServiceAccount or Ingress rights. |
 
 ## Use it
@@ -38,10 +38,4 @@ Delete what you deploy when you are done. What you leave goes in the nightly swe
 
 To keep a test longer (up to 7 days), label each object you need: `scratchpad.nefcloud.top/keep: "true"`. That includes its Services, ConfigMaps, Secrets and PVCs. For a StatefulSet, put the label in `volumeClaimTemplates[].metadata.labels` too, so its PVCs get it.
 
-See what the sweep would delete now, from an agent's pod (a server dry run as your own ServiceAccount; it deletes nothing):
-
-```sh
-python3 -I nefcloud/scratchpad/sweep/sweep.py --dry-run
-```
-
-Its tests: `cd nefcloud/scratchpad/sweep && python3 -I -m unittest -v`. No CI job runs them yet.
+The sweep, how to see what it would delete now, and its tests: [martin-nef/scratchpad](https://github.com/martin-nef/scratchpad).
